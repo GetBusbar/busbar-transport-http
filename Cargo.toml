@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# RENDERED by `cargo xtask fleet render busbar-transport-http` from GetBusbar/busbar's plugins.yaml and
+# .github/fleet/workspace-Cargo.toml; `cargo xtask fleet check` is red on any edit here.
+#
+# One repo per plugin, every repo a twin: this workspace is exactly two crates, the logic
+# (`transport-http/`, the rlib a busbar build can link) and the thin cdylib that packages it as a
+# droppable `kind: transport` plugin (`transport-http-plugin/`, crate `busbar-transport-http-plugin`). Its busbar
+# dependencies are git dependencies on GetBusbar/busbar at the fleet pin (`.busbar-ref` field 1);
+# no sibling-checkout path dependency ships in any manifest.
+[workspace]
+resolver = "2"
+members = [
+    "transport-http",
+    "transport-http-plugin",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/GetBusbar/busbar-transport-http"
+
+[workspace.dependencies]
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
