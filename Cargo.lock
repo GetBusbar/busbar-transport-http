@@ -76,7 +76,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a50b0cfa614357f6080d1e07ea06fd275038fc8b#a50b0cfa614357f6080d1e07ea06fd275038fc8b"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "async-trait",
  "futures",
@@ -98,7 +98,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a50b0cfa614357f6080d1e07ea06fd275038fc8b#a50b0cfa614357f6080d1e07ea06fd275038fc8b"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "busbar-contract",
  "serde",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a50b0cfa614357f6080d1e07ea06fd275038fc8b#a50b0cfa614357f6080d1e07ea06fd275038fc8b"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "busbar-contract",
  "sha2 0.11.0",
@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=a50b0cfa614357f6080d1e07ea06fd275038fc8b#a50b0cfa614357f6080d1e07ea06fd275038fc8b"
+source = "git+https://github.com/GetBusbar/busbar?rev=7008c5fc6fecaea49b4e4170268c1c4bed395c25#7008c5fc6fecaea49b4e4170268c1c4bed395c25"
 dependencies = [
  "async-trait",
  "busbar-contract",
@@ -154,8 +154,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
- "tonic",
- "tower",
  "url",
 ]
 
@@ -930,26 +928,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pin-project"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,17 +1491,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1536,26 +1503,6 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tonic"
-version = "0.14.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "http",
- "http-body",
- "http-body-util",
- "percent-encoding",
- "pin-project",
- "sync_wrapper",
- "tokio-stream",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]

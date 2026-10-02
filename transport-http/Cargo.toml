@@ -28,7 +28,7 @@ crate-type = ["rlib"]
 [dependencies]
 tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 memchr = "2"
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a50b0cfa614357f6080d1e07ea06fd275038fc8b" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7008c5fc6fecaea49b4e4170268c1c4bed395c25" }
 futures = "0.3"
 tokio = { version = "1", features = ["net", "rt", "sync", "io-util", "time", "macros"] }
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
@@ -38,17 +38,6 @@ http = "1"
 bytes = "1"
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = "1"
-# THE gRPC MODULE (`src/grpc/`, folded in from `busbar-transport-grpc`).
-# `tonic` here is used ONLY for its codec/status/streaming machinery (`tonic::codec::Codec`,
-# `tonic::Status`, `tonic::server::Grpc`, `tonic::client::Grpc`) — the gRPC WIRE FRAMING (the
-# 5-byte length-prefix per message, the `grpc-status` trailer) with a byte-blind custom `Codec`
-# (see `grpc/codec.rs`) that carries no protobuf meaning at all. `default-features = false` (the
-# workspace pin) keeps `tonic::transport` (the whole `Channel`/`Server` framework, `axum`
-# included) OUT of this crate's build: the HTTP/2 listener and dialer are the module's own, built
-# directly on `hyper`/`hyper-util`, because `tonic::transport::Server`'s routing is by declared
-# service NAME, and this transport is protocol-blind — it has no service name to route by.
-tonic = { version = "0.14", default-features = false }
-tower = "0.5"
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
@@ -61,9 +50,6 @@ url = "2"
 # The TEST-ONLY seal (#65). `busbar_contract::plugin::TestKernelSeal` is the one blessed
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a50b0cfa614357f6080d1e07ea06fd275038fc8b", features = ["test-seal"] }
-# `test-util` is dev-only (this list is `[dev-dependencies]`), so `start_paused` never reaches a
-# release build: it lets the gRPC module's stalled-preface cases (item 146) prove the budget by
-# letting the runtime auto-advance virtual time to it, rather than actually waiting ten real seconds.
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros", "test-util"] }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7008c5fc6fecaea49b4e4170268c1c4bed395c25", features = ["test-seal"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
