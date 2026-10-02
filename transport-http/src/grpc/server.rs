@@ -226,7 +226,7 @@ pub(crate) async fn forward_inbound(
                     transport_units: None,
                     status: None,
                     status_code: None,
-                    retry_after_secs: None,
+                    ..Default::default()
                 };
                 let frame = Frame {
                     direction: Direction::Inbound,
@@ -293,7 +293,7 @@ pub(crate) fn terminal_frame(stream_id: StreamId, status: Option<&Status>) -> Fr
                     .map(|n| WireStatus::new(ns, n))
             },
         ),
-        retry_after_secs: None,
+        ..Default::default()
     };
     Frame {
         direction: Direction::Inbound,
