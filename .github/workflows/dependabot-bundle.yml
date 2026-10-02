@@ -1,3 +1,5 @@
+# RENDERED by `busbar-release plugin sync busbar-transport-http` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync (DEPENDABOT-ONE).
 # dependabot-bundle: every open dependabot PR (whatever its base today) is merged into ONE branch (deps/bundle),
 # which carries ONE PR with auto-merge on. Merged PRs are closed with a link; a PR that conflicts
 # is listed in the bundle PR body and left open. The branch is only ever fast-forwarded (no force).
