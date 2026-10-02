@@ -105,11 +105,16 @@ fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O,
 
 // ── the golden ───────────────────────────────────────────────────────────────────────────────────
 
+/// busbar's own golden at this repo's `.busbar-ref` (`testing/shadow-oracle/golden`), which the fleet
+/// harness checks out and exports; the repo keeps no copy of it.
 fn golden_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("BUSBAR_WIRE_GOLDEN_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/1.5.5/cells")
+    let root = std::env::var_os("BUSBAR_GOLDEN_DIR").unwrap_or_else(|| {
+        panic!(
+            "BUSBAR_GOLDEN_DIR is not set: the 1.5.5 wire golden is busbar's \
+             testing/shadow-oracle/golden at this repo's .busbar-ref (the fleet harness exports it)"
+        )
+    });
+    PathBuf::from(root).join("1.5.5/cells")
 }
 
 /// One request the 1.5.5 binary sent, as the capture recorded it.
