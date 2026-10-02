@@ -102,6 +102,10 @@ pub mod linked {
     /// Whether this wire carries sessions.
     pub const SESSION: bool = <HttpTransport as TransportMeta>::SESSION;
 
+    /// The `http` framer's memory-ABI door: a composition root that links this row as a door row
+    /// opens it on the connector, the same door the dropped-in build exports.
+    pub use crate::door::door;
+
     /// `http` opens its own socket, so it takes no lower layer; it holds the deployment's settings.
     #[must_use]
     pub fn build(
