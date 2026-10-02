@@ -783,7 +783,7 @@ fn body_frame(bytes: Vec<u8>) -> (StreamId, Frame) {
                 transport_units: None,
                 status: None,
                 status_code: None,
-                retry_after_secs: None,
+                ..Default::default()
             },
         },
     )
