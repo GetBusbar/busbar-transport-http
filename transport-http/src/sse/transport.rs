@@ -109,10 +109,10 @@ impl Transport for SseTransport {
                         bytes: SlabBytes::new(bytes),
                         meta: FrameMeta {
                             bytes: len,
-                            transport_units: None,
                             status: status.class,
                             status_code: status.code,
                             retry_after_secs: status.retry_after_secs,
+                            ..Default::default()
                         },
                     };
                     return Some((Ok((StreamId(0), frame)), st));
