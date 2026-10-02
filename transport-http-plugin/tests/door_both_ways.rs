@@ -9,7 +9,7 @@
 //! `ingest`, `timer`. The framer is driven from the test's own thread, outside any runtime.
 //!
 //! Each scenario runs twice, through the linked door and through the cdylib `cargo test` built from
-//! `examples/http_door.rs`, and both must print the same proof lines.
+//! `src/lib.rs`, and both must print the same proof lines.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -604,7 +604,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_http::door::door();
+    let d = busbar_transport_http_plugin::door::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -615,19 +615,14 @@ fn dropped() -> (&'static Ops, &'static libloading::Library) {
         .parent()
         .and_then(|d| d.parent())
         .expect("target/<profile>");
-    let file = format!(
-        "{}http_door{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_SUFFIX
-    );
-    let path = [
-        profile.join("examples").join(&file),
-        profile.join("examples").join("deps").join(&file),
-    ]
-    .into_iter()
-    .find(|p| p.exists())
-    .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
-    // SAFETY: our own example, built by this `cargo test`.
+    let file = busbar_plugin_loader::plugin_library_filename("busbar_transport_http_plugin");
+    let path = [profile.join(&file), profile.join("deps").join(&file)]
+        .into_iter()
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max()
+        .map(|(_, p)| p)
+        .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
+    // SAFETY: our own cdylib, built by this `cargo test`.
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));

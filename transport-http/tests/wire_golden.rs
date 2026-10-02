@@ -109,7 +109,7 @@ fn golden_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("BUSBAR_WIRE_GOLDEN_DIR") {
         return PathBuf::from(d);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testing/shadow-oracle/golden/1.5.5/cells")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/1.5.5/cells")
 }
 
 /// One request the 1.5.5 binary sent, as the capture recorded it.
