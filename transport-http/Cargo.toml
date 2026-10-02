@@ -26,18 +26,18 @@ crate-type = ["rlib"]
 # &["tcp"]` in `meta.rs` is a declared wire fact the registry reads, and it needs no link edge to be
 # true.
 [dependencies]
-tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
-memchr = "2"
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a50b0cfa614357f6080d1e07ea06fd275038fc8b" }
-futures = "0.3"
-tokio = { version = "1", features = ["net", "rt", "sync", "io-util", "time", "macros"] }
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
-http-body-util = "0.1"
-http = "1"
-bytes = "1"
+tokio-util = { workspace = true }
+memchr = { workspace = true }
+busbar-contract = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "io-util", "time", "macros"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
-serde_json = "1"
+serde_json = { workspace = true }
 # THE gRPC MODULE (`src/grpc/`, folded in from `busbar-transport-grpc`).
 # `tonic` here is used ONLY for its codec/status/streaming machinery (`tonic::codec::Codec`,
 # `tonic::Status`, `tonic::server::Grpc`, `tonic::client::Grpc`) — the gRPC WIRE FRAMING (the
@@ -47,23 +47,23 @@ serde_json = "1"
 # included) OUT of this crate's build: the HTTP/2 listener and dialer are the module's own, built
 # directly on `hyper`/`hyper-util`, because `tonic::transport::Server`'s routing is by declared
 # service NAME, and this transport is protocol-blind — it has no service name to route by.
-tonic = { version = "0.14", default-features = false }
-tower = "0.5"
+tonic = { workspace = true }
+tower = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
 # `http2` feature, built exactly as 1.5.5 built it, captured beside this door on the same request.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+reqwest = { workspace = true, features = ["http2"] }
 # THE REQUEST TARGET'S 1.5.5 BYTES (`door/tests`): the URL parser 1.5.5's client serialised
 # every upstream path with, compared against the door's own encoder. Already in this list's closure
 # through reqwest: no crate is added.
-url = "2"
+url = { workspace = true }
 # The TEST-ONLY seal (#65). `busbar_contract::plugin::TestKernelSeal` is the one blessed
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "a50b0cfa614357f6080d1e07ea06fd275038fc8b", features = ["test-seal"] }
+busbar-contract = { workspace = true, features = ["test-seal"] }
 # `test-util` is dev-only (this list is `[dev-dependencies]`), so `start_paused` never reaches a
 # release build: it lets the gRPC module's stalled-preface cases (item 146) prove the budget by
 # letting the runtime auto-advance virtual time to it, rather than actually waiting ten real seconds.
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros", "test-util"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros", "test-util"] }
 
