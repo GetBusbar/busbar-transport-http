@@ -89,9 +89,9 @@ fn open(p: &Plugin<Transport>) {
 /// One scripted exchange through the dispatcher: begin a dialled http/1.1 connection, encode one
 /// request. What comes back is the wire bytes the door rendered.
 fn script(p: &Plugin<Transport>) -> Vec<u8> {
-    let mut wire = vec![0_u8; 8192];
-    let mut frame = vec![0_u8; 8192];
-    let mut pieces: Vec<FramePiece> = vec![z(); 8];
+    let wire = vec![0_u8; 8192];
+    let frame = vec![0_u8; 8192];
+    let pieces: Vec<FramePiece> = vec![z(); 8];
     let sink = || FramerSink {
         wire: wire.as_ptr().cast_mut(),
         wire_cap: wire.len(),
