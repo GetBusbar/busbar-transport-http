@@ -166,6 +166,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-transport-http",
+ "busbar-transport-http-plugin",
  "bytes",
  "http-body-util",
  "hyper",
