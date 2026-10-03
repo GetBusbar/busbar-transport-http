@@ -8,7 +8,8 @@
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
 //! the framer's"), the connector makes it in the handshake and tells this framer what was agreed in
 //! [`ConnFacts::agreed_protocol`]. A cleartext connection has no handshake: it speaks HTTP/2 under
-//! the prior-knowledge key and HTTP/1.1 otherwise. From there each op is one step of
+//! the prior-knowledge key (offering `h2` alone, which the connector hands back as agreed) and
+//! HTTP/1.1 otherwise. From there each op is one step of
 //! [`engine::Framing`]:
 //!
 //! * `locate` reads a target URL: its authority, the name offered to the far end, and whether it
@@ -32,7 +33,8 @@
 //! `locate` also answers this framer's protocol offer for a secured connection (ALPN, most
 //! preferred first): `h2, http/1.1`, `http/1.1` alone under the http1-only key, or `h2` alone under
 //! the prior-knowledge key, exactly as 1.5.5's client offered. The connector offers it and hands
-//! back what was agreed.
+//! back what was agreed. On a cleartext target the offer is `h2` alone under the prior-knowledge
+//! key (the protocol spoken by prior knowledge) and none otherwise.
 //!
 //! One clock bounds each exchange, as 1.5.5's `limits.upstream_request_timeout_secs` did: from the
 //! attempt's start (the deadline the caller stamps on `emit`) to the response body's end.
@@ -394,16 +396,19 @@ const OFFER_H1: &[u8] = b"\x08http/1.1";
 /// The same under the prior-knowledge key: h2 alone.
 const OFFER_H2: &[u8] = b"\x02h2";
 
-/// The protocol offer `locate` answers: none in the clear, else 1.5.5's by its keys. 1.5.5's client
-/// (reqwest 0.12) offered by its version preference, and each key SET that preference, the one
-/// applied last winning: `h2` alone under prior knowledge, `http/1.1` alone under http1-only (applied
-/// after prior knowledge, so it wins when both are set), `h2, http/1.1` otherwise.
+/// The protocol offer `locate` answers, 1.5.5's by its keys. 1.5.5's client (reqwest 0.12) offered
+/// by its version preference, and each key SET that preference, the one applied last winning: `h2`
+/// alone under prior knowledge, `http/1.1` alone under http1-only (applied after prior knowledge,
+/// so it wins when both are set), `h2, http/1.1` otherwise. In the clear there is no handshake:
+/// the offer is `h2` alone under prior knowledge (the one protocol offered there is the one spoken
+/// by prior knowledge, `LocateOut::alpn_written`, so the connector knows the connection is h2c and
+/// shares it as 1.5.5 did), and none otherwise (HTTP/1.1).
 fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static [u8] {
     match (secure, prior_knowledge, http1_only) {
-        (false, _, _) => &[],
         (true, _, true) => OFFER_H1,
-        (true, true, false) => OFFER_H2,
+        (_, true, false) => OFFER_H2,
         (true, false, false) => OFFER_H2_H1,
+        (false, _, _) => &[],
     }
 }
 

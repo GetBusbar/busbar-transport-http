@@ -45,8 +45,8 @@ fn a_status_code_maps_to_its_class() {
 
 /// `locate`'s protocol offer is 1.5.5's client's ALPN offer (reqwest 0.12 by its version
 /// preference): `h2, http/1.1` on a secured target, `http/1.1` alone under the http1-only key, `h2`
-/// alone under the prior-knowledge key (http1-only, applied last, wins when both are set), and none
-/// on a cleartext one.
+/// alone under the prior-knowledge key (http1-only, applied last, wins when both are set); on a
+/// cleartext one `h2` alone under prior knowledge (spoken by prior knowledge) and none otherwise.
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     let keys = |s: &'static str| {
@@ -73,9 +73,17 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
         ),
         b"\x08http/1.1"
     );
+    // In the clear: the one protocol spoken by prior knowledge, else none.
     assert_eq!(offer(false, "{}"), b"");
     assert_eq!(
         offer(false, r#"{"advanced.upstream_h2_prior_knowledge":true}"#),
+        b"\x02h2"
+    );
+    assert_eq!(
+        offer(
+            false,
+            r#"{"advanced.upstream_h2_prior_knowledge":true,"advanced.upstream_http1_only":true}"#
+        ),
         b""
     );
     assert_eq!(offer_for(false, false, true), b"");
