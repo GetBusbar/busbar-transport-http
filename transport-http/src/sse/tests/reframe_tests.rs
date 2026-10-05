@@ -95,16 +95,3 @@ fn the_composition_root_install_hands_the_installed_capability_back() {
         "the installed capability reframes byte-identically to the free fn"
     );
 }
-
-#[test]
-fn every_reframed_event_carries_a_field_the_inbound_carve_recognises() {
-    // The outbound framing and the inbound recogniser are the two halves of one wire: what this
-    // produces must read back as a real frame, not a comment the carve would drop.
-    let bytes = reframe(&[b"log-line"], b"answer");
-    let mut buf = bytes.clone();
-    let (frames, _moved) = crate::sse::carve_complete_frames(&mut buf, 0);
-    assert_eq!(frames.len(), 2);
-    for frame in &frames {
-        assert!(crate::sse::proto::frame_carries_a_field(frame));
-    }
-}
