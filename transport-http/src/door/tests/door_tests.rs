@@ -43,18 +43,50 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(101), STATUS_OTHER);
 }
 
-/// `locate`'s protocol offer is 1.5.5's client's ALPN offer: `h2, http/1.1` on a secured target,
-/// `http/1.1` alone under the http1-only key, and none on a cleartext one.
+/// `locate`'s protocol offer is 1.5.5's client's ALPN offer (reqwest 0.12 by its version
+/// preference): `h2, http/1.1` on a secured target, `http/1.1` alone under the http1-only key, `h2`
+/// alone under the prior-knowledge key (http1-only, applied last, wins when both are set); on a
+/// cleartext one `h2` alone under prior knowledge (spoken by prior knowledge) and none otherwise.
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
-    let http1_only = |s: &'static str| read_settings(blob(s)).expect("settings").2;
-    assert_eq!(offer_for(true, http1_only("{}")), b"\x02h2\x08http/1.1");
+    let keys = |s: &'static str| {
+        let (_, prior, h1) = read_settings(blob(s)).expect("settings");
+        (prior, h1)
+    };
+    let offer = |secure, s| {
+        let (prior, h1) = keys(s);
+        offer_for(secure, prior, h1)
+    };
+    assert_eq!(offer(true, "{}"), b"\x02h2\x08http/1.1");
     assert_eq!(
-        offer_for(true, http1_only(r#"{"advanced.upstream_http1_only":true}"#)),
+        offer(true, r#"{"advanced.upstream_http1_only":true}"#),
         b"\x08http/1.1"
     );
-    assert_eq!(offer_for(false, http1_only("{}")), b"");
-    assert_eq!(offer_for(false, true), b"");
+    assert_eq!(
+        offer(true, r#"{"advanced.upstream_h2_prior_knowledge":true}"#),
+        b"\x02h2"
+    );
+    assert_eq!(
+        offer(
+            true,
+            r#"{"advanced.upstream_h2_prior_knowledge":true,"advanced.upstream_http1_only":true}"#
+        ),
+        b"\x08http/1.1"
+    );
+    // In the clear: the one protocol spoken by prior knowledge, else none.
+    assert_eq!(offer(false, "{}"), b"");
+    assert_eq!(
+        offer(false, r#"{"advanced.upstream_h2_prior_knowledge":true}"#),
+        b"\x02h2"
+    );
+    assert_eq!(
+        offer(
+            false,
+            r#"{"advanced.upstream_h2_prior_knowledge":true,"advanced.upstream_http1_only":true}"#
+        ),
+        b""
+    );
+    assert_eq!(offer_for(false, false, true), b"");
 }
 
 /// RED: the head is the field block — lower-case names, hyper's (1.5.5's) order with a repeated
@@ -83,10 +115,10 @@ fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
         );
     }
     assert_eq!(
-        String::from_utf8(engine::field_block(&h)).unwrap(),
+        String::from_utf8(engine::field_block(&h, &[])).unwrap(),
         "x-b: 1\r\nx-b: 2\r\nx-a: v: w\r\nx-session-id: s1\r\n"
     );
-    assert!(engine::field_block(&http::HeaderMap::new()).is_empty());
+    assert!(engine::field_block(&http::HeaderMap::new(), &[]).is_empty());
 }
 
 /// A field block is cut only at a line's start or inside a value, never inside a name: the host

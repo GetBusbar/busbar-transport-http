@@ -183,6 +183,12 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
             name: s("content-type"),
             value: s("application/json"),
         },
+        // 1.5.5's client-default `accept`, which the caller writes: the door writes no field the
+        // plane did not (transport neutrality).
+        Field {
+            name: s("accept"),
+            value: s("*/*"),
+        },
     ];
     let mut e: EncodeIn = z();
     e.fields = fields.as_ptr();
