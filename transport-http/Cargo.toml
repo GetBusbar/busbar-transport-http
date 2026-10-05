@@ -28,7 +28,7 @@ crate-type = ["rlib"]
 [dependencies]
 tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 memchr = "2"
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b24168c3051feb30534bf924422190cb5d60a23" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8e13f029d656170048bfe4ea8416ac92c702b8dc" }
 futures = "0.3"
 tokio = { version = "1", features = ["net", "rt", "sync", "io-util", "time", "macros"] }
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
@@ -50,6 +50,6 @@ url = "2"
 # The TEST-ONLY seal (#65). `busbar_contract::plugin::TestKernelSeal` is the one blessed
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b24168c3051feb30534bf924422190cb5d60a23", features = ["test-seal"] }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8e13f029d656170048bfe4ea8416ac92c702b8dc", features = ["test-seal"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
