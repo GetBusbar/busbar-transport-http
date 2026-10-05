@@ -76,11 +76,11 @@ use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
-    EmitIn, EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn,
-    ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn, StatusRow,
-    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL,
-    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
-    YIELD_ENDED,
+    EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
+    ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
+    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
+    FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
+    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -197,6 +197,53 @@ pub(crate) const STATUS_ROWS: &[StatusRow] = &[
         class: STATUS_FAR_END_FAULT as u32,
     },
 ];
+
+/// What each answer means to the BREAKER, in HTTP's numbering: the fault table, beside the status
+/// table and never folded into it (the status class is the fee decision's leg). A refused
+/// credential (`401`, `403`) takes the destination down for every caller. A timed-out or throttled
+/// request (`408`, `429`) and every `5xx` (`529`, a provider's overloaded answer, among them) is the
+/// destination's transient fault, its `Retry-After` the cooldown floor. Every other `4xx` is the
+/// caller's own. A status off the table (`2xx`, `3xx`) states no reading. This is 1.5.5's breaker
+/// table exactly, moved to the wire that owns the numbering (busbar ARCHITECT breaker ruling Q1).
+const HTTP_FAULTS: [(u32, u32, u8); 10] = [
+    (400, 400, FAULT_CALLER),
+    (401, 401, FAULT_HARD),
+    (402, 402, FAULT_CALLER),
+    (403, 403, FAULT_HARD),
+    (404, 407, FAULT_CALLER),
+    (408, 408, FAULT_TRANSIENT),
+    (409, 428, FAULT_CALLER),
+    (429, 429, FAULT_TRANSIENT),
+    (430, 499, FAULT_CALLER),
+    (500, 599, FAULT_TRANSIENT),
+];
+
+/// How many claims the fault table covers, by claim index.
+const FAULT_CLAIMS: usize = 2;
+
+/// The fault table, by claim index: `sse` reads `http`'s.
+pub(crate) const FAULT_ROWS: &[FaultRow] = &fault_rows();
+
+const fn fault_rows() -> [FaultRow; FAULT_CLAIMS * HTTP_FAULTS.len()] {
+    let mut out = [FaultRow {
+        claim: 0,
+        lo: 0,
+        hi: 0,
+        fault: 0,
+    }; FAULT_CLAIMS * HTTP_FAULTS.len()];
+    let mut i = 0;
+    while i < out.len() {
+        let (lo, hi, fault) = HTTP_FAULTS[i % HTTP_FAULTS.len()];
+        out[i] = FaultRow {
+            claim: (i / HTTP_FAULTS.len()) as u32,
+            lo,
+            hi,
+            fault: fault as u32,
+        };
+        i += 1;
+    }
+    out
+}
 
 pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
@@ -711,7 +758,7 @@ fn step(
             return failed(o, e.0);
         }
     }
-    fill(&mut h.framing, sink, o, class_of);
+    fill(&mut h.framing, sink, o, class_of, fault_of);
     Outcome::Ready
 }
 
@@ -726,6 +773,14 @@ fn class_of(code: u16) -> u8 {
         500..=599 => STATUS_FAR_END_FAULT,
         _ => STATUS_OTHER,
     }
+}
+
+/// The breaker's reading of `code`, from the fault table (`FAULT_NONE` off it).
+fn fault_of(code: u16) -> u8 {
+    FAULT_ROWS
+        .iter()
+        .find(|r| r.claim == 0 && (r.lo..=r.hi).contains(&u32::from(code)))
+        .map_or(FAULT_NONE, |r| r.fault as u8)
 }
 
 busbar_contract::plugin_door! {

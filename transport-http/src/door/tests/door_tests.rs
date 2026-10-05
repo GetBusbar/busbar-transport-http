@@ -43,6 +43,61 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(101), STATUS_OTHER);
 }
 
+/// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
+/// their band. Written out rather than derived from the table, so a row that drifted fails here.
+#[test]
+fn a_status_code_maps_to_the_breakers_fault_reading() {
+    let expect: &[(u16, u8)] = &[
+        (200, FAULT_NONE),
+        (204, FAULT_NONE),
+        (301, FAULT_NONE),
+        (399, FAULT_NONE),
+        (400, FAULT_CALLER),
+        (401, FAULT_HARD),
+        (402, FAULT_CALLER),
+        (403, FAULT_HARD),
+        (404, FAULT_CALLER),
+        (407, FAULT_CALLER),
+        (408, FAULT_TRANSIENT),
+        (409, FAULT_CALLER),
+        (413, FAULT_CALLER),
+        (422, FAULT_CALLER),
+        (428, FAULT_CALLER),
+        (429, FAULT_TRANSIENT),
+        (430, FAULT_CALLER),
+        (499, FAULT_CALLER),
+        (500, FAULT_TRANSIENT),
+        (503, FAULT_TRANSIENT),
+        (529, FAULT_TRANSIENT),
+        (599, FAULT_TRANSIENT),
+        (600, FAULT_NONE),
+    ];
+    for (code, fault) in expect {
+        assert_eq!(fault_of(*code), *fault, "status {code}");
+    }
+}
+
+/// Every claim that classes its answers reads them for the breaker too, with the same table, and
+/// the tail the door states passes the host's load checks for both tables.
+#[test]
+fn every_classed_claim_has_the_fault_table() {
+    use busbar_contract::abi::transport::check::{
+        check_fault_cover, check_fault_rows, check_status_rows,
+    };
+    let claims = FAULT_CLAIMS as u64;
+    assert_eq!(check_status_rows(STATUS_ROWS, claims), Ok(()));
+    assert_eq!(check_fault_rows(FAULT_ROWS, claims), Ok(()));
+    assert_eq!(check_fault_cover(STATUS_ROWS, FAULT_ROWS), Ok(()));
+    for claim in 0..FAULT_CLAIMS as u32 {
+        let rows: Vec<(u32, u32, u32)> = FAULT_ROWS
+            .iter()
+            .filter(|r| r.claim == claim)
+            .map(|r| (r.lo, r.hi, r.fault))
+            .collect();
+        assert_eq!(rows.len(), HTTP_FAULTS.len(), "claim {claim}");
+    }
+}
+
 /// `locate`'s protocol offer is 1.5.5's client's ALPN offer (reqwest 0.12 by its version
 /// preference): `h2, http/1.1` on a secured target, `http/1.1` alone under the http1-only key, `h2`
 /// alone under the prior-knowledge key (http1-only, applied last, wins when both are set); on a
