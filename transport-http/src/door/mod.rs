@@ -2,7 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
-//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door.
+//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
+//! crate's ONE entry and claims two schemes, `http` and `sse` (an event stream is an HTTP response
+//! body, framed alike); it composes over nothing, the carrier being the connector's choice.
 //!
 //! A framer frames; it does not dial. The connector owns the socket and connection security; the
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
@@ -76,9 +78,9 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn,
     ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn, StatusRow,
-    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
-    SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
-    STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
+    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL,
+    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -105,6 +107,8 @@ pub mod setting {
 
 const SELECTOR_CODES: [u8; crate::claims::SELECTOR_FORMS.len()] =
     form_codes(crate::claims::SELECTOR_FORMS);
+const SSE_SELECTOR_CODES: [u8; crate::claims::SSE_SELECTOR_FORMS.len()] =
+    form_codes(crate::claims::SSE_SELECTOR_FORMS);
 
 const FACTS: &[AbiStr] = &[
     abi_str(tfacts::PATH),
@@ -120,31 +124,42 @@ const fn bytes_str(b: &'static [u8]) -> AbiStr {
     }
 }
 
-/// The schemes `http` claims, by name: the Statement's `claims`, the one place they are stated.
-const CLAIM_NAMES: &[AbiStr] = &[abi_str(
-    <crate::HttpTransport as busbar_contract::TransportMeta>::KEY,
-)];
+/// The schemes this ONE entry claims, by name: the Statement's `claims`, the one place they are
+/// stated. `http`, and `sse` (an HTTP response body read as events), framed alike.
+const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY), abi_str(crate::meta::SSE_KEY)];
 
-/// Each claimed scheme's row, by index into [`CLAIM_NAMES`].
-const CLAIMS: &[Claim] = &[Claim {
-    selector_forms: bytes_str(&SELECTOR_CODES),
-    egress_selector_forms: abi_str(""),
-    facts: FACTS.as_ptr(),
-    facts_len: FACTS.len(),
-    status_namespace: abi_str(status_ns::HTTP),
-    session: 0,
-    session_bound: 0,
-    unit0_trigger: 0,
-    status_at: STATUS_AT_FIRST_FRAME,
-    _reserved: 0,
-}];
+/// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
+/// and no selector of its own (the request that opens a stream is an `http` one); its status leg is
+/// `http`'s, at the first frame.
+pub(crate) const CLAIMS: &[Claim] = &[
+    Claim {
+        selector_forms: bytes_str(&SELECTOR_CODES),
+        egress_selector_forms: abi_str(""),
+        facts: FACTS.as_ptr(),
+        facts_len: FACTS.len(),
+        status_namespace: abi_str(status_ns::HTTP),
+        session: 0,
+        session_bound: 0,
+        unit0_trigger: 0,
+        status_at: STATUS_AT_FIRST_FRAME,
+        _reserved: 0,
+    },
+    Claim {
+        selector_forms: bytes_str(&SSE_SELECTOR_CODES),
+        egress_selector_forms: abi_str(""),
+        facts: std::ptr::null(),
+        facts_len: 0,
+        status_namespace: abi_str(status_ns::HTTP),
+        session: 0,
+        session_bound: 0,
+        unit0_trigger: 0,
+        status_at: STATUS_AT_FIRST_FRAME,
+        _reserved: 0,
+    },
+];
 
-/// What `http` composes over, as the transport's own declaration states it.
-const COMPOSES_OVER: &[AbiStr] = &[abi_str(
-    <crate::HttpTransport as busbar_contract::TransportMeta>::COMPOSES_OVER[0],
-)];
-
-const STATUS_ROWS: &[StatusRow] = &[
+/// Each claim's status classes, by claim index: `sse` reads `http`'s.
+pub(crate) const STATUS_ROWS: &[StatusRow] = &[
     StatusRow {
         claim: 0,
         lo: 200,
@@ -163,9 +178,27 @@ const STATUS_ROWS: &[StatusRow] = &[
         hi: 599,
         class: STATUS_FAR_END_FAULT as u32,
     },
+    StatusRow {
+        claim: 1,
+        lo: 200,
+        hi: 299,
+        class: STATUS_SUCCESS as u32,
+    },
+    StatusRow {
+        claim: 1,
+        lo: 400,
+        hi: 499,
+        class: STATUS_CALLER_FAULT as u32,
+    },
+    StatusRow {
+        claim: 1,
+        lo: 500,
+        hi: 599,
+        class: STATUS_FAR_END_FAULT as u32,
+    },
 ];
 
-const SETTINGS: &[SettingDecl] = &[
+pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
         path: abi_str(setting::H2_PRIOR_KNOWLEDGE),
         kind: SETTING_FLAG,
@@ -192,42 +225,12 @@ const SETTINGS: &[SettingDecl] = &[
     },
 ];
 
-const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
-
-const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
-    facts: 0,
-    handshake_max_steps: 0,
-    composes_over: COMPOSES_OVER.as_ptr(),
-    composes_over_len: COMPOSES_OVER.len(),
-    claim_rows: CLAIMS.as_ptr(),
-    claim_rows_len: CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: STATUS_ROWS.as_ptr(),
-    status_rows_len: STATUS_ROWS.len(),
-    settings: SETTINGS.as_ptr(),
-    settings_len: SETTINGS.len(),
-};
-
-/// The door's Statement: the `http` framer.
+/// The door's Statement: the `http` framer, claiming `http` and `sse`.
 pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
+    kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
-    ..statement("http", env!("CARGO_PKG_VERSION"), 64)
+    ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────

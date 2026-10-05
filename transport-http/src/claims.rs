@@ -24,5 +24,6 @@ pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::PathContains,
 ];
 
-/// The forms an EGRESS claim over this wire may take: none.
-pub(crate) const EGRESS_SELECTOR_FORMS: &[SelectorForm] = &[];
+/// The forms an INGRESS claim on the `sse` scheme may take: none. The request that opens an event
+/// stream is an `http` request, and the claim that reads it is the `http` one.
+pub(crate) const SSE_SELECTOR_FORMS: &[SelectorForm] = &[];
