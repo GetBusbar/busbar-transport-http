@@ -207,3 +207,36 @@ fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
         "cut at 300s from the attempt's start, not from the send"
     );
 }
+
+/// The request bytes one emitted message puts on the wire, on HTTP/1.1.
+fn h1_wire(message: &[u8]) -> String {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    f.emit(1, message, 0, 0).expect("emit");
+    f.drive(0, 0);
+    String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
+}
+
+/// RED (busbar SEAM-4i, transport neutrality): the door writes no header field the plane did not
+/// write. A request naming no `accept` leaves with none (1.5.5's client default is the caller's to
+/// carry now), while what the connection itself needs (`host`, the origin-form target) is still
+/// written; a request that names `accept` leaves with exactly that one.
+#[test]
+fn the_door_writes_no_accept_the_plane_did_not_write() {
+    let bare = h1_wire(b"GET /x HTTP/1.1\r\n\r\n");
+    assert!(bare.starts_with("GET /x HTTP/1.1\r\n"), "{bare:?}");
+    assert!(
+        bare.to_ascii_lowercase().contains("host: 127.0.0.1:9\r\n"),
+        "{bare:?}"
+    );
+    assert!(!bare.to_ascii_lowercase().contains("accept"), "{bare:?}");
+    let named = h1_wire(b"GET /x HTTP/1.1\r\naccept: */*\r\n\r\n");
+    assert_eq!(
+        named
+            .to_ascii_lowercase()
+            .matches("accept: */*\r\n")
+            .count(),
+        1,
+        "{named:?}"
+    );
+}

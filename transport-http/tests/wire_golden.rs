@@ -10,9 +10,10 @@
 //!
 //! This test reads every such cell and drives the door with the same logical request, as a plane
 //! hands it over: the verb, the target, the plane's own header fields in their order, and the body.
-//! What the door adds itself is taken OUT of the fields first (`host`, `content-length`, and a
-//! trailing `accept: */*`, the client default), so the door must put each back exactly where 1.5.5
-//! did. Then the door's bytes are compared with the recording:
+//! What the door adds itself is taken OUT of the fields first (`host` and `content-length`), so
+//! the door must put each back exactly where 1.5.5 did. A trailing `accept: */*` (1.5.5's client
+//! default) stays in the plane's own fields: the door writes no field the plane did not write
+//! (transport neutrality), so the caller carries it. Then the door's bytes are compared with the recording:
 //!
 //! * HTTP/1.1: the whole request message, byte for byte;
 //! * HTTP/2: the connection preface, every frame the client sent up to the request's end (type,
@@ -179,25 +180,18 @@ fn recorded() -> Vec<Recorded> {
     out
 }
 
-/// The plane's own fields: what 1.5.5's client added itself is taken out, so the door has to add
-/// it back. `host`/`:authority`, `content-length`, the pseudo-fields, and a TRAILING `accept: */*`
-/// (the client default; one a caller set earlier in its list is the caller's, and stays).
+/// The plane's own fields: what the http connection adds itself is taken out, so the door has to
+/// add it back: `host`/`:authority`, `content-length` and the pseudo-fields. Every other field,
+/// 1.5.5's client-default `accept: */*` included, is the caller's to write (transport neutrality).
 fn plane_fields(r: &Recorded) -> Vec<(String, String)> {
-    let mut f: Vec<(String, String)> = r
-        .headers
+    r.headers
         .iter()
         .filter(|(n, _)| {
             let n = n.to_ascii_lowercase();
             !n.starts_with(':') && n != "host" && n != "content-length"
         })
         .cloned()
-        .collect();
-    if f.last()
-        .is_some_and(|(n, v)| n.eq_ignore_ascii_case("accept") && v == "*/*")
-    {
-        f.pop();
-    }
-    f
+        .collect()
 }
 
 // ── the door ─────────────────────────────────────────────────────────────────────────────────────
