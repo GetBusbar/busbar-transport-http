@@ -78,9 +78,9 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut, ListenIn,
     ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn, StatusRow,
-    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FRAMING_STREAM, ROLE_FRAMER, SETTING_COUNT,
-    SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
-    STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
+    TransportTail, WriteIn, CANCEL_NOTHING_MOVED, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL,
+    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -131,7 +131,7 @@ const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY), abi_str(crate::meta:
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
 /// and no selector of its own (the request that opens a stream is an `http` one); its status leg is
 /// `http`'s, at the first frame.
-const CLAIMS: &[Claim] = &[
+pub(crate) const CLAIMS: &[Claim] = &[
     Claim {
         selector_forms: bytes_str(&SELECTOR_CODES),
         egress_selector_forms: abi_str(""),
@@ -159,7 +159,7 @@ const CLAIMS: &[Claim] = &[
 ];
 
 /// Each claim's status classes, by claim index: `sse` reads `http`'s.
-const STATUS_ROWS: &[StatusRow] = &[
+pub(crate) const STATUS_ROWS: &[StatusRow] = &[
     StatusRow {
         claim: 0,
         lo: 200,
@@ -198,7 +198,7 @@ const STATUS_ROWS: &[StatusRow] = &[
     },
 ];
 
-const SETTINGS: &[SettingDecl] = &[
+pub(crate) const SETTINGS: &[SettingDecl] = &[
     SettingDecl {
         path: abi_str(setting::H2_PRIOR_KNOWLEDGE),
         kind: SETTING_FLAG,
@@ -225,40 +225,9 @@ const SETTINGS: &[SettingDecl] = &[
     },
 ];
 
-const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
-
-const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
-    facts: 0,
-    handshake_max_steps: 0,
-    // No transport names another: the carrier is the connector's choice from the target's scheme.
-    composes_over: std::ptr::null(),
-    composes_over_len: 0,
-    claim_rows: CLAIMS.as_ptr(),
-    claim_rows_len: CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: STATUS_ROWS.as_ptr(),
-    status_rows_len: STATUS_ROWS.len(),
-    settings: SETTINGS.as_ptr(),
-    settings_len: SETTINGS.len(),
-};
-
 /// The door's Statement: the `http` framer, claiming `http` and `sse`.
 pub const STATEMENT: Statement = Statement {
-    kind_tail: (&TAIL as *const TransportTail).cast::<KindTailHead>(),
+    kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
     ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
