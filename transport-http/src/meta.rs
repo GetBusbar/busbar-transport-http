@@ -1,52 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! What this transport declares about itself.
-//!
-//! Everything here is an associated constant, because everything here is read once at registration
-//! and sealed. Held as the kind's own `meta.rs` (`BUSBAR-1.6.0.md` THE DESIGN, §2) so two siblings of the
-//! transport kind are indistinguishable in shape.
+//! What this transport declares about itself, as the kind's own file (`BUSBAR-1.6.0.md` THE
+//! DESIGN, §2): the schemes it claims and how each is framed. Read once at registration and sealed,
+//! so it is data, held apart from the framing code it describes; the door's Statement states it.
 
-use busbar_contract::transport::registry::facts as tfacts;
-use busbar_contract::{Kind, Plugin, SelectorForm, TransportMeta};
+/// The `http` claim: the entry's first claim and the row's key.
+pub(crate) const KEY: &str = "http";
 
-use crate::claims;
-use crate::HttpTransport;
+/// The `sse` claim: an HTTP response body read as a stream of events, framed as `http` is.
+pub(crate) const SSE_KEY: &str = "sse";
 
-impl Plugin for HttpTransport {
-    fn key(&self) -> &'static str {
-        Self::KEY
-    }
-    fn kind(&self) -> Kind {
-        Kind::Transport
-    }
-    fn abi(&self) -> busbar_contract::transport::AbiVersion {
-        busbar_contract::transport::registry::TRANSPORT_ABI
-    }
-}
+/// The layers this framer is built over: none. The carrier is the connector's choice from the
+/// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
+pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
-impl TransportMeta for HttpTransport {
-    const KEY: &'static str = "http";
-    const SELECTOR_FORMS: &'static [SelectorForm] = claims::SELECTOR_FORMS;
-    const EGRESS_SELECTOR_FORMS: &'static [SelectorForm] = claims::EGRESS_SELECTOR_FORMS;
-    const COMPOSES_OVER: &'static [&'static str] = &["tcp"];
-    const HANDOFF: Option<busbar_contract::transport::wire::Handoff> = None;
-    const FRAMING: busbar_contract::transport::wire::Framing =
-        busbar_contract::transport::wire::Framing::Stream;
-    const SESSION: bool = false;
-    const SESSION_BOUND: bool = false;
-    const UNIT0_TRIGGER: Option<busbar_contract::transport::wire::Unit0Trigger> = None;
-    const UPGRADES_TO: &'static [&'static str] = &[];
-    const HANDSHAKE_TRIGGER: Option<busbar_contract::transport::wire::HandshakeTrigger> = None;
-    const TRANSPORT_FACTS: &'static [&'static str] = &[
-        tfacts::PATH,
-        tfacts::METHOD,
-        tfacts::AUTHORITY,
-        tfacts::PEER,
-    ];
-    const DECODES_PAYLOAD: bool = false;
-    const STATUS_CLASS: Option<busbar_contract::transport::wire::StatusAt> =
-        Some(busbar_contract::transport::wire::StatusAt::FirstFrame);
-    const STATUS_NAMESPACE: Option<&'static str> =
-        Some(busbar_contract::transport::registry::status_ns::HTTP);
-}
+/// Neither claim carries a session.
+pub(crate) const SESSION: bool = false;
