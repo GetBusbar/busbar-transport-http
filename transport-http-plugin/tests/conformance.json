@@ -1,0 +1,49 @@
+{
+  "settings": {},
+  "transport": {
+    "locate": {
+      "reads": [
+        {
+          "target": "http://peer.test:8080/v1/x",
+          "authority": "peer.test:8080",
+          "secure": false,
+          "has_name": true
+        }
+      ],
+      "refuses": [
+        "ftp://peer.test/x"
+      ]
+    },
+    "dial": {
+      "target": "http://peer.test:8080/v1/x",
+      "emit": "POST /v1/x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi",
+      "wire": "POST /v1/x HTTP/1.1\r\nhost: peer.test:8080\r\ncontent-length: 2\r\n\r\nhi",
+      "ingest": "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
+      "frames": [
+        "",
+        "ok",
+        ""
+      ],
+      "deadline": true
+    },
+    "encode": [
+      {
+        "body": "b",
+        "fields": [
+          [
+            "method",
+            "POST"
+          ],
+          [
+            "path",
+            "/v1/x"
+          ]
+        ],
+        "wire": "POST /v1/x HTTP/1.1\r\ncontent-length: 1\r\n\r\nb"
+      }
+    ],
+    "refuse": "refused",
+    "detach": "refused",
+    "adopt": "refused"
+  }
+}

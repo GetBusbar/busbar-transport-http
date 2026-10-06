@@ -58,4 +58,6 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     status_rows_len: crate::door::STATUS_ROWS.len(),
     settings: crate::door::SETTINGS.as_ptr(),
     settings_len: crate::door::SETTINGS.len(),
+    fault_rows: crate::door::FAULT_ROWS.as_ptr(),
+    fault_rows_len: crate::door::FAULT_ROWS.len(),
 };
