@@ -461,8 +461,8 @@ fn advance(
                     }
                 }
                 Poll::Ready(None) => {
-                    // The empty piece that says this stream's response is whole.
-                    out.push_back(Piece::data(id, Bytes::new()));
+                    // The end piece (`PIECE_END`) that says this stream's response is whole.
+                    out.push_back(Piece::end(id));
                     *stage = Stage::Done;
                     return Ok(());
                 }
