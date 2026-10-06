@@ -26,13 +26,9 @@ crate-type = ["rlib"]
 # &["tcp"]` in `meta.rs` is a declared wire fact the registry reads, and it needs no link edge to be
 # true.
 [dependencies]
-tokio-util = { version = "0.7", default-features = false, features = ["compat"] }
 memchr = "2"
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "085c207abc59cb87f50c950b6a8e6c73d56f221a" }
-futures = "0.3"
-tokio = { version = "1", features = ["net", "rt", "sync", "io-util", "time", "macros"] }
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
