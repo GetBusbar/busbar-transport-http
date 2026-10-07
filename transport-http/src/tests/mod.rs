@@ -299,3 +299,38 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     crate::transport::render_envelope(&[("x-note", b"ok".as_slice())], b"body")
         .expect("a clean field still encodes");
 }
+
+/// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
+/// re-parses its own rendered message (`authorization:x` + `v` becomes `authorization` = `x: v`),
+/// which slips past the kernel's same-name auth replacement: refused, nothing rendered.
+#[test]
+fn a_field_name_that_is_not_a_token_is_refused() {
+    for name in [
+        "authorization:x",
+        "a b",
+        "",
+        "x\u{e9}",
+        "a(b",
+        "a/b",
+        "a\"b",
+        "a\tb",
+    ] {
+        let err = crate::transport::render_envelope(&[(name, b"v".as_slice())], b"")
+            .expect_err("a non-token field name is not encodable");
+        assert_eq!(
+            err,
+            busbar_contract::transport::wire::Encode::Unrepresentable,
+            "name {name:?} was written through"
+        );
+    }
+    let ok = crate::transport::render_envelope(
+        &[
+            ("authorization", b"Bearer a".as_slice()),
+            ("x-a.b_c~1!#$%&'*+^`|", b"v".as_slice()),
+        ],
+        b"",
+    )
+    .expect("token names still encode");
+    let text = String::from_utf8(ok).unwrap();
+    assert_eq!(text.matches("authorization").count(), 1);
+}
