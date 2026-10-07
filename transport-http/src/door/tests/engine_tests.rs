@@ -240,3 +240,52 @@ fn the_door_writes_no_accept_the_plane_did_not_write() {
         "{named:?}"
     );
 }
+
+/// What one emit of `message` on `stream` puts on the wire.
+fn sent(f: &mut Framing, stream: u64, message: &[u8]) -> String {
+    f.emit(stream, message, 0, 0).expect("emit");
+    f.drive(0, 0);
+    String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
+}
+
+/// The far end answers the request in flight, whole, so the line is free for the next one.
+fn answered(f: &mut Framing) {
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", false);
+    f.drive(0, 0);
+    f.pieces().clear();
+}
+
+/// RED (busbar ruling (T), the pooled line's request target): a stated target always wins, `/`
+/// included; only a request naming NO target inherits the dial's path, and only as the
+/// connection's first. A line dialled to `http://h/card` by one exchange is lent, pooled by
+/// authority, to the next exchange to the same place: that exchange's stated `POST /` goes to `/`,
+/// never to `/card` (at 9e0d6fee15 it went to `/card`, the far end answered 405, and the breaker
+/// counted a fault the far end never had). A later request naming no target goes to `/`.
+#[test]
+fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialled() {
+    let mut f = Framing::dial("http://127.0.0.1:9/card", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
+    let first = sent(&mut f, 1, &unnamed);
+    assert!(
+        first.starts_with("GET /card HTTP/1.1\r\n"),
+        "the first request names no target: the dial's own path: {first:?}"
+    );
+    answered(&mut f);
+    let root = crate::transport::render_envelope(
+        &[("method", b"POST".as_slice()), ("path", b"/".as_slice())],
+        b"{}",
+    )
+    .unwrap();
+    let second = sent(&mut f, 2, &root);
+    assert!(
+        second.starts_with("POST / HTTP/1.1\r\n"),
+        "a stated `/` on the pooled line goes to `/`: {second:?}"
+    );
+    answered(&mut f);
+    let third = sent(&mut f, 3, &unnamed);
+    assert!(
+        third.starts_with("GET / HTTP/1.1\r\n"),
+        "a later request naming no target goes to `/`, not the dial's path: {third:?}"
+    );
+}

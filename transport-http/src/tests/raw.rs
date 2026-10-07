@@ -12,7 +12,7 @@ fn parses_a_request_line_and_headers() {
         msg.start,
         RawStartLine::Request {
             method: "GET".to_string(),
-            path: "/v1/models".to_string()
+            path: Some("/v1/models".to_string())
         }
     );
     assert_eq!(msg.headers[0], ("Host".to_string(), "example".to_string()));
