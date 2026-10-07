@@ -100,6 +100,10 @@ pub struct Framing {
     conn_err: Arc<Mutex<Option<String>>>,
     conn_done: Arc<AtomicBool>,
     dial: http::Uri,
+    /// Whether this connection has carried a request yet: the dial's own path is its FIRST
+    /// request's to inherit (when that request names no target), never a later one's
+    /// (`crate::message::request_target`).
+    carried: bool,
     proto: Proto,
     posture: Posture,
     exchanges: Vec<(u64, Stage)>,
@@ -163,6 +167,7 @@ impl Framing {
             conn_err,
             conn_done,
             dial,
+            carried: false,
             proto,
             posture,
             exchanges: Vec::new(),
@@ -248,9 +253,10 @@ impl Framing {
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
-        let mut b = http::Request::builder()
-            .method(method.as_str())
-            .uri(request_target(&self.dial, path).map_err(|e| Failure(format!("{e:?}")))?);
+        let target = request_target(&self.dial, path.as_deref(), !self.carried)
+            .map_err(|e| Failure(format!("{e:?}")))?;
+        self.carried = true;
+        let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // hyper frames the body below; a length or coding the message carried describes the
             // wire it was written for, not the one going out.

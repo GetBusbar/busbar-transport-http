@@ -102,18 +102,27 @@ fn civil_to_epoch_secs(
     Some(days_since_epoch * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
-/// Where an egress request actually goes: the dialled scheme and authority, carrying the path the
-/// ENVELOPE named.
+/// Where an egress request actually goes: the dialled scheme and authority, carrying the target
+/// the message STATED.
 ///
 /// A dial pins a destination — scheme, host, port. It does not pin a request: one connection to an
-/// upstream carries many requests, and on an API whose surface is its path they are different
-/// requests only because their paths differ. So the path travels with the message, and the dial
-/// URI's own path stands in only when the message names none (`/` or empty), which is the shape a
-/// caller writes when the dial URI already spells the whole target.
-pub(crate) fn request_target(dial: &http::Uri, path: &str) -> Result<http::Uri, TransportError> {
-    if path.is_empty() || path == "/" {
-        return Ok(dial.clone());
-    }
+/// upstream carries many requests (a pooled line is lent to whichever exchange next opens to the
+/// same place), and on an API whose surface is its path they are different requests only because
+/// their paths differ. So a stated target always wins, `/` included. Only a request that names NO
+/// target (`path` = `None`) inherits the dial URI's own path — the shape a caller writes when the
+/// dial URI already spells the whole target — and only as the connection's FIRST request
+/// (`first`); a later request naming none goes to `/`, never to whatever path the exchange that
+/// dialled the line happened to name.
+pub(crate) fn request_target(
+    dial: &http::Uri,
+    path: Option<&str>,
+    first: bool,
+) -> Result<http::Uri, TransportError> {
+    let path = match path {
+        Some(stated) => stated,
+        None if first => return Ok(dial.clone()),
+        None => "/",
+    };
     let mut parts = dial.clone().into_parts();
     parts.path_and_query = Some(
         path.parse::<http::uri::PathAndQuery>()
