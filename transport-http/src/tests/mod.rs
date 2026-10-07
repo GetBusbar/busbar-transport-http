@@ -235,10 +235,38 @@ fn the_envelope_encodes_as_an_http_message() {
         parsed.start,
         raw::RawStartLine::Request {
             method: "POST".to_string(),
-            path: "/v1/messages".to_string()
+            path: Some("/v1/messages".to_string())
         }
     );
     assert_eq!(parsed.body, b"{\"model\":\"m\"}");
+}
+
+/// An envelope naming NO path is not one that named `/`: it renders an empty target word and reads
+/// back as no target at all, while a stated `/` reads back as `/` (the framing decides where each
+/// goes, `crate::message::request_target`).
+#[test]
+fn no_target_named_and_a_stated_root_stay_distinct() {
+    let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
+    assert!(unnamed.starts_with(b"GET  HTTP/1.1\r\n"), "{unnamed:?}");
+    assert_eq!(
+        raw::parse_message(&unnamed).expect("readable").start,
+        raw::RawStartLine::Request {
+            method: "GET".to_string(),
+            path: None
+        }
+    );
+    let root = crate::transport::render_envelope(
+        &[("method", b"GET".as_slice()), ("path", b"/".as_slice())],
+        b"",
+    )
+    .unwrap();
+    assert_eq!(
+        raw::parse_message(&root).expect("readable").start,
+        raw::RawStartLine::Request {
+            method: "GET".to_string(),
+            path: Some("/".to_string())
+        }
+    );
 }
 
 /// A CR or an LF in a field is not data on this wire: it ENDS the line. A caller that can put one

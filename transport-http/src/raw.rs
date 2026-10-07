@@ -14,8 +14,9 @@ pub enum RawStartLine {
     Request {
         /// The request method.
         method: String,
-        /// The request path.
-        path: String,
+        /// The request target the message STATED; `None` = it named none (an empty target word,
+        /// `METHOD  HTTP/version`). A stated `/` is `Some("/")`: it is a target like any other.
+        path: Option<String>,
     },
     /// `HTTP/version status reason`.
     Status {
@@ -106,7 +107,7 @@ fn parse_start_line(line: &str) -> Option<RawStartLine> {
     }
     Some(RawStartLine::Request {
         method: a.to_string(),
-        path: b.to_string(),
+        path: (!b.is_empty()).then(|| b.to_string()),
     })
 }
 
