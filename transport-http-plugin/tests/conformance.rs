@@ -23,8 +23,8 @@ use busbar_contract::abi::transport::{
 use busbar_plugin_loader::dispatch::kinds::hook::Hook;
 use busbar_plugin_loader::dispatch::kinds::transport::Transport;
 use busbar_plugin_loader::dispatch::{
-    in_head, load_dropped, load_linked, out_head, Bind, DispatchConfig, Dispatcher, Frame,
-    LinkedRow, LoadError, NoSink, Plugin,
+    in_head, load_dropped, load_linked, out_head, Bind, ConnTable, DispatchConfig, Dispatcher,
+    Frame, LinkedRow, LoadError, NoSink, Plugin,
 };
 
 fn z<T>() -> T {
@@ -67,7 +67,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: ConnTable::NoNeeds,
     }
 }
 
