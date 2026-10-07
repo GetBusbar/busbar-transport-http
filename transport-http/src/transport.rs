@@ -23,7 +23,10 @@ pub(crate) fn render_envelope(
             .map(|(_, v)| *v)
     };
     let method = field("method").unwrap_or(b"POST");
-    let path = field("path").unwrap_or(b"/");
+    // NO TARGET NAMED is not a stated `/`: it renders as an empty target word, which the framing
+    // reads back as `None` (the dial's own path, on the connection's first request only), while a
+    // stated `/` goes to `/` (`crate::message::request_target`).
+    let path = field("path").unwrap_or(b"");
 
     // A CR, an LF or a NUL anywhere in a name, a value, the method or the path is a byte that
     // ENDS a line on this wire. Writing one through means the caller chooses where this
