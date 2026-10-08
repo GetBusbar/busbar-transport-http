@@ -400,6 +400,29 @@ impl Host {
         got
     }
 
+    /// `encode` an envelope carrying one extra field `name` = `v`; the outcome only.
+    fn encode_with_field(&mut self, name: &'static str) -> Outcome {
+        let fields = [
+            Field {
+                name: s("authorization"),
+                value: s("Bearer sk-test"),
+            },
+            Field {
+                name: s(name),
+                value: s("v"),
+            },
+        ];
+        let mut i: EncodeIn = z();
+        i.fields = fields.as_ptr();
+        i.fields_len = fields.len();
+        i.body = "".as_ptr();
+        i.body_len = 0;
+        i.sink = self.sink();
+        i.sink.wire_cap = self.wire.len();
+        let mut o: FramerOut = z();
+        call(self.ops.encode, self.inst, &mut i, &mut o, slot::ENCODE)
+    }
+
     /// Ingest whatever the far end has sent until it stays quiet for `quiet`; the first op that
     /// fails ends the pump with its outcome.
     fn pump(&mut self, quiet: Duration, got: &mut Vec<Got>) -> Outcome {
@@ -821,5 +844,33 @@ fn a_yield_more_recall_answers_nothing_twice() {
             recall_continues(&dup, &roomy).is_err(),
             "a duplicated piece is caught"
         );
+    }
+}
+
+/// A field name that is not an RFC 9110 token (`authorization:x`) would be re-read as a second
+/// `authorization` on the door's own reparse: through the whole door, `encode` fails it, linked
+/// and dropped-in alike, while a token name still encodes.
+#[test]
+fn a_non_token_field_name_fails_encode_through_the_door() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (d, _lib) = dropped();
+    for ops in [linked(), d] {
+        let sock = serve(&rt, true);
+        let mut host = Host::open(
+            ops,
+            r#"{"advanced.upstream_h2_prior_knowledge":true}"#,
+            sock,
+            ROOMY,
+        );
+        host.begin("");
+        assert_eq!(host.encode_with_field("x-ok"), Outcome::Ready);
+        for bad in ["authorization:x", "a b", ""] {
+            assert_eq!(host.encode_with_field(bad), Outcome::Failed, "{bad:?}");
+        }
+        host.close();
     }
 }
