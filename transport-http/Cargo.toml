@@ -26,26 +26,26 @@ crate-type = ["rlib"]
 # &["tcp"]` in `meta.rs` is a declared wire fact the registry reads, and it needs no link edge to be
 # true.
 [dependencies]
-memchr = "2"
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "2add33afe2073215a8dbb1f655d14e4d324770e7" }
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
-http-body-util = "0.1"
-http = "1"
-bytes = "1"
+memchr = { workspace = true }
+busbar-contract = { workspace = true }
+hyper = { workspace = true }
+http-body-util = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
 # `http2` feature, built exactly as 1.5.5 built it, captured beside this door on the same request.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+reqwest = { workspace = true, features = ["http2"] }
 # THE REQUEST TARGET'S 1.5.5 BYTES (`door/tests`): the URL parser 1.5.5's client serialised
 # every upstream path with, compared against the door's own encoder. Already in this list's closure
 # through reqwest: no crate is added.
-url = "2"
+url = { workspace = true }
 # The TEST-ONLY seal (#65). `busbar_contract::plugin::TestKernelSeal` is the one blessed
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "2add33afe2073215a8dbb1f655d14e4d324770e7", features = ["test-seal"] }
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
+busbar-contract = { workspace = true, features = ["test-seal"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
