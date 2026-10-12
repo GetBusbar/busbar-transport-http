@@ -89,6 +89,46 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     assert_eq!(offer_for(false, false, true), b"");
 }
 
+/// RED (busbar ARCHITECT ruling on #780 (2), 1.5.5 parity): `locate` offers, and has the far end's
+/// certificate verified against, the ADDRESS an IPv4 spelling names, as 1.5.5's client did (its
+/// URL parser canonicalized the host before it connected): a spelling of loopback is `127.0.0.1`,
+/// a spelling of a public address is that address, a trailing root dot on an IPv4 literal is
+/// dropped. The authority dialled keeps the host as written, so the connector's destination guard
+/// still judges the spelling. A DNS name, an IPv6 literal and a dotted quad are offered as written.
+/// RED on the `locate` that offered `127.1` and `16909060` as names.
+#[test]
+fn locate_offers_the_address_an_ipv4_spelling_names() {
+    for (target, authority, name) in [
+        ("https://127.1:4318/v1/traces", "127.1:4318", "127.0.0.1"),
+        ("https://2130706433/", "2130706433:443", "127.0.0.1"),
+        ("https://0x7f000001:8443/", "0x7f000001:8443", "127.0.0.1"),
+        ("https://017700000001/", "017700000001:443", "127.0.0.1"),
+        ("https://16909060/", "16909060:443", "1.2.3.4"),
+        ("https://0x1020304/x", "0x1020304:443", "1.2.3.4"),
+        ("https://1.2.772/", "1.2.772:443", "1.2.3.4"),
+        ("https://127.0.0.1./", "127.0.0.1.:443", "127.0.0.1"),
+        (
+            "https://collector.example.com/",
+            "collector.example.com:443",
+            "collector.example.com",
+        ),
+        ("https://localhost:4318/", "localhost:4318", "localhost"),
+        ("https://[::1]:4318/", "[::1]:4318", "::1"),
+        (
+            "https://93.184.216.34/",
+            "93.184.216.34:443",
+            "93.184.216.34",
+        ),
+        ("http://127.1:4318/", "127.1:4318", "127.0.0.1"),
+    ] {
+        let (_, a, n) = located(target.as_bytes()).expect(target);
+        assert_eq!((a.as_str(), n.as_str()), (authority, name), "{target}");
+    }
+    assert_eq!(located(b"https://127.1/").map(|l| l.0), Ok(true));
+    assert_eq!(located(b"http://127.1/").map(|l| l.0), Ok(false));
+    assert!(located(b"ftp://127.1/").is_err());
+}
+
 /// RED: the head is the field block — lower-case names, hyper's (1.5.5's) order with a repeated
 /// field on its own lines after its first, values unaltered — and no hop-by-hop field (the fixed
 /// list, and what `connection` names: a `connection:`, `te:` or `upgrade:` line in the wire input
