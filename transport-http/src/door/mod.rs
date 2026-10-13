@@ -462,6 +462,50 @@ fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static 
     }
 }
 
+/// What `locate` answers for `target`: whether it is secured, the authority to dial (the host as
+/// the URL writes it, so the connector's destination guard judges the spelling the operator wrote),
+/// and the name offered to and verified against the far end ([`offered_name`]).
+fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
+    let Some(uri) = std::str::from_utf8(target)
+        .ok()
+        .and_then(|t| t.parse::<http::Uri>().ok())
+    else {
+        return Err("locate: the target is not a URL");
+    };
+    let secure = match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => false,
+        _ => return Err("locate: the target's scheme is not http or https"),
+    };
+    let Some(host) = uri.host() else {
+        return Err("locate: the target names no host");
+    };
+    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let authority = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok((secure, authority, offered_name(host)))
+}
+
+/// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
+/// its URL parser (WHATWG, reqwest 0.12) turned every IPv4 spelling into the dotted quad before it
+/// connected, so `https://127.1/` was verified against `127.0.0.1` and `https://16909060/` against
+/// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
+/// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
+/// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
+/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal, a dotted quad) is
+/// offered as written.
+fn offered_name(host: &str) -> String {
+    let bare = host.strip_suffix('.').unwrap_or(host);
+    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+        return v4.to_string();
+    }
+    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
+}
+
 /// `locate`.
 pub struct Locate;
 impl SafeSlot for Locate {
@@ -473,32 +517,12 @@ impl SafeSlot for Locate {
         i: Lent<'_, LocateIn>,
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
-        let Ok(uri) = std::str::from_utf8(i.field(|x| &x.target).bytes())
-            .ok()
-            .and_then(|t| t.parse::<http::Uri>().ok())
-            .ok_or(())
-        else {
-            o.error("locate: the target is not a URL");
-            return Outcome::Failed;
-        };
-        let secure = match uri.scheme_str() {
-            Some("https") => true,
-            Some("http") => false,
-            _ => {
-                o.error("locate: the target's scheme is not http or https");
+        let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
+            Ok(l) => l,
+            Err(why) => {
+                o.error(why);
                 return Outcome::Failed;
             }
-        };
-        let Some(host) = uri.host() else {
-            o.error("locate: the target names no host");
-            return Outcome::Failed;
-        };
-        let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let authority = if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
         };
         // The offer exists only where a handshake does: on a secured connection.
         let offer = p.get().map_or(offer_for(secure, false, false), |x| {
@@ -508,7 +532,7 @@ impl SafeSlot for Locate {
         o.set(|x| &x.has_name, 1);
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
         a.extend(authority.as_bytes());
-        n.extend(host.as_bytes());
+        n.extend(name.as_bytes());
         l.extend(offer);
         // One short answer for all three buffers, each at its full size.
         let short = !(a.fits() && n.fits() && l.fits());
