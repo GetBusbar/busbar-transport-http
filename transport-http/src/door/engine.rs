@@ -119,9 +119,10 @@ impl Framing {
     ///
     /// `dial` is not a URI.
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
-        let dial: http::Uri = dial
-            .parse()
-            .map_err(|_| Failure(format!("not a target: {dial}")))?;
+        let dial = canonical_host(
+            dial.parse()
+                .map_err(|_| Failure(format!("not a target: {dial}")))?,
+        );
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
         let (exec, timer) = (io.exec(), io.timer());
@@ -347,6 +348,31 @@ impl Owed for Framing {
     fn ended(&self) -> bool {
         self.conn_done.load(Ordering::Acquire)
     }
+}
+
+/// The dial target with an IPv4 spelling in its host written as the dotted quad it names
+/// ([`super::offered_name`]), so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2)
+/// carry the address 1.5.5's client sent: its URL parser canonicalized the host before the
+/// request was built (`https://127.1:4318/` went out as `host: 127.0.0.1:4318`). Any other host is
+/// kept as written.
+fn canonical_host(dial: http::Uri) -> http::Uri {
+    let Some(host) = dial.host() else {
+        return dial;
+    };
+    let name = super::offered_name(host);
+    if name == host {
+        return dial;
+    }
+    let authority = match dial.port_u16() {
+        Some(p) => format!("{name}:{p}"),
+        None => name,
+    };
+    let Ok(authority) = authority.parse::<http::uri::Authority>() else {
+        return dial;
+    };
+    let mut parts = dial.clone().into_parts();
+    parts.authority = Some(authority);
+    http::Uri::from_parts(parts).unwrap_or(dial)
 }
 
 /// What the http CONNECTION needs of every request after the caller built it, so the bytes on the

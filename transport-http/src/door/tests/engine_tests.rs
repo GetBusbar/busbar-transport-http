@@ -289,3 +289,30 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
         "a later request naming no target goes to `/`, not the dial's path: {third:?}"
     );
 }
+
+/// RED (busbar ARCHITECT ruling on busbar#780 (2), 1.5.5 parity): a target whose host is an IPv4
+/// spelling goes out naming the address it spells, as 1.5.5's client sent it (its URL parser
+/// canonicalized the host before the request was built): `host: 127.0.0.1:9` for `127.1`,
+/// `2130706433` and `0x7f000001`, `host: 1.2.3.4:9` for `16909060`. A name and a dotted quad go out
+/// as written. RED on the framing that wrote the spelling into the `host` field.
+#[test]
+fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
+    for (dial, host) in [
+        ("http://127.1:9", "127.0.0.1:9"),
+        ("http://2130706433:9", "127.0.0.1:9"),
+        ("http://0x7f000001:9", "127.0.0.1:9"),
+        ("http://16909060:9", "1.2.3.4:9"),
+        ("http://localhost:9", "localhost:9"),
+        ("http://127.0.0.1:9", "127.0.0.1:9"),
+    ] {
+        let mut f = Framing::dial(dial, Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+        f.drive(0, 0);
+        let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).to_ascii_lowercase();
+        assert!(
+            wire.contains(&format!("host: {host}\r\n")),
+            "{dial}: {wire:?}"
+        );
+    }
+}
