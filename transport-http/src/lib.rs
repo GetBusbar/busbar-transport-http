@@ -22,7 +22,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// THE KIND'S SKELETON (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
+// THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
 // (`claims`), the entry's own message rendering (`transport`), and the door that states them.
 mod claims;
 // THE ABI BOUNDARY: the door reads and writes the host's C buffers through the SDK's safe surface
