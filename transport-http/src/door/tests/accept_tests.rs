@@ -261,3 +261,48 @@ fn a_switched_connection_detaches_what_followed_its_request() {
     );
     assert!(a.ended());
 }
+
+#[test]
+fn an_unanswered_connection_detaches_as_sent_for_the_upgrade_framer_to_answer() {
+    let request: &[u8] =
+        b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n";
+    let mut a = Accepted::accept(SEC);
+    a.ingest(request, false);
+    a.drive(SEC);
+    assert_eq!(up(&mut a).heads.len(), 1, "the request went up");
+    a.ingest(b"\x81\x02hi", false);
+    let rest: Vec<u8> = a
+        .detach()
+        .expect("handed over")
+        .expect("nothing answered")
+        .drain(..)
+        .collect();
+    let mut sent = request.to_vec();
+    sent.extend_from_slice(b"\x81\x02hi");
+    assert_eq!(rest, sent, "the connection as the far side sent it");
+    assert!(a.take_wire(usize::MAX).is_empty(), "nothing was answered");
+    assert!(a.ended());
+}
+
+#[test]
+fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
+    let mut a = Accepted::accept(SEC);
+    a.ingest(GET, false);
+    a.drive(SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(stream, b"content-length: 0\r\n", true, 204)
+        .expect("answered");
+    a.drive(SEC);
+    assert!(
+        a.detach().expect("no failure").is_none(),
+        "an answered connection"
+    );
+
+    let mut h2 = Accepted::accept(SEC);
+    h2.ingest(H2_PREFACE, false);
+    h2.drive(SEC);
+    assert!(
+        h2.detach().expect("no failure").is_none(),
+        "an HTTP/2 connection"
+    );
+}

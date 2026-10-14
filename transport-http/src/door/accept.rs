@@ -51,6 +51,9 @@ pub const REPLY_LOW_WATER: usize = 64 * 1024;
 /// The status that switches protocols.
 const SWITCHING_PROTOCOLS: u16 = 101;
 
+/// What an HTTP/2 connection opens with (RFC 9113 §3.4).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type ConnResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -130,6 +133,10 @@ pub struct Accepted {
     ended: bool,
     /// What the far side sent after a switched request, waiting for `detach`.
     leftover: Option<VecDeque<u8>>,
+    /// Every byte the far side sent, kept until the connection's first answer: a connection
+    /// nothing answered yet is handed over AS SENT, its upgrade request first, for the upgrade
+    /// framer to answer itself (`adopt`).
+    raw: Option<Vec<u8>>,
 }
 
 impl Accepted {
@@ -160,11 +167,15 @@ impl Accepted {
             out: VecDeque::new(),
             ended: false,
             leftover: None,
+            raw: Some(Vec::new()),
         }
     }
 
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
+        if let Some(raw) = self.raw.as_mut() {
+            raw.extend_from_slice(bytes);
+        }
         self.io.ingest(bytes, end);
     }
 
@@ -197,6 +208,8 @@ impl Accepted {
             return Err(Failure(format!("emit: no request on stream {stream}")));
         };
         if let Some(respond) = a.respond.take() {
+            // The connection answers: it is no longer one to hand over as sent.
+            self.raw = None;
             let code = u16::try_from(status)
                 .ok()
                 .and_then(|s| http::StatusCode::from_u16(s).ok())
@@ -302,13 +315,37 @@ impl Accepted {
         self.out.extend(pieces);
     }
 
-    /// DETACH a switched connection: every byte the far side sent after the request that was
-    /// answered `101`, for the upgrade framer to adopt. `None`: nothing is switched (yet).
+    /// DETACH the connection for the upgrade framer to adopt, two ways:
+    ///
+    /// * a connection NOTHING ANSWERED yet goes AS SENT, its upgrade request first, for a framer
+    ///   that answers the upgrade itself (ws's `adopt` takes the request it answers). An HTTP/2
+    ///   connection (it opened with the preface) carries no upgrade and is not handed over;
+    /// * a connection whose request the host answered `101` goes from the byte after that request.
+    ///
+    /// `None`: neither holds.
     ///
     /// # Errors
     ///
     /// The switch itself failed.
     pub fn detach(&mut self) -> Result<Option<&mut VecDeque<u8>>, Failure> {
+        let switched = self
+            .shared
+            .lock()
+            .expect("shared")
+            .streams
+            .values()
+            .any(|a| a.switched);
+        if self.leftover.is_none() && !switched {
+            if let Some(raw) = self.raw.take() {
+                if raw.starts_with(H2_PREFACE) {
+                    return Ok(None);
+                }
+                // hyper is dropped unanswered: the far side's bytes are the upgrade framer's now.
+                self.conn = None;
+                self.leftover = Some(raw.into());
+                self.ended = true;
+            }
+        }
         if self.leftover.is_none() {
             let mut up = {
                 let mut sh = self.shared.lock().expect("shared");

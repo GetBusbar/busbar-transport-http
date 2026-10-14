@@ -57,9 +57,10 @@
 //! listener offered `http/1.1` alone (`tls.rs`:242); [`ACCEPT_OFFER`] is that offer. Each request
 //! goes up as a stream (its head a field block with its method, target and authority in the head
 //! slots, then its body); its answer comes down through `emit`, the first emit its head with the
-//! status in `EmitIn::status` (`BUSBAR-1.6.0.md` l.4913), the later ones its body. A `101` answer to
-//! a request that asked to upgrade switches the connection, and `detach` hands the host what the
-//! far side sent after it. `refuse`, `adopt` and every carrier op are refused.
+//! status in `EmitIn::status` (`BUSBAR-1.6.0.md` l.4913), the later ones its body. `detach` hands
+//! the connection to the claimed upgrade framer: as the far side sent it while nothing has been
+//! answered (the upgrade framer answers the upgrade itself), or from the byte after a request the
+//! host answered `101`. `refuse`, `adopt` and every carrier op are refused.
 
 pub mod accept;
 pub mod dest_head;
@@ -672,10 +673,11 @@ impl SafeSlot for Timer {
     }
 }
 
-/// `detach`: an accepted connection whose request was answered `101` hands the host every byte
-/// the far side sent after it, in `frame` (any wire bytes still owed, the `101` itself, first),
-/// for the claimed upgrade framer to adopt; the framing has ended. A connection nothing switched,
-/// or a dialled one, has nothing to detach.
+/// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire bytes
+/// still owed first). A connection nothing answered yet goes AS SENT, its upgrade request first,
+/// for an upgrade framer that answers the upgrade itself (ws's `adopt`); one whose request was
+/// answered `101` goes from the byte after that request. The framing has ended. A connection
+/// neither holds for, or a dialled one, has nothing to detach.
 pub struct Detach;
 impl SafeSlot for Detach {
     type In = FramingIn;
