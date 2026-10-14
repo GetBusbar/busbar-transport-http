@@ -18,17 +18,22 @@ crate-type = ["rlib"]
 #
 # AND NO SIBLING TRANSPORT. This crate once declared `busbar-transport-tcp` and a `tls` transport
 # crate (retired: TLS is core's connection security) and referenced neither in
-# any of its source files: `listen`/`accept` bind their own socket through `tokio::net`, and this
-# crate dials nothing (an upstream connection is the connector's, TLS included). Those names put a capability crate in the
+# any of its source files: this crate binds, accepts and dials nothing (every socket, listener and
+# upstream connection is the host connector's, TLS included). Those names put a capability crate in the
 # dependency closure of four plugin crates by two lines that compiled nothing (DECISIONS #40 — the
 # wall is over the CLOSURE, and a transitive member is invisible in the manifest that causes it).
 # What `http` composes over is still stated, but it is stated where it is true: `COMPOSES_OVER =
 # &["tcp"]` in `meta.rs` is a declared wire fact the registry reads, and it needs no link edge to be
 # true.
+#
+# NO RUNTIME, NO SOCKET CRATE (ARCHITECT 2026-10-14, BUSBAR-1.6.0.md l.4706-4708 and l.4711-4720):
+# hyper's `client::conn` is driven as a sans-IO framer over the host's bytes (`door/engine.rs`), so
+# hyper is taken with `client` alone; no source file serves through hyper's server side. tokio,
+# tokio-util, futures and hyper-util are not in this list; plugin-ci's netban proves the closure.
 [dependencies]
 memchr = "2"
 busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "2add33afe2073215a8dbb1f655d14e4d324770e7" }
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
