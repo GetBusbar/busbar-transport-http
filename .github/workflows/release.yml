@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@3b2992b12a480e4bd72d62a3be35de96f1a575e2
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@2add33afe2073215a8dbb1f655d14e4d324770e7
     with:
       service: none
       busbar_checkout: false
@@ -29,7 +29,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@3b2992b12a480e4bd72d62a3be35de96f1a575e2
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@2add33afe2073215a8dbb1f655d14e4d324770e7
     with:
       plugin_crate: busbar-transport-http-plugin
       manifest_name: busbar-transport-http
@@ -45,7 +45,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@3b2992b12a480e4bd72d62a3be35de96f1a575e2
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@2add33afe2073215a8dbb1f655d14e4d324770e7
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-transport-http
