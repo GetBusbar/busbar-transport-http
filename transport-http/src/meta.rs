@@ -8,7 +8,9 @@
 
 use busbar_contract::abi::mechanism::call::AbiStr;
 use busbar_contract::abi::mechanism::door::KindTailHead;
-use busbar_contract::abi::transport::{TransportTail, FRAMING_STREAM, ROLE_FRAMER};
+use busbar_contract::abi::transport::{
+    TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
+};
 
 /// The `http` claim: the entry's first claim and the row's key.
 pub const KEY: &str = "http";
@@ -43,6 +45,8 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     framing: FRAMING_STREAM,
     facts: 0,
     handshake_max_steps: 0,
+    frame_piece_size: FRAME_PIECE_SIZE,
+    _reserved: 0,
     // No transport names another: the carrier is the connector's choice from the target's scheme.
     composes_over: std::ptr::null(),
     composes_over_len: 0,
