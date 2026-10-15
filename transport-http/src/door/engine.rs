@@ -505,14 +505,38 @@ fn advance(
 
 /// The response head as the frame the layer above reads: ONE field block
 /// (`busbar_contract::abi::transport::fields`) carrying the status and any `Retry-After`, framed
-/// even when no field is left in it, so it always comes before the body.
+/// even when no field is left in it, so it always comes before the body. The head piece states the
+/// body length the head declared (`Content-Length`, `PIECE_HAS_DECLARED_LEN`), where it declared
+/// one: the host's pre-body download cap reads it before a body byte arrives.
 fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> Piece {
     Piece {
         status: Some(r.status().as_u16()),
         retry_after_secs: retry_after_secs(r.headers(), now_unix_secs),
+        declared_len: declared_len(r.headers()),
         head: reason_phrase(r).map(HeadWords::reason),
         ..Piece::fields(stream, Bytes::from(field_block(r.headers(), &[])))
     }
+}
+
+/// The body length an answer's head declared: its `Content-Length`, where every value it names
+/// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6). `None` where the head
+/// names none, or names one that is not a single valid length (the field block never carries it,
+/// so a head without one states nothing).
+fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
+    let mut one: Option<u64> = None;
+    for v in headers.get_all(http::header::CONTENT_LENGTH) {
+        for s in v.to_str().ok()?.split(',').map(str::trim) {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let n = s.parse::<u64>().ok()?;
+            if one.is_some_and(|m| m != n) {
+                return None;
+            }
+            one = Some(n);
+        }
+    }
+    one
 }
 
 /// An HTTP/1 answer's reason phrase exactly as sent: hyper keeps a phrase that differs from the

@@ -108,6 +108,67 @@ fn an_h2_trailer_block_is_not_body() {
     assert!(whole, "the response ended whole");
 }
 
+/// What stream 1's head piece states as the answer's declared body length (`None`: no head yet).
+fn declared(f: &mut Framing) -> Option<Option<u64>> {
+    f.pieces()
+        .iter()
+        .find(|p| p.stream == 1 && p.fields)
+        .map(|p| p.declared_len)
+}
+
+/// The head piece states the body length the answer's head declared (`Content-Length`, busbar
+/// #1032's `PIECE_HAS_DECLARED_LEN`), on HTTP/1.1 and on HTTP/2, so the host's pre-body download
+/// cap reads it before a body byte; a head that declares none (a chunked answer) states none.
+#[test]
+fn the_head_piece_states_the_body_length_the_head_declared() {
+    let mut f = asked(Proto::H1, 300);
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello", false);
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(Some(5)), "h1: the declared length");
+
+    let mut f = asked(Proto::H1, 300);
+    f.ingest(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        false,
+    );
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(None), "h1 chunked: none declared");
+
+    let mut f = asked(Proto::H2, 300);
+    let mut block = vec![0x88];
+    block.extend(literal("content-length", "5"));
+    let mut far = h2(4, 0, 0, &[]);
+    far.extend(h2(1, 0x4, 1, &block));
+    far.extend(h2(0, 0x1, 1, b"hello"));
+    f.ingest(&far, false);
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(Some(5)), "h2: the declared length");
+}
+
+/// The length a head declares is read whole or not at all: identical duplicates are one length,
+/// and a disagreeing or malformed value declares none.
+#[test]
+fn a_declared_length_is_one_valid_content_length() {
+    let head = |values: &[&str]| {
+        let mut h = http::HeaderMap::new();
+        for v in values {
+            h.append(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_str(v).expect("value"),
+            );
+        }
+        declared_len(&h)
+    };
+    assert_eq!(head(&[]), None);
+    assert_eq!(head(&["12"]), Some(12));
+    assert_eq!(head(&["12, 12"]), Some(12));
+    assert_eq!(head(&["12", "12"]), Some(12));
+    assert_eq!(head(&["12", "13"]), None);
+    assert_eq!(head(&["+12"]), None);
+    assert_eq!(head(&[""]), None);
+    assert_eq!(head(&["99999999999999999999999"]), None);
+}
+
 /// 1.5.5's `upstream_request_timeout_secs` was reqwest's TOTAL timeout: one clock from the send
 /// to the body's end (reqwest 0.12 wraps the response body in the same sleep). A response still
 /// arriving at the deadline is cut there, on HTTP/1.1 ...
