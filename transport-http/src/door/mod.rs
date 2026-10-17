@@ -49,12 +49,21 @@
 //! `sdk::Instance<Instance>`, host-lent bytes and host buffers go through `Lent` and `HostBuf`, and
 //! this crate holds no `unsafe`.
 //!
-//! The accepted side is not this door's at this commit: an ingress request is served by the root's
-//! transitional listener, so `begin` for [`SIDE_ACCEPT`] is refused, and so are `refuse`, `detach`,
-//! `adopt` and every carrier op. The accepted side (THE DESIGN §3 l.475-478: "the ALPN offer is the
-//! framer's") is busbar-transport-http#24 (INBOUND-LISTEN, ARCHITECT ruling 2026-10-17: an accept
-//! side is required for 1.6.0), its own change.
+//! THE ACCEPTED SIDE IS THIS DOOR'S TOO (`BUSBAR-1.6.0.md` l.477-478, INBOUND-LISTEN): per
+//! accepted connection the connector runs this framer's accept side, under the TLS server wrap
+//! when configured, and the ALPN offer is the framer's. `begin` on [`SIDE_ACCEPT`] serves the
+//! connection as v1.5.5's data listener did ([`accept`]): hyper's auto server, HTTP/2 by prior
+//! knowledge when the far side opens with its preface and HTTP/1.1 otherwise, HTTP/1's header read
+//! bounded at 30 s, upgrades on (v1.5.5 `crates/busbar/src/tls.rs`:560-566, :620). v1.5.5's TLS
+//! listener offered `http/1.1` alone (`tls.rs`:242); [`ACCEPT_OFFER`] is that offer. Each request
+//! goes up as a stream (its head a field block with its method, target and authority in the head
+//! slots, then its body); its answer comes down through `emit`, the first emit its head with the
+//! status in `EmitIn::status` (`BUSBAR-1.6.0.md` l.4913), the later ones its body. `detach` hands
+//! the connection to the claimed upgrade framer: as the far side sent it while nothing has been
+//! answered (the upgrade framer answers the upgrade itself), or from the byte after a request the
+//! host answered `101`. `refuse`, `adopt` and every carrier op are refused.
 
+pub(crate) mod accept;
 pub(crate) mod dest_head;
 pub(crate) mod engine;
 
@@ -82,15 +91,18 @@ use busbar_contract::abi::transport::{
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
     StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
+    FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
     STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
+    YIELD_MORE,
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
+use accept::Accepted;
+use busbar_contract::abi::transport::check::check_emit_status;
 use engine::{Framing, Posture, Proto};
 #[cfg(test)]
 use hyper_io::field_cut;
-use hyper_io::{fill, Owed};
+use hyper_io::{fill, mark_stream_full, Owed};
 
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
@@ -313,9 +325,12 @@ impl Instance {
     }
 }
 
-/// One framing the instance holds, by its token.
-struct Held {
-    framing: Framing,
+/// One framing: a dialled connection's client, or an accepted connection's server.
+enum Held {
+    /// A dialled connection ([`SIDE_DIAL`]).
+    Dial(Framing),
+    /// An accepted connection ([`SIDE_ACCEPT`]).
+    Accept(Accepted),
 }
 
 /// The default the count setting `path` declares ([`SETTING_ROWS`]).
@@ -476,12 +491,17 @@ answer!(Write, WriteIn, IoOut, Outcome::Refused);
 answer!(Flush, ConnIn, OutHead, Outcome::Refused);
 answer!(Shut, ShutIn, OutHead, Outcome::Refused);
 answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
-// No refusal, detach or adoption on a dialled HTTP connection.
+// No refusal and no adoption: an answer is emitted like any other, and nothing switches TO http.
 answer!(Refuse, RefuseIn, FramerOut, Outcome::Refused);
-answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
 answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
 
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
+
+/// THE ACCEPTED SIDE'S PROTOCOL OFFER (ALPN) under connection security, in the handshake's
+/// ProtocolNameList encoding: `http/1.1` alone, v1.5.5's TLS listener's (`crates/busbar/src/tls.rs`
+/// :242, "http/1.1 only"). A cleartext connection has no handshake: HTTP/2 there is the far side's
+/// prior knowledge, read off its preface.
+pub const ACCEPT_OFFER: &[u8] = b"\x08http/1.1";
 
 /// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding.
 const OFFER_H2_H1: &[u8] = b"\x02h2\x08http/1.1";
@@ -563,29 +583,40 @@ impl SafeSlot for Locate {
         i: Lent<'_, LocateIn>,
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
-        let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
-            Ok(l) => l,
-            Err(why) => {
-                o.error(why);
-                return Outcome::Failed;
-            }
+        let (secure, authority, name, offer) = if i.accept == 1 {
+            // An ACCEPTING listener's offer (`LocateIn::accept`): v1.5.5's TLS listener's, whatever
+            // the target (a listener names no far end, so none is read).
+            (true, String::new(), String::new(), ACCEPT_OFFER)
+        } else {
+            let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
+                Ok(l) => l,
+                Err(why) => {
+                    o.error(why);
+                    return Outcome::Failed;
+                }
+            };
+            // The offer exists only where a handshake does: on a secured connection.
+            let offer = p.get().map_or(offer_for(secure, false, false), |x| {
+                let s = x.settings();
+                offer_for(secure, s.prior_knowledge, s.http1_only)
+            });
+            (secure, authority, name, offer)
         };
-        // The offer exists only where a handshake does: on a secured connection.
-        let offer = p.get().map_or(offer_for(secure, false, false), |x| {
-            let s = x.settings();
-            offer_for(secure, s.prior_knowledge, s.http1_only)
-        });
         o.set(|x| &x.secure, u32::from(secure));
-        o.set(|x| &x.has_name, 1);
+        o.set(|x| &x.has_name, u32::from(!name.is_empty()));
         // THE FRAMER'S OWN HEAD LINES (THE DESIGN §6 step 5): stated here, added by the host
-        // before the auth signs the head, never by `encode`.
-        let defaults = i
-            .field(|x| &x.target)
-            .as_str()
-            .ok()
-            .and_then(|t| t.parse::<http::Uri>().ok())
-            .map(|u| engine::client_defaults(&u))
-            .unwrap_or_default();
+        // before the auth signs the head, never by `encode`. An accepting listener names no far
+        // end, so it states none.
+        let defaults = if i.accept == 1 {
+            String::new()
+        } else {
+            i.field(|x| &x.target)
+                .as_str()
+                .ok()
+                .and_then(|t| t.parse::<http::Uri>().ok())
+                .map(|u| engine::client_defaults(&u))
+                .unwrap_or_default()
+        };
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
         let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
@@ -634,8 +665,26 @@ impl SafeSlot for Begin {
             return Outcome::Failed;
         };
         let settings = inst.settings();
+        if i.side == SIDE_ACCEPT {
+            // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
+            // listener did (`accept`): no agreed protocol is read here.
+            // As on the dialled side: the framing joins the table only once its first step is
+            // READY, so a failed begin leaves no entry the host holds no token for.
+            let mut h = Held::Accept(Accepted::accept(i.sink.now_monotonic_ns));
+            let r = step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            if r != Outcome::Ready {
+                return r;
+            }
+            let token = inst.next.fetch_add(1, Ordering::Relaxed);
+            inst.framings
+                .lock()
+                .expect("framings")
+                .insert(token, Arc::new(Mutex::new(h)));
+            o.set(|x| &x.framing, token);
+            return r;
+        }
         if i.side != SIDE_DIAL {
-            o.error("begin: http frames dialled connections only");
+            o.error("begin: http frames whole connections, accepted or dialled");
             return Outcome::Refused;
         }
         let agreed = i
@@ -662,7 +711,7 @@ impl SafeSlot for Begin {
         };
         // The framing joins the instance's table only once its first step is READY: a begin that
         // fails hands the host no token, so nothing would ever release an entry it left behind.
-        let mut h = Held { framing };
+        let mut h = Held::Dial(framing);
         let r = step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
         if r != Outcome::Ready {
             return r;
@@ -689,8 +738,11 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.ingest(bytes, i.end != 0);
+        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |h| {
+            match h {
+                Held::Dial(f) => f.ingest(bytes, i.end != 0),
+                Held::Accept(a) => a.ingest(bytes, i.end != 0),
+            }
             Ok(())
         })
     }
@@ -709,9 +761,25 @@ impl SafeSlot for Emit {
     ) -> Outcome {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
-        })
+        let mut full = false;
+        let r = with(&p, i.framing, i.field(|x| &x.sink), &mut o, |h| match h {
+            Held::Dial(f) => {
+                // A dialled stream's emits carry a request: no answer's status rides them.
+                check_emit_status(&*i, false).map_err(refused_status)?;
+                f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+            }
+            Held::Accept(a) => {
+                // The first emit on an accepted stream is its answer's head, with its status;
+                // every other carries none.
+                check_emit_status(&*i, a.answers_head(i.stream)).map_err(refused_status)?;
+                full = a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?;
+                Ok(())
+            }
+        });
+        if full && r == Outcome::Ready {
+            mark_stream_full(&mut o);
+        }
+        r
     }
 }
 
@@ -727,6 +795,68 @@ impl SafeSlot for Timer {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+    }
+}
+
+/// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire bytes
+/// still owed first). A connection nothing answered yet goes AS SENT, its upgrade request first,
+/// for an upgrade framer that answers the upgrade itself (ws's `adopt`); one whose request was
+/// answered `101` goes from the byte after that request. The framing has ended. A connection
+/// neither holds for, or a dialled one, has nothing to detach.
+pub struct Detach;
+impl SafeSlot for Detach {
+    type In = FramingIn;
+    type Out = FramerOut;
+    type State = Instance;
+    fn call(
+        p: sdk::Instance<'_, Instance>,
+        i: Lent<'_, FramingIn>,
+        mut o: Out<'_, FramerOut>,
+    ) -> Outcome {
+        let held = p.get().and_then(|inst| {
+            inst.framings
+                .lock()
+                .expect("framings")
+                .get(&i.framing)
+                .cloned()
+        });
+        let Some(held) = held else {
+            o.error("detach: no such framing");
+            return Outcome::Failed;
+        };
+        let mut h = held.lock().expect("framing");
+        let Held::Accept(a) = &mut *h else {
+            o.error("detach: a dialled http connection does not switch");
+            return Outcome::Refused;
+        };
+        let sink = i.field(|x| &x.sink);
+        a.drive(sink.now_monotonic_ns);
+        let mut wire_buf = sink.wire();
+        let wire = a.take_wire(wire_buf.cap());
+        wire_buf.extend(&wire);
+        let wire_pending = a.wire_pending();
+        let rest = match a.detach() {
+            Ok(Some(rest)) => rest,
+            Ok(None) => {
+                o.error("detach: nothing on this connection switched protocols");
+                return Outcome::Refused;
+            }
+            Err(e) => return failed(&mut o, e.0),
+        };
+        let mut frame = sink.frame();
+        let n = rest.len().min(frame.cap());
+        let taken: Vec<u8> = rest.drain(..n).collect();
+        frame.extend(&taken);
+        let mut y = o.get().yielded;
+        y.wire_len = wire_buf.written() as u64;
+        y.frame_len = frame.written() as u64;
+        y.flags = if wire_pending || !rest.is_empty() {
+            YIELD_MORE
+        } else {
+            YIELD_ENDED
+        };
+        o.set(|x| &x.yielded, y);
+        Outcome::Ready
     }
 }
 
@@ -825,7 +955,7 @@ fn with(
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let held = p
         .get()
@@ -842,20 +972,36 @@ fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
-    if let Err(e) = f(&mut h.framing) {
+    if let Err(e) = f(h) {
         return failed(o, e.0);
     }
-    h.framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
-    let pending = h.framing.wire_pending() || !h.framing.pieces().is_empty();
-    if let Some(e) = h.framing.failure().cloned() {
-        if !pending {
-            return failed(o, e.0);
+    match h {
+        Held::Dial(framing) => {
+            framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
+            let pending = framing.wire_pending() || !framing.pieces().is_empty();
+            if let Some(e) = framing.failure().cloned() {
+                if !pending {
+                    return failed(o, e.0);
+                }
+            }
+            fill(framing, sink, o, class_of, fault_of);
+        }
+        Held::Accept(a) => {
+            a.drive(sink.now_monotonic_ns);
+            fill(a, sink, o, class_of, fault_of);
         }
     }
-    fill(&mut h.framing, sink, o, class_of, fault_of);
     Outcome::Ready
+}
+
+/// An emit whose status breaks `check_emit_status`, as the failure its op answers.
+fn refused_status(f: busbar_contract::abi::transport::check::Fault) -> engine::Failure {
+    engine::Failure(format!(
+        "emit: the status breaks {:?} at {}",
+        f.rule, f.field
+    ))
 }
 
 fn failed(o: &mut Out<'_, FramerOut>, text: String) -> Outcome {
