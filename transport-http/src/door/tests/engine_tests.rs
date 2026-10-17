@@ -278,28 +278,24 @@ fn h1_wire(message: &[u8]) -> String {
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
 
-/// RED (busbar SEAM-4i, transport neutrality): the door writes no header field the plane did not
-/// write. A request naming no `accept` leaves with none (1.5.5's client default is the caller's to
-/// carry now), while what the connection itself needs (`host`, the origin-form target) is still
-/// written; a request that names `accept` leaves with exactly that one.
+/// RED (THE DESIGN §5 l.722: "When the caller sets none, the http door adds `accept: */*`, and on
+/// h1 the host header and origin-form target: the http transport owns the client defaults
+/// (owner-agreed 2026-09-28)"): a request naming no `accept` leaves with 1.5.5's client default,
+/// after the caller's fields and before `host`, as reqwest wrote it; a request naming one leaves
+/// with exactly that one.
 #[test]
-fn the_door_writes_no_accept_the_plane_did_not_write() {
-    let bare = h1_wire(b"GET /x HTTP/1.1\r\n\r\n");
+fn the_door_adds_accept_when_the_caller_sets_none() {
+    let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
     assert!(bare.starts_with("GET /x HTTP/1.1\r\n"), "{bare:?}");
     assert!(
-        bare.to_ascii_lowercase().contains("host: 127.0.0.1:9\r\n"),
+        bare.to_ascii_lowercase()
+            .contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
         "{bare:?}"
     );
-    assert!(!bare.to_ascii_lowercase().contains("accept"), "{bare:?}");
-    let named = h1_wire(b"GET /x HTTP/1.1\r\naccept: */*\r\n\r\n");
-    assert_eq!(
-        named
-            .to_ascii_lowercase()
-            .matches("accept: */*\r\n")
-            .count(),
-        1,
-        "{named:?}"
-    );
+    let named = h1_wire(b"GET /x HTTP/1.1\r\naccept: application/json\r\n\r\n");
+    let lower = named.to_ascii_lowercase();
+    assert_eq!(lower.matches("accept:").count(), 1, "{named:?}");
+    assert!(lower.contains("accept: application/json\r\n"), "{named:?}");
 }
 
 /// What one emit of `message` on `stream` puts on the wire.
