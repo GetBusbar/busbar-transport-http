@@ -3,10 +3,10 @@
 
 //! THE 1.5.5 WIRE GOLDEN: the http door's exit test, byte parity with the published 1.5.5 wire.
 //!
-//! The golden is what the PUBLISHED 1.5.5 binary put on the wire. The C0 capture cells
-//! (`testing/shadow-oracle/golden/1.5.5/cells/`) were recorded from it by busbar-release's `capture`
-//! driver: a mock upstream kept every HTTP/1.1 request byte for byte, and every HTTP/2 connection's
-//! frames, with each request header field's HPACK representation and bytes.
+//! The golden is what the PUBLISHED 1.5.5 binary put on the wire. The C0 capture cells (busbar's
+//! `testing/shadow-oracle/golden/1.5.5/cells/` at the pin, read in place) were recorded from it by
+//! busbar-release's `capture` driver: a mock upstream kept every HTTP/1.1 request byte for byte, and
+//! every HTTP/2 connection's frames, with each request header field's HPACK representation and bytes.
 //!
 //! This test reads every such cell and drives the door with the same logical request, as a plane
 //! hands it over: the verb, the target, the plane's own header fields in their order, and the body.
@@ -106,11 +106,21 @@ fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O,
 
 // ── the golden ───────────────────────────────────────────────────────────────────────────────────
 
+/// Busbar's own capture cells at the pin, never a copy in this repo (the fleet template deletes one):
+/// `BUSBAR_WIRE_GOLDEN_DIR` names the cells dir itself; otherwise `BUSBAR_GOLDEN_DIR` (plugin CI's
+/// busbar checkout, `testing/shadow-oracle/golden`) or `BUSBAR_CHECKOUT` (a busbar tree) leads to it.
+/// None of them set is a missing golden, and so a failure.
 fn golden_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("BUSBAR_WIRE_GOLDEN_DIR") {
         return PathBuf::from(d);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden/1.5.5/cells")
+    if let Some(d) = std::env::var_os("BUSBAR_GOLDEN_DIR") {
+        return PathBuf::from(d).join("1.5.5/cells");
+    }
+    if let Some(d) = std::env::var_os("BUSBAR_CHECKOUT") {
+        return PathBuf::from(d).join("testing/shadow-oracle/golden/1.5.5/cells");
+    }
+    PathBuf::from("<BUSBAR_GOLDEN_DIR unset: no busbar golden at the pin>")
 }
 
 /// One request the 1.5.5 binary sent, as the capture recorded it.
