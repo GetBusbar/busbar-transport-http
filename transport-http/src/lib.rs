@@ -9,7 +9,7 @@
 //! socket and connection security and chooses the carrier from the target's scheme, so the framer
 //! composes over nothing (`COMPOSES_OVER` is empty: no transport names another). An `sse` stream is
 //! an HTTP response body, so the `sse` claim is framed exactly as `http` is; a plane reads the event
-//! boundaries in the body it is handed ([`sse::reframe`] is the shape a plane may re-frame it in).
+//! boundaries in the body it is handed.
 //! gRPC is its own transport plugin (OWNER 2026-09-29), not a claim of this one.
 //!
 //! `http` carries no session and its status class rides the first response frame: the
@@ -33,22 +33,9 @@ mod meta;
 mod raw;
 mod transport;
 
-pub mod mount;
-
-/// SSE as a plane may re-frame an HTTP response body (the `sse` claim is framed as `http`).
-pub mod sse;
-
 pub use raw::{RawMessage, RawStartLine};
 
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
-
-/// The settings a composition root resolves off the deployment's `limits:`: the contract's
-/// [`TransportSettings`](busbar_contract::transport::TransportSettings), named here too so this
-/// crate's own callers read the name they always did.
-pub use busbar_contract::transport::TransportSettings as ClientSettings;
-pub use busbar_contract::transport::{
-    DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
-};
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this row: its key, the
 /// layers it declares (none: the carrier is the connector's choice) and its door. The root names
