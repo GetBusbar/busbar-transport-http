@@ -31,7 +31,8 @@ use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, 
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
     HeadSlots, IngestIn, Ops, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_STREAM_FAILED, SIDE_DIAL, YIELD_HAS_DEADLINE, YIELD_MORE,
+    PIECE_HAS_CODE, PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_DIAL, YIELD_HAS_DEADLINE,
+    YIELD_MORE,
 };
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
@@ -160,6 +161,8 @@ struct Got {
     bytes: Vec<u8>,
     flags: u16,
     code: u32,
+    /// The body length the piece states its head declared (`PIECE_HAS_DECLARED_LEN`), if any.
+    declared_len: Option<u64>,
 }
 
 struct Host {
@@ -289,6 +292,7 @@ impl Host {
                 bytes: self.frame[p.offset as usize..(p.offset + p.len) as usize].to_vec(),
                 flags: p.flags,
                 code: p.code,
+                declared_len: (p.flags & PIECE_HAS_DECLARED_LEN != 0).then_some(p.declared_len),
             });
         }
         self.deadline =
@@ -561,6 +565,9 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     assert_eq!((head.stream, head.code), (1, 200));
     // The head is ONE field block, flagged as one: no status line, no hop-by-hop field.
     assert_ne!(head.flags & PIECE_FIELDS, 0, "the head is a fields piece");
+    // A streamed answer declares no body length, and its head piece states none: read at the
+    // contract's 48-byte piece stride, the same on the linked and the dropped-in door.
+    assert_eq!(head.declared_len, None, "{label}: no declared length");
     let block = String::from_utf8_lossy(&head.bytes).into_owned();
     assert!(!block.starts_with("HTTP/"), "{block}");
     // The reason phrase is a head slot, never a field: HTTP/1's exactly as sent, none on HTTP/2.
