@@ -382,16 +382,17 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
     http::Uri::from_parts(parts).unwrap_or(dial)
 }
 
-/// What the http CONNECTION needs of every request after the caller built it, so the bytes on the
-/// wire are the bytes 1.5.5 sent: on HTTP/1.1, hyper-util's `host` field (the port only when it is
-/// not the scheme's own) with the target rewritten to origin form. On HTTP/2 the target stays
-/// absolute: it becomes `:scheme`, `:authority` and `:path`.
-///
-/// TRANSPORT NEUTRALITY (busbar ARCHITECT ruling, SEAM-4i): the door writes no header field the
-/// plane did not write. 1.5.5's client default `accept: */*` is a field of the request, not of the
-/// connection, so a caller that sent it then carries it in its own fields now (a plane's
-/// dialect fields, an auth mint request), in the place 1.5.5 put it.
+/// The client defaults the http transport owns (THE DESIGN §5: "When the caller sets none, the
+/// http door adds `accept: */*`, and on h1 the host header and origin-form target: the http
+/// transport owns the client defaults"), so the bytes on the wire are the bytes 1.5.5 sent:
+/// `accept: */*` after the caller's fields where it set none, as reqwest added its default; on
+/// HTTP/1.1, hyper-util's `host` field (the port only when it is not the scheme's own) with the
+/// target rewritten to origin form. On HTTP/2 the target stays absolute: it becomes `:scheme`,
+/// `:authority` and `:path`.
 fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) {
+    req.headers_mut()
+        .entry(http::header::ACCEPT)
+        .or_insert(http::HeaderValue::from_static("*/*"));
     if proto == Proto::H2 {
         return;
     }
