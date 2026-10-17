@@ -6,12 +6,40 @@
 //! `encode` answers, the bytes the egress cross-check reads. The framing itself is the door's
 //! (`crate::door::engine`).
 
+/// An RFC 9110 `token`: one or more `tchar`. A field name is one; anything else (a `:`, a space,
+/// a control byte, a non-ASCII byte) is not a name this wire can carry back out unchanged.
+fn is_token(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.iter().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 /// Render an outbound envelope (`fields`, post-decoration) and `body` as one HTTP/1.1 request
 /// message: the bytes the egress cross-check reads, whichever door rendered them.
 ///
 /// # Errors
 ///
-/// A CR, LF or NUL in the method, the path, a field name or a value: `Encode::Unrepresentable`.
+/// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
+/// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
+/// reparse): `Encode::Unrepresentable`.
 pub(crate) fn render_envelope(
     fields: &[(&str, &[u8])],
     body: &[u8],
@@ -39,7 +67,7 @@ pub(crate) fn render_envelope(
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
     for (name, value) in fields {
-        if !clean(name.as_bytes()) || !clean(value) {
+        if !is_token(name.as_bytes()) || !clean(value) {
             return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
         }
     }
