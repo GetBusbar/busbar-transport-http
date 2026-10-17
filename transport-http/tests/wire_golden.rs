@@ -12,8 +12,8 @@
 //! hands it over: the verb, the target, the plane's own header fields in their order, and the body.
 //! What the door adds itself is taken OUT of the fields first (`host` and `content-length`), so
 //! the door must put each back exactly where 1.5.5 did. A trailing `accept: */*` (1.5.5's client
-//! default) stays in the plane's own fields: the door writes no field the plane did not write
-//! (transport neutrality), so the caller carries it. Then the door's bytes are compared with the recording:
+//! default) is taken out too: when the caller sets none, the http door adds it (THE DESIGN §5: "the
+//! http transport owns the client defaults"). Then the door's bytes are compared with the recording:
 //!
 //! * HTTP/1.1: the whole request message, byte for byte;
 //! * HTTP/2: the connection preface, every frame the client sent up to the request's end (type,
@@ -181,17 +181,26 @@ fn recorded() -> Vec<Recorded> {
 }
 
 /// The plane's own fields: what the http connection adds itself is taken out, so the door has to
-/// add it back: `host`/`:authority`, `content-length` and the pseudo-fields. Every other field,
-/// 1.5.5's client-default `accept: */*` included, is the caller's to write (transport neutrality).
+/// add it back: `host`/`:authority`, `content-length`, the pseudo-fields, and 1.5.5's client-default
+/// `accept: */*` where it trails the caller's fields (THE DESIGN §5: "When the caller sets none, the
+/// http door adds `accept: */*`"). An `accept` the caller wrote among its own fields stays.
 fn plane_fields(r: &Recorded) -> Vec<(String, String)> {
-    r.headers
+    let mut own: Vec<(String, String)> = r
+        .headers
         .iter()
         .filter(|(n, _)| {
             let n = n.to_ascii_lowercase();
             !n.starts_with(':') && n != "host" && n != "content-length"
         })
         .cloned()
-        .collect()
+        .collect();
+    if own
+        .last()
+        .is_some_and(|(n, v)| n.eq_ignore_ascii_case("accept") && v == "*/*")
+    {
+        own.pop();
+    }
+    own
 }
 
 // ── the door ─────────────────────────────────────────────────────────────────────────────────────
