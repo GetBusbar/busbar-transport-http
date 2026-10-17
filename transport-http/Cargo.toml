@@ -32,6 +32,12 @@ hyper = { version = "1", default-features = false, features = ["server", "client
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
+# THE ACCEPTED SIDE (`door::accept`): hyper-util's auto server, as v1.5.5's data listener served
+# (h2 by prior knowledge, HTTP/1.1 otherwise), driven over the host's bytes. No `tokio` feature: the
+# executor and timer are the sans-IO drive's, so no runtime and no socket enter the closure.
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "http1", "http2", "service"] }
+# The one-shot an accepted request's answer is handed to hyper's service through.
+futures-channel = "0.3"
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = "1"
 
@@ -52,4 +58,8 @@ tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util"
 # own wire, so the cell compares the head the auth saw with every line a far end receives. Already
 # in this lock through hyper's `http2` feature: no crate is added.
 h2 = "0.4"
+# THE ACCEPTED SIDE'S 1.5.5 BYTES (`door/tests/accept_tests.rs`): v1.5.5's exact server builder on a
+# tokio duplex, compared against the door's answer bytes.
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "http1", "http2", "service", "tokio"] }
+futures = "0.3"
 
