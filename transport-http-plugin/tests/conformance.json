@@ -17,7 +17,7 @@
     "dial": {
       "target": "http://peer.test:8080/v1/x",
       "emit": "POST /v1/x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi",
-      "wire": "POST /v1/x HTTP/1.1\r\nhost: peer.test:8080\r\ncontent-length: 2\r\n\r\nhi",
+      "wire": "POST /v1/x HTTP/1.1\r\naccept: */*\r\nhost: peer.test:8080\r\ncontent-length: 2\r\n\r\nhi",
       "ingest": "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
       "frames": [
         "",
