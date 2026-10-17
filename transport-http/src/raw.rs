@@ -32,8 +32,9 @@ pub enum RawStartLine {
 pub struct RawMessage {
     /// The request or status line.
     pub start: RawStartLine,
-    /// Header name/value pairs, in the order they appeared.
-    pub headers: Vec<(String, String)>,
+    /// Header name/value pairs, in the order they appeared. A value is its bytes as sent (obs-text
+    /// included), without the optional whitespace around it.
+    pub headers: Vec<(String, Vec<u8>)>,
     /// Everything after the blank line.
     pub body: Vec<u8>,
 }
@@ -56,14 +57,18 @@ pub fn parse_message(bytes: &[u8]) -> Option<RawMessage> {
         Vec::new()
     };
 
-    let text = std::str::from_utf8(header_block).ok()?;
-    let mut lines = text.split("\r\n").filter(|l| !l.is_empty());
-    let start_line = lines.next()?;
-    let start = parse_start_line(start_line)?;
+    // The start line and every field name are text; a field VALUE is bytes (RFC 9110 5.5: obs-text
+    // is a value's, and 1.5.5's client carried such a value as given).
+    let mut lines = header_block
+        .split(|b| *b == b'\n')
+        .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
+        .filter(|l| !l.is_empty());
+    let start = parse_start_line(std::str::from_utf8(lines.next()?).ok()?)?;
 
     let mut headers = Vec::new();
     for line in lines {
-        let (name, value) = line.split_once(':')?;
+        let colon = line.iter().position(|b| *b == b':')?;
+        let name = std::str::from_utf8(&line[..colon]).ok()?;
         // No whitespace is allowed between a field name and its colon. Trimming it here would
         // normalise a header no compliant peer would honour into one this transport does, and the
         // disagreement that opens between an intermediary and its upstream is exactly the
@@ -71,7 +76,7 @@ pub fn parse_message(bytes: &[u8]) -> Option<RawMessage> {
         if name != name.trim() {
             return None;
         }
-        headers.push((name.to_string(), value.trim().to_string()));
+        headers.push((name.to_string(), ows_trimmed(&line[colon + 1..]).to_vec()));
     }
 
     Some(RawMessage {
@@ -79,6 +84,18 @@ pub fn parse_message(bytes: &[u8]) -> Option<RawMessage> {
         headers,
         body,
     })
+}
+
+/// `value` without the optional whitespace (SP, HTAB) a field line may carry around it (RFC 9112
+/// 5.1); every other byte stays.
+fn ows_trimmed(value: &[u8]) -> &[u8] {
+    let ows = |b: &u8| *b == b' ' || *b == b'\t';
+    let start = value.iter().position(|b| !ows(b)).unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|b| !ows(b))
+        .map_or(start, |at| at + 1);
+    &value[start..end]
 }
 
 fn parse_start_line(line: &str) -> Option<RawStartLine> {
@@ -122,11 +139,11 @@ fn is_http1(version: &str) -> bool {
 
 /// Find a header's value, case-insensitively, as the wire allows any casing.
 #[must_use]
-pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_str())
+        .map(|(_, v)| v.as_slice())
 }
 
 /// A field's WHOLE value: every line carrying that name, joined with `", "`, or `None` when no
@@ -140,9 +157,12 @@ pub fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str
 /// not `chunked` and whose length RFC 9112 6.1 leaves undeterminable; a reader that saw only the
 /// first line would frame a body the sender never described.
 #[must_use]
-pub fn field_list(headers: &[(String, String)], name: &str) -> Option<String> {
+pub fn field_list(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     let mut out: Option<String> = None;
     for (_, v) in headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)) {
+        // A framing field is ASCII; a byte that is not reads as U+FFFD, which no coding or length
+        // matches, so such a value is refused rather than guessed at.
+        let v = String::from_utf8_lossy(v);
         match &mut out {
             Some(acc) => {
                 acc.push_str(", ");
@@ -164,7 +184,7 @@ pub fn field_list(headers: &[(String, String)], name: &str) -> Option<String> {
 /// `chunked` may be applied only ONCE: `chunked, chunked` describes a body wrapped twice, of which
 /// undoing one layer would hand up a framing still on the bytes as though it were the body.
 #[must_use]
-pub fn is_chunked(headers: &[(String, String)]) -> bool {
+pub fn is_chunked(headers: &[(String, Vec<u8>)]) -> bool {
     let Some(list) = field_list(headers, "transfer-encoding") else {
         return false;
     };
@@ -185,7 +205,7 @@ pub fn is_chunked(headers: &[(String, String)]) -> bool {
 /// frame is a framing error, and telling that apart from a message that names none is what lets a
 /// caller refuse the first without refusing the second.
 #[must_use]
-pub fn has_transfer_encoding(headers: &[(String, String)]) -> bool {
+pub fn has_transfer_encoding(headers: &[(String, Vec<u8>)]) -> bool {
     field_list(headers, "transfer-encoding").is_some()
 }
 
@@ -200,7 +220,7 @@ pub fn has_transfer_encoding(headers: &[(String, String)]) -> bool {
 /// # Errors
 ///
 /// Returns `Err(())` when the header is present but does not name a single valid body length.
-pub fn content_length(headers: &[(String, String)]) -> Result<Option<usize>, ()> {
+pub fn content_length(headers: &[(String, Vec<u8>)]) -> Result<Option<usize>, ()> {
     // The whole field, however many lines it was spelled across: a second `Content-Length` line is
     // the same list a comma would have made, and reading only the first would take a message that
     // declares two lengths for one that declares one.

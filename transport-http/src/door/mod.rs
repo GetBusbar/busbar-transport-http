@@ -99,9 +99,9 @@ pub mod setting {
     pub const H2_PRIOR_KNOWLEDGE: &str = "advanced.upstream_h2_prior_knowledge";
     /// Pin the connection to HTTP/1.1.
     pub const HTTP1_ONLY: &str = "advanced.upstream_http1_only";
-    /// The ceiling on one exchange up to the response head, in seconds.
+    /// The ceiling on one exchange, from the attempt's start to the response body's end, in seconds.
     pub const REQUEST_TIMEOUT_SECS: &str = "limits.upstream_request_timeout_secs";
-    /// The largest request message and response body carried, in bytes.
+    /// The largest request body carried, in bytes (a response body is not capped here).
     pub const BODY_MAX_BYTES: &str = "limits.request_body_max_bytes";
 }
 

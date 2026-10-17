@@ -216,7 +216,8 @@ pub(crate) fn complete_message(
     cache.fed = 0;
     // A trailer is a header that arrived late; it goes where every other header went, so
     // nothing downstream has to know which side of the body it was written on.
-    head.headers.extend(trailers);
+    head.headers
+        .extend(trailers.into_iter().map(|(n, v)| (n, v.into_bytes())));
     Ok(Some(raw::RawMessage {
         start: head.start,
         headers: head.headers,
@@ -233,7 +234,7 @@ pub(crate) fn complete_message(
 pub(crate) struct CachedHead {
     pub(crate) end: usize,
     pub(crate) start: raw::RawStartLine,
-    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, Vec<u8>)>,
 }
 
 /// [`CachedHead`], plus this connection's own count of how many times it has parsed one — the cell

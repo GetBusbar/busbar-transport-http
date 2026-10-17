@@ -15,7 +15,7 @@ fn parses_a_request_line_and_headers() {
             path: Some("/v1/models".to_string())
         }
     );
-    assert_eq!(msg.headers[0], ("Host".to_string(), "example".to_string()));
+    assert_eq!(msg.headers[0], ("Host".to_string(), b"example".to_vec()));
     assert_eq!(msg.body, b"abc");
 }
 
@@ -62,14 +62,14 @@ fn chunk_extensions_are_ignored_rather_than_read() {
 #[test]
 fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
     let headers = vec![
-        ("CONTENT-length".to_string(), " 12 ".to_string()),
-        ("Transfer-Encoding".to_string(), "gzip, Chunked".to_string()),
+        ("CONTENT-length".to_string(), b" 12 ".to_vec()),
+        ("Transfer-Encoding".to_string(), b"gzip, Chunked".to_vec()),
     ];
     assert_eq!(content_length(&headers), Ok(Some(12)));
     assert!(is_chunked(&headers));
     assert!(!is_chunked(&[(
         "Transfer-Encoding".to_string(),
-        "gzip".to_string()
+        b"gzip".to_vec()
     )]));
 }
 
@@ -90,7 +90,7 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     );
     // The legal shape still parses, value whitespace and all.
     let ok = parse_message(b"GET / HTTP/1.1\r\nContent-Length:  5 \r\n\r\n").unwrap();
-    assert_eq!(ok.headers[0].1, "5");
+    assert_eq!(ok.headers[0].1, b"5");
 }
 
 /// `chunked` is the LAST coding or the message is not chunked at all.
@@ -103,20 +103,20 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
 fn chunked_counts_only_as_the_final_transfer_coding() {
     assert!(is_chunked(&[(
         "Transfer-Encoding".to_string(),
-        "gzip, chunked".to_string()
+        b"gzip, chunked".to_vec()
     )]));
     assert!(!is_chunked(&[(
         "Transfer-Encoding".to_string(),
-        "chunked, gzip".to_string()
+        b"chunked, gzip".to_vec()
     )]));
     // And a coding list that names one at all is still a declared coding, chunked or not.
     assert!(has_transfer_encoding(&[(
         "Transfer-Encoding".to_string(),
-        "chunked, gzip".to_string()
+        b"chunked, gzip".to_vec()
     )]));
     assert!(!has_transfer_encoding(&[(
         "Content-Length".to_string(),
-        "5".to_string()
+        b"5".to_vec()
     )]));
 }
 

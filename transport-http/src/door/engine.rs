@@ -57,7 +57,7 @@ pub struct Posture {
     /// response body's end (reqwest's total timeout). Counted from a stream's first `emit` when the
     /// caller stamped no deadline of its own.
     pub request_timeout: Duration,
-    /// The largest REQUEST message carried. A response is not capped here: 1.5.5's incremental
+    /// The largest REQUEST body carried (its head has its own allowance). A response is not capped here: 1.5.5's incremental
     /// body path carried a body for as long as the far end sent one, and its buffered reads are
     /// the plane's.
     pub max_body_bytes: usize,
@@ -87,6 +87,11 @@ enum Stage {
     /// Answered in full.
     Done,
 }
+
+/// The most a request's head (its request line and fields) may add to its body in one emitted
+/// message: hyper's own HTTP/1 read-buffer ceiling (`8192 + 4096 * 100`), the largest head hyper
+/// would read back.
+const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
 
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,7 +250,9 @@ impl Framing {
             )));
         };
         buf.extend_from_slice(bytes);
-        if buf.len() > max {
+        // The cap is the BODY's (`complete_message` holds the declared length to it); the head
+        // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
+        if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
             return Err(Failure("request message over the body cap".into()));
         }
         let raw = complete_message(buf, head, max)
@@ -266,7 +273,7 @@ impl Framing {
             {
                 continue;
             }
-            b = b.header(k, v);
+            b = b.header(k.as_str(), v.as_slice());
         }
         let mut req = b
             .body(Full::new(Bytes::from(raw.body)))
