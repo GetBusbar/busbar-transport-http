@@ -377,3 +377,66 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
         );
     }
 }
+
+/// What one emit of an envelope rendered by `encode` does on a fresh HTTP/1.1 framing whose body
+/// cap is `cap`: the emit's answer and the bytes the connection wrote.
+fn rendered_and_sent(
+    cap: usize,
+    fields: &[(&str, &[u8])],
+    body: &[u8],
+) -> (Result<(), Failure>, Vec<u8>) {
+    let capped = Posture {
+        max_body_bytes: cap,
+        ..posture(30)
+    };
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
+    f.drive(0, 0);
+    let message = crate::transport::render_envelope(fields, body).expect("render");
+    let r = f.emit(1, &message, 0, 0);
+    f.drive(0, 0);
+    (r, f.take_wire(usize::MAX))
+}
+
+/// RED (THE DESIGN §2 "A port keeps 1.5.5's surface"; `limits.request_body_max_bytes` is a BODY
+/// size): the cap bounds the request's body, never its rendered head. A body exactly at the cap
+/// leaves whole with its head; one byte over is refused. RED on the framing that counted the
+/// request line and every field against the body's cap.
+#[test]
+fn a_request_body_at_the_cap_goes_out_with_its_head() {
+    let fields: &[(&str, &[u8])] = &[
+        ("method", b"POST"),
+        ("path", b"/v1/x"),
+        ("content-type", b"application/json"),
+    ];
+    let (r, wire) = rendered_and_sent(16, fields, &[b'x'; 16]);
+    assert!(r.is_ok(), "a body at the cap is carried: {r:?}");
+    let wire = String::from_utf8_lossy(&wire).into_owned();
+    assert!(wire.starts_with("POST /v1/x HTTP/1.1\r\n"), "{wire:?}");
+    assert!(wire.ends_with("\r\n\r\nxxxxxxxxxxxxxxxx"), "{wire:?}");
+    let (r, _) = rendered_and_sent(16, fields, &[b'x'; 17]);
+    assert!(r.is_err(), "a body one byte over the cap is refused");
+}
+
+/// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
+/// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
+/// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8
+/// and refused the whole request for it.
+#[test]
+fn an_obs_text_field_value_goes_out_byte_for_byte() {
+    let (r, wire) = rendered_and_sent(
+        1024,
+        &[
+            ("method", b"GET"),
+            ("path", b"/x"),
+            ("x-name", b"caf\xe9 \x80\xff"),
+        ],
+        b"",
+    );
+    assert!(r.is_ok(), "an obs-text value is carried: {r:?}");
+    let needle = b"x-name: caf\xe9 \x80\xff\r\n";
+    assert!(
+        wire.windows(needle.len()).any(|w| w == needle),
+        "{:?}",
+        String::from_utf8_lossy(&wire)
+    );
+}
