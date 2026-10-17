@@ -30,9 +30,9 @@ use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
-    HeadSlots, IngestIn, Ops, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS,
-    PIECE_HAS_CODE, PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_DIAL, YIELD_HAS_DEADLINE,
-    YIELD_MORE,
+    HeadSlots, IngestIn, LocateIn, LocateOut, Ops, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
+    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT,
+    SIDE_DIAL, YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
@@ -879,5 +879,278 @@ fn a_non_token_field_name_fails_encode_through_the_door() {
             assert_eq!(host.encode_with_field(bad), Outcome::Failed, "{bad:?}");
         }
         host.close();
+    }
+}
+
+// ── the accepted side (INBOUND-LISTEN) ───────────────────────────────────────────────────────────
+
+/// One accepted connection driven through the table as the connector drives it: the host hands the
+/// far side's raw bytes to `ingest`, reads the request's head and body out of its sink, and answers
+/// through `emit`, the first emit its head with the status in `EmitIn::status`.
+struct AcceptHost {
+    ops: &'static Ops,
+    inst: *mut c_void,
+    framing: u64,
+    wire: Vec<u8>,
+    frame: Vec<u8>,
+    pieces: Vec<FramePiece>,
+    heads: Vec<HeadSlots>,
+    /// Every wire byte the framer owed the far side.
+    out: Vec<u8>,
+    /// Every request piece: (stream, bytes, flags), and every head slot's method and target.
+    got: Vec<(u64, Vec<u8>, u16)>,
+    words: Vec<(u64, Vec<u8>, Vec<u8>)>,
+}
+
+impl AcceptHost {
+    fn open(ops: &'static Ops) -> Self {
+        let mut i: OpenIn = z();
+        let mut o: OpenOut = z();
+        assert_eq!(
+            call(
+                ops.head.open,
+                std::ptr::null_mut(),
+                &mut i,
+                &mut o,
+                life::OPEN
+            ),
+            Outcome::Ready
+        );
+        let mut h = Self {
+            ops,
+            inst: o.instance,
+            framing: 0,
+            wire: vec![0; 64 * 1024],
+            frame: vec![0; 64 * 1024],
+            pieces: vec![z(); 64],
+            heads: vec![HeadSlots::default(); 4],
+            out: Vec::new(),
+            got: Vec::new(),
+            words: Vec::new(),
+        };
+        let mut facts: ConnFacts = z();
+        facts.size = size_of::<ConnFacts>() as u32;
+        let mut i: BeginIn = z();
+        i.side = SIDE_ACCEPT;
+        i.facts = &facts;
+        i.sink = h.sink();
+        let mut o: FramerOut = z();
+        let r = call(ops.begin, h.inst, &mut i, &mut o, slot::BEGIN);
+        h.framing = o.framing;
+        assert_eq!(h.take(r, &o), Outcome::Ready, "begin on the accepted side");
+        h
+    }
+
+    fn sink(&mut self) -> FramerSink {
+        FramerSink {
+            wire: self.wire.as_mut_ptr(),
+            wire_cap: self.wire.len(),
+            frame: self.frame.as_mut_ptr(),
+            frame_cap: self.frame.len(),
+            pieces: self.pieces.as_mut_ptr(),
+            pieces_cap: self.pieces.len(),
+            now_monotonic_ns: 7 * SEC,
+            now_unix_ns: 1_790_000_000 * SEC,
+            heads: self.heads.as_mut_ptr(),
+            heads_cap: self.heads.len(),
+        }
+    }
+
+    fn take(&mut self, r: Outcome, o: &FramerOut) -> Outcome {
+        let n = o.yielded.pieces_len as usize;
+        check_framer(
+            r,
+            o,
+            &self.pieces[..n],
+            self.wire.len() as u64,
+            self.frame.len() as u64,
+            self.pieces.len() as u64,
+        )
+        .expect("the answer passes the kind's check");
+        if r != Outcome::Ready {
+            return r;
+        }
+        let frame = self.frame[..o.yielded.frame_len as usize].to_vec();
+        check_framer_fields(&self.pieces[..n], &frame).expect("no pseudo-field in a field block");
+        check_head_slots(o, &self.heads, self.heads.len() as u64).expect("the head slots pass");
+        for h in &self.heads[..o.yielded.heads_len as usize] {
+            let at = |s: busbar_contract::abi::transport::FrameSpan| {
+                frame[s.offset as usize..(s.offset + s.len) as usize].to_vec()
+            };
+            self.words.push((h.stream, at(h.method), at(h.target)));
+        }
+        self.out
+            .extend_from_slice(&self.wire[..o.yielded.wire_len as usize]);
+        for p in &self.pieces[..n] {
+            self.got.push((
+                p.stream,
+                frame[p.offset as usize..(p.offset + p.len) as usize].to_vec(),
+                p.flags,
+            ));
+        }
+        r
+    }
+
+    fn ingest(&mut self, bytes: &[u8]) -> Outcome {
+        let mut i: IngestIn = z();
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        self.take(r, &o)
+    }
+
+    fn emit(&mut self, stream: u64, bytes: &[u8], end: bool, status: u32) -> Outcome {
+        let mut i: EmitIn = z();
+        i.framing = self.framing;
+        i.stream = stream;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end_of_frame = u32::from(end);
+        i.status = status;
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
+        self.take(r, &o)
+    }
+
+    fn close(self) {
+        let mut i: InHead = z();
+        let mut o: OutHead = z();
+        call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
+    }
+}
+
+/// The wire bytes with the `date` line (the second hyper answered in) taken out.
+fn undated(mut wire: Vec<u8>) -> Vec<u8> {
+    if let Some(at) = wire.windows(6).position(|w| w == b"date: ") {
+        let end = at
+            + wire[at..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .expect("a line")
+            + 2;
+        wire.drain(at..end);
+    }
+    wire
+}
+
+/// One request answered through the door's accepted side: the answer's wire bytes, undated.
+fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
+    let mut h = AcceptHost::open(ops);
+    assert_eq!(
+        h.ingest(b"POST /v1/messages?beta=1 HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\ncontent-type: application/json\r\n\r\nhello"),
+        Outcome::Ready
+    );
+    assert_eq!(
+        h.words,
+        vec![(1, b"POST".to_vec(), b"/v1/messages?beta=1".to_vec())],
+        "{label}: the request's method and target are head slots"
+    );
+    let head = h
+        .got
+        .iter()
+        .find(|g| g.2 & PIECE_FIELDS != 0)
+        .expect("a head")
+        .1
+        .clone();
+    assert_eq!(
+        String::from_utf8_lossy(&head),
+        "host: busbar.test\r\ncontent-type: application/json\r\n",
+        "{label}: one field block, no content-length"
+    );
+    let body: Vec<u8> = h
+        .got
+        .iter()
+        .filter(|g| g.2 & PIECE_FIELDS == 0)
+        .flat_map(|g| g.1.clone())
+        .collect();
+    assert_eq!(body, b"hello", "{label}");
+    assert!(
+        h.got
+            .iter()
+            .any(|g| g.1.is_empty() && g.2 & PIECE_END != 0 && g.2 & PIECE_FIELDS == 0),
+        "{label}: the request is whole"
+    );
+
+    // RED: an answer head with no status, and a status on an emit that carries no head.
+    assert_eq!(
+        h.emit(1, b"content-type: text/plain\r\n", false, 0),
+        Outcome::Failed,
+        "{label}: the head emit states the status"
+    );
+    assert_eq!(
+        h.emit(
+            1,
+            b"content-type: text/plain\r\ncontent-length: 2\r\n",
+            false,
+            201
+        ),
+        Outcome::Ready
+    );
+    assert_eq!(
+        h.emit(1, b"ok", true, 200),
+        Outcome::Failed,
+        "{label}: only the head emit states a status"
+    );
+    assert_eq!(h.emit(1, b"ok", true, 0), Outcome::Ready);
+    let wire = undated(h.out.clone());
+    println!("PROOF {label}: answer {:?}", String::from_utf8_lossy(&wire));
+    h.close();
+    wire
+}
+
+/// The protocol offer the door answers for an ACCEPTING listener: v1.5.5's TLS listener's,
+/// `http/1.1` alone (v1.5.5 `crates/busbar/src/tls.rs`:242), not its dial offer.
+fn accept_offer(ops: &'static Ops) -> Vec<u8> {
+    let mut i: OpenIn = z();
+    let mut o: OpenOut = z();
+    call(
+        ops.head.open,
+        std::ptr::null_mut(),
+        &mut i,
+        &mut o,
+        life::OPEN,
+    );
+    let inst = o.instance;
+    let (mut auth, mut name, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 256]);
+    let mut li: LocateIn = z();
+    li.accept = 1;
+    li.authority_buf = auth.as_mut_ptr();
+    li.authority_cap = auth.len();
+    li.name_buf = name.as_mut_ptr();
+    li.name_cap = name.len();
+    li.alpn_buf = alpn.as_mut_ptr();
+    li.alpn_cap = alpn.len();
+    let mut lo: LocateOut = z();
+    assert_eq!(
+        call(ops.locate, inst, &mut li, &mut lo, slot::LOCATE),
+        Outcome::Ready
+    );
+    let mut ci: InHead = z();
+    let mut co: OutHead = z();
+    call(ops.head.close, inst, &mut ci, &mut co, life::CLOSE);
+    alpn[..lo.alpn_written as usize].to_vec()
+}
+
+#[test]
+fn the_accepted_side_answers_alike_linked_and_dropped_in() {
+    let (d, _lib) = dropped();
+    let linked_wire = answered("linked", linked());
+    let dropped_wire = answered("dropped", d);
+    assert_eq!(
+        linked_wire, dropped_wire,
+        "one door, two images, one answer"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&linked_wire),
+        "HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok"
+    );
+    for (image, ops) in [("linked", linked()), ("dropped", d)] {
+        let offer = accept_offer(ops);
+        println!("PROOF {image}: accept offer {offer:?}");
+        assert_eq!(offer, b"\x08http/1.1", "{image}");
     }
 }
