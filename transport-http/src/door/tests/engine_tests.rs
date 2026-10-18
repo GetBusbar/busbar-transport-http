@@ -413,6 +413,39 @@ fn a_request_body_at_the_cap_goes_out_with_its_head() {
     assert!(r.is_err(), "a body one byte over the cap is refused");
 }
 
+/// RED (THE DESIGN §2 l.393-397; `limits.request_body_max_bytes` is "the largest request body
+/// carried"): a CHUNKED request body is held to the cap as a declared one is. Its decoded body at
+/// the cap is carried; one byte over is refused, never carried for being inside the head allowance.
+/// RED on the framing that compared only a Content-Length against the cap.
+#[test]
+fn a_chunked_request_body_is_held_to_the_cap() {
+    let chunked = |n: usize| {
+        let mut m = b"POST /v1/x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n".to_vec();
+        m.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+        m.extend(std::iter::repeat_n(b'x', n));
+        m.extend_from_slice(b"\r\n0\r\n\r\n");
+        m
+    };
+    let send = |message: &[u8]| {
+        let capped = Posture {
+            max_body_bytes: 16,
+            ..posture(30)
+        };
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message, 0, 0);
+        f.drive(0, 0);
+        r
+    };
+    let at = send(&chunked(16));
+    assert!(at.is_ok(), "a chunked body at the cap is carried: {at:?}");
+    let over = send(&chunked(17));
+    assert!(
+        over.is_err(),
+        "a chunked body one byte over the cap is refused"
+    );
+}
+
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
 /// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
 /// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8
