@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The `http` transport: ONE framer entry, claiming the `http` and `sse` schemes.
+//! The `http` transport: ONE framer entry, claiming the `http`, `https` and `sse` schemes.
 //!
 //! A plugin exports one entry and its schemes are its claims (`BUSBAR-1.6.0.md` TRANSPORT-STACK,
 //! ARCHITECT correction 2026-09-27: "ONE ENTRY PER PLUGIN"). This crate's entry is its memory-ABI
