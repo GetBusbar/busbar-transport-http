@@ -39,6 +39,23 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
 }
 
+/// The defaults the settings declare are the host's own (`transport::registry`), so the door and
+/// the host read one figure for each.
+#[test]
+fn the_declared_defaults_are_the_hosts() {
+    use busbar_contract::transport::registry::{
+        DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
+    };
+    assert_eq!(
+        declared_count(setting::REQUEST_TIMEOUT_SECS),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        declared_count(setting::BODY_MAX_BYTES),
+        DEFAULT_REQUEST_BODY_MAX_BYTES as u64
+    );
+}
+
 /// Each status band lands in its class; anything outside the three bands is other.
 #[test]
 fn a_status_code_maps_to_its_class() {
