@@ -24,6 +24,10 @@ pub mod sse {
 /// The `sse` claim's key, by its own name.
 pub(crate) const SSE_KEY: &str = sse::KEY;
 
+/// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
+/// secures before they leave (THE DESIGN §5: "http claims `http`, `https` and `sse`").
+pub(crate) const SECURE_KEY: &str = "https";
+
 /// The layers this framer is built over: none. The carrier is the connector's choice from the
 /// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
