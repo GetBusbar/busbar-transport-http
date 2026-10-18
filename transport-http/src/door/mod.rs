@@ -3,8 +3,9 @@
 
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
 //! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
-//! crate's ONE entry and claims two schemes, `http` and `sse` (an event stream is an HTTP response
-//! body, framed alike); it composes over nothing, the carrier being the connector's choice.
+//! crate's ONE entry and claims three schemes, `http`, `https` (an `http` target the connector
+//! secures) and `sse` (an event stream is an HTTP response body, framed alike); it composes over
+//! nothing, the carrier being the connector's choice.
 //!
 //! A framer frames; it does not dial. The connector owns the socket and connection security; the
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
