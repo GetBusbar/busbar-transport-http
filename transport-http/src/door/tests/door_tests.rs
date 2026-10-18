@@ -345,3 +345,11 @@ fn the_entry_claims_http_https_and_sse() {
         .collect();
     assert_eq!(https, http);
 }
+
+/// RED (THE DESIGN §6 step 5): the tail states that the framer adds no field line after the
+/// kernel's auth call (`FACT_SIGNS_NOTHING_AFTER_AUTH`), which the kernel holds it to.
+#[test]
+fn the_tail_states_it_signs_nothing_after_auth() {
+    let fact = busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH;
+    assert_eq!(crate::meta::TAIL.facts & fact, fact);
+}

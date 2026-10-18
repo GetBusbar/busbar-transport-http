@@ -42,8 +42,8 @@ use std::path::PathBuf;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, BLOB_JSON};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::{
-    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    SIDE_DIAL,
+    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, IngestIn,
+    LocateIn, LocateOut, Ops, SIDE_DIAL,
 };
 use serde_json::Value;
 
@@ -339,6 +339,23 @@ impl Door {
         let mut o: FramerOut = z();
         call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
         self.take(&o);
+    }
+}
+
+impl Door {
+    /// THE FRAMER'S OWN HEAD LINES `locate` states for `target` (`LocateIn::defaults_buf`): what the
+    /// host adds to a request head that does not carry them, before the auth signs it.
+    fn defaults(&self, target: &str) -> String {
+        let (mut a, mut n, mut l, mut d) = (vec![0; 512], vec![0; 512], vec![0; 64], vec![0; 512]);
+        let mut i: LocateIn = z();
+        i.target = s(target);
+        (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
+        (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
+        (i.alpn_buf, i.alpn_cap) = (l.as_mut_ptr(), l.len());
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
+        let mut o: LocateOut = z();
+        call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        String::from_utf8_lossy(&d[..o.defaults_written as usize]).into_owned()
     }
 }
 
@@ -728,5 +745,32 @@ fn an_h2_request_over_a_secured_connection_says_scheme_https() {
         &block[..2],
         &[0x83, 0x87],
         ":method POST then :scheme https, both indexed"
+    );
+}
+
+/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "The transport finalises the head (its own lines: host,
+/// length, framing), calls the auth at its points, adds the lines the auth returns ... Nothing is
+/// added to the head after the auth has run"): `locate` states the framer's own head lines for a
+/// target, 1.5.5's client defaults in 1.5.5's order, so the host adds them BEFORE the auth signs
+/// the head: `accept: */*`, then `host` (its port only when it is not the scheme's own). RED on
+/// the framer that stated none and added them at `encode`, after the auth.
+#[test]
+fn locate_states_the_framers_own_head_lines() {
+    let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");
+    assert_eq!(
+        door.defaults("http://127.0.0.1:9"),
+        "accept: */*\r\nhost: 127.0.0.1:9\r\n"
+    );
+    assert_eq!(
+        door.defaults("https://api.example.com/v1"),
+        "accept: */*\r\nhost: api.example.com\r\n"
+    );
+    assert_eq!(
+        door.defaults("https://api.example.com:8443/v1"),
+        "accept: */*\r\nhost: api.example.com:8443\r\n"
+    );
+    assert_eq!(
+        door.defaults("http://[::1]:80/"),
+        "accept: */*\r\nhost: [::1]\r\n"
     );
 }
