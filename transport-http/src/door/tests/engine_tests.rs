@@ -278,6 +278,29 @@ fn h1_wire(message: &[u8]) -> String {
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
 
+/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "Nothing is added to the head after the auth has
+/// run"): the framer writes the head it is handed and adds no field line of its own at `encode`;
+/// its own lines (`accept`, `host`) are stated at `locate` and added by the host before the auth.
+/// RED on the framer that added them after the auth.
+#[test]
+fn the_door_adds_no_line_to_the_head_it_is_handed() {
+    let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
+    let lower = bare.to_ascii_lowercase();
+    assert!(
+        lower.starts_with("get /x http/1.1\r\nx-a: 1\r\n"),
+        "{bare:?}"
+    );
+    assert!(!lower.contains("accept:"), "no accept was handed: {bare:?}");
+    assert!(!lower.contains("host:"), "no host was handed: {bare:?}");
+    let handed = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n\r\n");
+    assert!(
+        handed
+            .to_ascii_lowercase()
+            .contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
+        "the handed head, as handed: {handed:?}"
+    );
+}
+
 /// RED (THE DESIGN §5 l.722: "When the caller sets none, the http door adds `accept: */*`, and on
 /// h1 the host header and origin-form target: the http transport owns the client defaults
 /// (owner-agreed 2026-09-28)"): a request naming no `accept` leaves with 1.5.5's client default,
