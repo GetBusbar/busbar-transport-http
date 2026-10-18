@@ -125,25 +125,33 @@ const fn bytes_str(b: &'static [u8]) -> AbiStr {
 }
 
 /// The schemes this ONE entry claims, by name: the Statement's `claims`, the one place they are
-/// stated. `http`, and `sse` (an HTTP response body read as events), framed alike.
-const CLAIM_NAMES: &[AbiStr] = &[abi_str(crate::meta::KEY), abi_str(crate::meta::SSE_KEY)];
+/// stated. `http`, `sse` (an HTTP response body read as events) and `https` (an `http` target the
+/// connector secures), framed alike (THE DESIGN §5: "http claims `http`, `https` and `sse`").
+const CLAIM_NAMES: &[AbiStr] = &[
+    abi_str(crate::meta::KEY),
+    abi_str(crate::meta::SSE_KEY),
+    abi_str(crate::meta::SECURE_KEY),
+];
+
+/// The `http` claim's row; `https` is the same wire, so it carries the same row.
+const HTTP_ROW: Claim = Claim {
+    selector_forms: bytes_str(&SELECTOR_CODES),
+    egress_selector_forms: abi_str(""),
+    facts: FACTS.as_ptr(),
+    facts_len: FACTS.len(),
+    status_namespace: abi_str(status_ns::HTTP),
+    session: 0,
+    session_bound: 0,
+    unit0_trigger: 0,
+    status_at: STATUS_AT_FIRST_FRAME,
+    _reserved: 0,
+};
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
 /// and no selector of its own (the request that opens a stream is an `http` one); its status leg is
 /// `http`'s, at the first frame.
 pub(crate) const CLAIMS: &[Claim] = &[
-    Claim {
-        selector_forms: bytes_str(&SELECTOR_CODES),
-        egress_selector_forms: abi_str(""),
-        facts: FACTS.as_ptr(),
-        facts_len: FACTS.len(),
-        status_namespace: abi_str(status_ns::HTTP),
-        session: 0,
-        session_bound: 0,
-        unit0_trigger: 0,
-        status_at: STATUS_AT_FIRST_FRAME,
-        _reserved: 0,
-    },
+    HTTP_ROW,
     Claim {
         selector_forms: bytes_str(&SSE_SELECTOR_CODES),
         egress_selector_forms: abi_str(""),
@@ -156,47 +164,39 @@ pub(crate) const CLAIMS: &[Claim] = &[
         status_at: STATUS_AT_FIRST_FRAME,
         _reserved: 0,
     },
+    HTTP_ROW,
 ];
 
-/// Each claim's status classes, by claim index: `sse` reads `http`'s.
-pub(crate) const STATUS_ROWS: &[StatusRow] = &[
-    StatusRow {
-        claim: 0,
-        lo: 200,
-        hi: 299,
-        class: STATUS_SUCCESS as u32,
-    },
-    StatusRow {
-        claim: 0,
-        lo: 400,
-        hi: 499,
-        class: STATUS_CALLER_FAULT as u32,
-    },
-    StatusRow {
-        claim: 0,
-        lo: 500,
-        hi: 599,
-        class: STATUS_FAR_END_FAULT as u32,
-    },
-    StatusRow {
-        claim: 1,
-        lo: 200,
-        hi: 299,
-        class: STATUS_SUCCESS as u32,
-    },
-    StatusRow {
-        claim: 1,
-        lo: 400,
-        hi: 499,
-        class: STATUS_CALLER_FAULT as u32,
-    },
-    StatusRow {
-        claim: 1,
-        lo: 500,
-        hi: 599,
-        class: STATUS_FAR_END_FAULT as u32,
-    },
+/// HTTP's status classes, read alike on every claim.
+const HTTP_CLASSES: [(u32, u32, u32); 3] = [
+    (200, 299, STATUS_SUCCESS as u32),
+    (400, 499, STATUS_CALLER_FAULT as u32),
+    (500, 599, STATUS_FAR_END_FAULT as u32),
 ];
+
+/// Each claim's status classes, by claim index: `sse` and `https` read `http`'s.
+pub(crate) const STATUS_ROWS: &[StatusRow] = &status_rows();
+
+const fn status_rows() -> [StatusRow; FAULT_CLAIMS * HTTP_CLASSES.len()] {
+    let mut out = [StatusRow {
+        claim: 0,
+        lo: 0,
+        hi: 0,
+        class: 0,
+    }; FAULT_CLAIMS * HTTP_CLASSES.len()];
+    let mut i = 0;
+    while i < out.len() {
+        let (lo, hi, class) = HTTP_CLASSES[i % HTTP_CLASSES.len()];
+        out[i] = StatusRow {
+            claim: (i / HTTP_CLASSES.len()) as u32,
+            lo,
+            hi,
+            class,
+        };
+        i += 1;
+    }
+    out
+}
 
 /// What each answer means to the BREAKER, in HTTP's numbering: the fault table, beside the status
 /// table and never folded into it (the status class is the fee decision's leg). A refused
@@ -218,10 +218,10 @@ const HTTP_FAULTS: [(u32, u32, u8); 10] = [
     (500, 599, FAULT_TRANSIENT),
 ];
 
-/// How many claims the fault table covers, by claim index.
-const FAULT_CLAIMS: usize = 2;
+/// How many claims the status and fault tables cover, by claim index: every claim.
+const FAULT_CLAIMS: usize = CLAIM_NAMES.len();
 
-/// The fault table, by claim index: `sse` reads `http`'s.
+/// The fault table, by claim index: `sse` and `https` read `http`'s.
 pub(crate) const FAULT_ROWS: &[FaultRow] = &fault_rows();
 
 const fn fault_rows() -> [FaultRow; FAULT_CLAIMS * HTTP_FAULTS.len()] {
@@ -272,7 +272,7 @@ pub(crate) const SETTINGS: &[SettingDecl] = &[
     },
 ];
 
-/// The door's Statement: the `http` framer, claiming `http` and `sse`.
+/// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
 pub const STATEMENT: Statement = Statement {
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
@@ -291,7 +291,7 @@ pub struct Instance {
     next: AtomicU64,
 }
 
-/// One framing and the error text its last failed op answered (valid until the next call).
+/// One framing the instance holds, by its token.
 struct Held {
     framing: Framing,
 }

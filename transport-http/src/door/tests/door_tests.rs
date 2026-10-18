@@ -299,3 +299,27 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
         assert_eq!(String::from_utf8(got).unwrap(), want, "{t:?}");
     }
 }
+
+/// THE ENTRY CLAIMS `http`, `https` AND `sse` (THE DESIGN §5: "http claims `http`, `https` and
+/// `sse`"; Part 2 #50), each with its own claim row, and the secured scheme classes and reads its
+/// answers as `http` does. RED before the fix: the Statement claimed `http` and `sse` only.
+#[test]
+fn the_entry_claims_http_https_and_sse() {
+    // The names' lengths, in claim order: `http`, `sse`, `https` (the crate forbids the unsafe a
+    // read of their bytes would take; the Statement's own reader is the published suite).
+    let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
+    assert_eq!(names, [4, 3, 5]);
+    assert_eq!(CLAIMS.len(), names.len());
+    assert_eq!(FAULT_CLAIMS, names.len());
+    let https: Vec<(u32, u32, u32)> = STATUS_ROWS
+        .iter()
+        .filter(|r| r.claim == 2)
+        .map(|r| (r.lo, r.hi, r.class))
+        .collect();
+    let http: Vec<(u32, u32, u32)> = STATUS_ROWS
+        .iter()
+        .filter(|r| r.claim == 0)
+        .map(|r| (r.lo, r.hi, r.class))
+        .collect();
+    assert_eq!(https, http);
+}
