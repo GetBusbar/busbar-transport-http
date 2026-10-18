@@ -296,11 +296,11 @@ struct Held {
     framing: Framing,
 }
 
-/// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
-/// says. An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), &'static str> {
+/// The settings blob's bytes, parsed; `Err` names, by its path, the first one that is not what its
+/// declaration says (the host renders the path instance-relative). An absent blob reads as `{}`.
+fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
     let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
-    let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
+    let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
         Some(x) => x.as_bool().ok_or(k),
@@ -309,7 +309,7 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), &'static str> {
         None => Ok(d),
         Some(x) => x.as_u64().ok_or(k),
     };
-    let err = |_| "settings: a value is not of its declared kind";
+    let err = |k: &str| format!("{k}: not of its declared kind");
     let prior = flag(setting::H2_PRIOR_KNOWLEDGE).map_err(err)?;
     let h1 = flag(setting::HTTP1_ONLY).map_err(err)?;
     let secs = count(setting::REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS).map_err(err)?;
@@ -358,10 +358,8 @@ slot!(
     Validate, ValidateIn, OutHead, |_, i, o| {
         match read_settings(i.field(|x| &x.settings).bytes()) {
             Ok(_) => Outcome::Ready,
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
+            // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
         }
     }
 );
@@ -380,10 +378,8 @@ slot!(
                 });
                 Outcome::Ready
             }
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
+            // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
         }
     }
 );
