@@ -398,7 +398,7 @@ fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) {
     }
     let uri = req.uri().clone();
     if let Some(host) = uri.host() {
-        let secure = matches!(uri.scheme_str(), Some("https" | "wss"));
+        let secure = matches!(uri.scheme_str(), Some("https"));
         let value = match uri.port_u16() {
             Some(443) if secure => host.to_owned(),
             Some(80) if !secure => host.to_owned(),
