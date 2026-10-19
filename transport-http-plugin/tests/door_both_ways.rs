@@ -31,10 +31,13 @@ use busbar_contract::abi::host::service::{
 };
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, RawOutcome, Span, BLOB_JSON, BLOB_OCTETS,
+    FLAG_RESUME,
 };
 use busbar_contract::abi::mechanism::door::Door;
-use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
-use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables};
+use busbar_contract::abi::mechanism::lifecycle::{
+    slot as life, CancelIn, CancelOut, OpenIn, OpenOut,
+};
+use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::route::{
@@ -42,9 +45,10 @@ use busbar_contract::abi::transport::route::{
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
-    HeadSlots, IngestIn, LocateIn, LocateOut, Ops, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
-    PIECE_FIELDS, PIECE_HAS_CODE, PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT,
-    SIDE_DIAL, YIELD_HAS_DEADLINE, YIELD_MORE,
+    HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL,
+    PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
+    PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
+    YIELD_HAS_DEADLINE, YIELD_MORE,
 };
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
@@ -925,6 +929,11 @@ struct AcceptHost {
     lines: Box<[LineEntry]>,
     /// The scripted kernel's context: the key of this host's [`Script`].
     ctx: u64,
+    /// The ticket `begin`, `ingest` and `emit` run on, as the host tickets them (`timer` and
+    /// `refuse` run on none, as the connector crosses them).
+    ticket: Ticket,
+    /// An answer said the connection is over (`YIELD_ENDED`).
+    ended: bool,
 }
 
 impl AcceptHost {
@@ -978,6 +987,8 @@ impl AcceptHost {
             words: Vec::new(),
             lines: lines.into_boxed_slice(),
             ctx,
+            ticket: TICKET,
+            ended: false,
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
@@ -1034,6 +1045,7 @@ impl AcceptHost {
         }
         self.out
             .extend_from_slice(&self.wire[..o.yielded.wire_len as usize]);
+        self.ended |= o.yielded.flags & YIELD_ENDED != 0;
         for p in &self.pieces[..n] {
             self.got.push((
                 p.stream,
@@ -1045,7 +1057,15 @@ impl AcceptHost {
     }
 
     fn ingest(&mut self, bytes: &[u8]) -> Outcome {
+        self.ingest_with(bytes, 0)
+    }
+
+    /// `ingest` with head flags `flags` (`FLAG_RESUME`: the host re-issuing the op that answered
+    /// PENDING, with the same bytes).
+    fn ingest_with(&mut self, bytes: &[u8], flags: u32) -> Outcome {
         let mut i: IngestIn = z();
+        i.head.ticket = self.ticket;
+        i.head.flags = flags;
         i.framing = self.framing;
         i.bytes = bytes.as_ptr();
         i.len = bytes.len();
@@ -1057,6 +1077,7 @@ impl AcceptHost {
 
     fn emit(&mut self, stream: u64, bytes: &[u8], end: bool, status: u32) -> Outcome {
         let mut i: EmitIn = z();
+        i.head.ticket = self.ticket;
         i.framing = self.framing;
         i.stream = stream;
         i.bytes = bytes.as_ptr();
@@ -1067,6 +1088,71 @@ impl AcceptHost {
         let mut o: FramerOut = z();
         let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
         self.take(r, &o)
+    }
+
+    /// `refuse`: `bytes` for `stream` (`None`: the whole connection), with the neutral `status`
+    /// and `head_sent`, on no ticket (it never pends), re-called while it answers `YIELD_MORE`.
+    fn refuse(
+        &mut self,
+        stream: Option<u64>,
+        bytes: &[u8],
+        status: u32,
+        head_sent: bool,
+    ) -> Outcome {
+        let mut first = true;
+        loop {
+            let mut i: RefuseIn = z();
+            i.framing = self.framing;
+            i.stream = stream.unwrap_or(0);
+            i.has_stream = u32::from(stream.is_some());
+            let b: &[u8] = if first { bytes } else { &[] };
+            i.bytes = b.as_ptr();
+            i.len = b.len();
+            i.status = status;
+            i.head_sent = u32::from(head_sent);
+            i.sink = self.sink();
+            let mut o: FramerOut = z();
+            let r = call(self.ops.refuse, self.inst, &mut i, &mut o, slot::REFUSE);
+            let more = o.yielded.flags & YIELD_MORE != 0;
+            let r = self.take(r, &o);
+            if r != Outcome::Ready || !more {
+                return r;
+            }
+            first = false;
+        }
+    }
+
+    /// `cancel` of the op on `ticket`: its disposition.
+    fn cancel(&mut self, ticket: Ticket) -> u32 {
+        let mut i: CancelIn = z();
+        i.ticket = ticket;
+        let mut o: CancelOut = z();
+        assert_eq!(
+            call(
+                self.ops.head.cancel,
+                self.inst,
+                &mut i,
+                &mut o,
+                life::CANCEL
+            ),
+            Outcome::Ready
+        );
+        o.disposition
+    }
+
+    /// `timer`, on no ticket: the connector crosses it on a blank `in` (it never pends).
+    fn timer(&mut self) -> Outcome {
+        let mut i: FramingIn = z();
+        i.framing = self.framing;
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER);
+        self.take(r, &o)
+    }
+
+    /// The completion sequence numbers the door's `auth.call`s were issued under, in order.
+    fn seqs(&self) -> Vec<u32> {
+        SCRIPTS.lock().expect("scripts")[&self.ctx].seqs.clone()
     }
 
     /// Every call the door made on the auth handle, in order.
@@ -1271,6 +1357,10 @@ struct Script {
     /// The services that answer FAILED (no answer at all): `auth.call`, `unit.hand_in`,
     /// `unit.refuse`.
     fails: Fails,
+    /// How many `auth.call`s answer NOT-READY (PENDING) before the script answers.
+    pend: usize,
+    /// Each `auth.call`'s completion sequence number.
+    seqs: Vec<u32>,
     asked: Vec<Asked>,
 }
 
@@ -1382,8 +1472,18 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
             view: view_of(&i.request),
             body: (!i.body.ptr.is_null()).then(|| bytes_of(i.body.ptr, i.body.len)),
         });
+        script.seqs.push(i.head.handle.seq);
+        // The loader's rule (THE DESIGN §11.12 l.1602): a may-pend service called with no ticket
+        // is REFUSED.
+        if i.head.handle.ticket.is_none() {
+            return outcome(out, Outcome::Refused);
+        }
         if script.fails.auth {
             return outcome(out, Outcome::Failed);
+        }
+        if script.pend > 0 {
+            script.pend -= 1;
+            return outcome(out, Outcome::Pending);
         }
         let (flow, names) = script
             .auth
@@ -1982,6 +2082,233 @@ fn strips_a_decoded_query_key(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// The ticket the cells' framings run on, where a cell needs one.
+const TICKET: Ticket = Ticket {
+    slot: 1,
+    generation: 1,
+};
+
+/// `timer` is no ticketed op (`contract!(TIMER, true, false, ..)`: it never pends): it never calls
+/// the auth handle and never answers PENDING, even with a request parked on a pending `auth.call`
+/// (Q128 reader A finding 2; THE DESIGN §11.12 l.1602-1604, Appendix A.4.6 l.3646).
+fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    assert_eq!(
+        h.ingest(POST_HELLO),
+        Outcome::Pending,
+        "{label}: the auth call pends"
+    );
+    assert_eq!(h.asked().len(), 1, "{label}");
+    assert_ne!(h.timer(), Outcome::Pending, "{label}: a timer never pends");
+    assert_eq!(
+        h.asked().len(),
+        1,
+        "{label}: a timer never calls the auth handle: {:?}",
+        h.asked()
+    );
+    assert_eq!(
+        h.heads_up(),
+        0,
+        "{label}: nothing went up past the parked call"
+    );
+    // The parked request was not dropped by the timer: the resume answers it (Q128 reader B
+    // finding 1: no request is ever dropped without an answer).
+    assert_eq!(
+        h.ingest_with(POST_HELLO, FLAG_RESUME),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: the resumed request went up");
+    h.close();
+}
+
+/// A pending `auth.call` parks the op; the host's resume re-issues the op with the same bytes and
+/// `FLAG_RESUME`: the door takes no byte twice, re-issues the SAME completion handle, and the
+/// request goes up once, whole (the transport contract: "the framer re-issues the same handle, and
+/// the service answers its STORED result").
+fn a_resume_reissues_the_same_handle(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Pending, "{label}");
+    assert_eq!(
+        h.heads_up(),
+        0,
+        "{label}: the op yields nothing while it pends"
+    );
+    assert_eq!(
+        h.ingest_with(POST_HELLO, FLAG_RESUME),
+        Outcome::Ready,
+        "{label}"
+    );
+    let seqs = h.seqs();
+    assert!(
+        seqs.len() == 2 && seqs[0] == seqs[1],
+        "{label}: the same handle re-issued: {seqs:?}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: one request went up");
+    let body: Vec<u8> = h
+        .got
+        .iter()
+        .filter(|g| g.2 & PIECE_FIELDS == 0)
+        .flat_map(|g| g.1.clone())
+        .collect();
+    assert_eq!(body, b"hello", "{label}: its bytes taken once");
+    h.close();
+}
+
+/// A `cancel` of an op parked on a pending `auth.call`: its bytes were taken, so the disposition is
+/// PARTIAL, and the parked call is let go (a later op calls afresh, under a new handle); a cancel
+/// of a ticket nothing is parked on moved nothing (Q128 reader A finding 3).
+fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    let other = Ticket {
+        slot: 9,
+        generation: 1,
+    };
+    assert_eq!(
+        h.cancel(other),
+        CANCEL_NOTHING_MOVED,
+        "{label}: nothing parked"
+    );
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Pending, "{label}");
+    assert_eq!(
+        h.cancel(TICKET),
+        CANCEL_PARTIAL,
+        "{label}: its bytes were taken"
+    );
+    assert_eq!(h.ingest(b""), Outcome::Ready, "{label}: a fresh op");
+    let seqs = h.seqs();
+    assert!(
+        seqs.len() == 2 && seqs[0] != seqs[1],
+        "{label}: the cancelled call is not re-issued: {seqs:?}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// Requests pipelined past any per-op bound are each answered in the op that decoded them: none is
+/// left waiting for a wake that never comes (Q128 reader B finding 1).
+fn pipelined_refusals(label: &str, ops: &'static Ops) {
+    const N: usize = 24;
+    let one = b"GET /nope HTTP/1.1\r\nhost: busbar.test\r\n\r\n";
+    let many: Vec<u8> = one.iter().copied().cycle().take(one.len() * N).collect();
+    let h = admitted(
+        ops,
+        vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        &many,
+    );
+    let refused = h
+        .asked()
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                Asked::Refuse {
+                    cause: REFUSE_NO_ROUTE,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        refused, N,
+        "{label}: every pipelined request answered in the one op"
+    );
+    let answers = h
+        .out
+        .windows(22)
+        .filter(|w| *w == b"HTTP/1.1 404 Not Found")
+        .count();
+    assert_eq!(answers, N, "{label}");
+    h.close();
+}
+
+/// THE ABI'S `refuse` ON AN ACCEPTED STREAM (Q128 reader B finding 2; ruling 22): a stream refused
+/// before its answer head is answered with `bytes` at the mapped `status`, its length stated, as
+/// v1.5.5's server answered a handler's error response.
+fn refuse_a_stream_before_its_head(label: &str, ops: &'static Ops) {
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(h.heads_up(), 1, "{label}");
+    let body = br#"{"error":"overloaded"}"#;
+    assert_eq!(
+        h.refuse(Some(1), body, 503, false),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        format!(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        ),
+        "{label}"
+    );
+    h.close();
+}
+
+/// `head_sent`: the answer's head already went; the stream ends failed. On HTTP/1.1 the connection
+/// closes with no terminating chunk, so the far side never reads a cut answer as whole.
+fn refuse_a_stream_after_its_head(label: &str, ops: &'static Ops) {
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(
+        h.emit(1, b"content-type: text/event-stream\r\n", false, 200),
+        Outcome::Ready
+    );
+    assert_eq!(h.emit(1, b"data: x\n\n", false, 0), Outcome::Ready);
+    assert_eq!(h.refuse(Some(1), b"", 500, true), Outcome::Ready, "{label}");
+    let wire = String::from_utf8_lossy(&h.out).into_owned();
+    assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{label}: {wire:?}");
+    assert!(
+        !wire.ends_with("0\r\n\r\n"),
+        "{label}: no terminating chunk: {wire:?}"
+    );
+    assert!(h.ended, "{label}: the connection is over");
+    h.close();
+}
+
+/// The whole connection (`has_stream` 0): the refusal's bytes are the transport's whole envelope
+/// (the connector's `unit0_refusal`), written as they are; the connection is over.
+fn refuse_the_connection(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open(ops);
+    let bytes = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
+    assert_eq!(h.refuse(None, bytes, 0, false), Outcome::Ready, "{label}");
+    assert_eq!(h.out, bytes, "{label}");
+    assert!(h.ended, "{label}: the connection is over");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -2053,4 +2380,39 @@ fn a_failed_refusal_never_reaches_the_plane() {
 #[test]
 fn a_percent_encoded_query_key_is_stripped_as_the_key_it_decodes_to() {
     both(strips_a_decoded_query_key);
+}
+
+#[test]
+fn a_timer_never_calls_the_auth_handle_nor_pends() {
+    both(timer_never_calls_the_auth);
+}
+
+#[test]
+fn a_resumed_op_reissues_the_same_handle_and_takes_no_byte_twice() {
+    both(a_resume_reissues_the_same_handle);
+}
+
+#[test]
+fn a_cancel_of_a_parked_op_is_partial_and_lets_the_call_go() {
+    both(cancel_of_a_parked_op);
+}
+
+#[test]
+fn pipelined_requests_are_each_answered_in_the_op_that_decoded_them() {
+    both(pipelined_refusals);
+}
+
+#[test]
+fn a_stream_refused_before_its_head_is_answered_with_the_refusal() {
+    both(refuse_a_stream_before_its_head);
+}
+
+#[test]
+fn a_stream_refused_after_its_head_ends_failed() {
+    both(refuse_a_stream_after_its_head);
+}
+
+#[test]
+fn a_connection_refused_whole_is_written_and_ends() {
+    both(refuse_the_connection);
 }
