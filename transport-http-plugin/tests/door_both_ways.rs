@@ -27,7 +27,8 @@ use busbar_contract::abi::auth::{
 use busbar_contract::abi::host::service::{
     AuthAnswer, AuthCallIn, AuthRef, HeadView, HostSlots, RefusalAnswer, ServiceOut, UnitHandInIn,
     UnitRef, UnitRefuseIn, FLOW_CONTINUE, FLOW_STOP, LINE_NONE, REFUSE_CHECK_FAILED,
-    REFUSE_METHOD_MISS, REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED, SERVICES,
+    REFUSE_METHOD_MISS, REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED, SCHEME_PLAIN,
+    SCHEME_SECURE, SERVICES,
 };
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, RawOutcome, Span, BLOB_JSON, BLOB_OCTETS,
@@ -950,6 +951,12 @@ impl AcceptHost {
     /// An accepted connection on a listener with guest list `lines`, the auth handle answered by
     /// `script` (`OpenIn::host`'s services table).
     fn open_with(ops: &'static Ops, lines: Vec<LineEntry>, script: Script) -> Self {
+        Self::open_on(ops, lines, script, false)
+    }
+
+    /// [`AcceptHost::open_with`] on a connection whose security the host states (`secured`: the
+    /// secure layer presented the host's certificate, `ConnFacts::local_certificate`) or not.
+    fn open_on(ops: &'static Ops, lines: Vec<LineEntry>, script: Script, secured: bool) -> Self {
         let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
         SCRIPTS.lock().expect("scripts").insert(ctx, script);
         let tables = HostTables {
@@ -992,6 +999,10 @@ impl AcceptHost {
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
+        if secured {
+            facts.local_certificate = s("the host's certificate, DER");
+            facts.agreed_protocol = s("http/1.1");
+        }
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
         i.facts = &facts;
@@ -1148,6 +1159,11 @@ impl AcceptHost {
         let mut o: FramerOut = z();
         let r = call(self.ops.timer, self.inst, &mut i, &mut o, slot::TIMER);
         self.take(r, &o)
+    }
+
+    /// The tickets the door's `auth.call`s were issued under, in order.
+    fn tickets(&self) -> Vec<Ticket> {
+        SCRIPTS.lock().expect("scripts")[&self.ctx].tickets.clone()
     }
 
     /// The completion sequence numbers the door's `auth.call`s were issued under, in order.
@@ -1336,6 +1352,8 @@ struct View {
     target: String,
     query: Option<String>,
     fields: Vec<(String, Vec<u8>)>,
+    /// `SCHEME_*`, as the view declared it.
+    scheme: u8,
 }
 
 impl View {
@@ -1361,6 +1379,8 @@ struct Script {
     pend: usize,
     /// Each `auth.call`'s completion sequence number.
     seqs: Vec<u32>,
+    /// Each `auth.call`'s ticket.
+    tickets: Vec<Ticket>,
     asked: Vec<Asked>,
 }
 
@@ -1445,6 +1465,7 @@ unsafe fn view_of(v: &HeadView) -> View {
             target: text(v.target),
             query: (!v.query.ptr.is_null()).then(|| text(v.query)),
             fields,
+            scheme: v.scheme,
         }
     }
 }
@@ -1473,6 +1494,7 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
             body: (!i.body.ptr.is_null()).then(|| bytes_of(i.body.ptr, i.body.len)),
         });
         script.seqs.push(i.head.handle.seq);
+        script.tickets.push(i.head.handle.ticket);
         // The loader's rule (THE DESIGN §11.12 l.1602): a may-pend service called with no ticket
         // is REFUSED.
         if i.head.handle.ticket.is_none() {
@@ -2309,6 +2331,77 @@ fn refuse_the_connection(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// THE SCHEME THE AUTH IS SHOWN (`HeadView::scheme`, busbar e858ecc: `0` is refused off the peer
+/// point): the one the host states for the accepted connection, never `0`. Until `BeginIn` states
+/// it, the host's statement is `BeginIn::facts` ("what connection security established"): a secure
+/// layer presents the host's certificate and agrees a protocol; a cleartext connection has neither.
+fn shows_the_scheme(label: &str, ops: &'static Ops) {
+    for (secured, want) in [(false, SCHEME_PLAIN), (true, SCHEME_SECURE)] {
+        let mut h = AcceptHost::open_on(
+            ops,
+            vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+            Script::default(),
+            secured,
+        );
+        assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+        let asked = h.asked();
+        let [Asked::Auth { view: shown, .. }, Asked::HandIn { view, .. }] = &asked[..] else {
+            panic!("{label}: an auth call, then the hand-in: {asked:?}");
+        };
+        assert_eq!(
+            shown.scheme, want,
+            "{label}: secured {secured}: the auth's view"
+        );
+        assert_eq!(
+            view.scheme, want,
+            "{label}: secured {secured}: the hand-in's view"
+        );
+        h.close();
+    }
+}
+
+/// A PENDING `auth.call` PARKS ONLY ITS OWN STREAM, on its own ticket (busbar e858ecc, the transport
+/// contract: "a parked `ingest` holds nothing of the host's ... the framer holds back only the
+/// stream whose auth it waits on"): a fresh op on another ticket never re-issues the parked handle
+/// under its own ticket, and the resume on the parked ticket does, with the same handle.
+fn parks_on_its_own_ticket(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    let other = Ticket {
+        slot: 2,
+        generation: 1,
+    };
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Pending, "{label}");
+    h.ticket = other;
+    assert_eq!(
+        h.ingest(b""),
+        Outcome::Ready,
+        "{label}: a fresh op on another ticket flows"
+    );
+    assert_eq!(
+        h.tickets(),
+        vec![TICKET],
+        "{label}: the parked handle is never re-issued under another ticket"
+    );
+    h.ticket = TICKET;
+    assert_eq!(
+        h.ingest_with(b"", FLAG_RESUME),
+        Outcome::Ready,
+        "{label}: the resume"
+    );
+    let seqs = h.seqs();
+    assert_eq!(h.tickets(), vec![TICKET, TICKET], "{label}");
+    assert!(seqs.len() == 2 && seqs[0] == seqs[1], "{label}: {seqs:?}");
+    assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -2415,4 +2508,14 @@ fn a_stream_refused_after_its_head_ends_failed() {
 #[test]
 fn a_connection_refused_whole_is_written_and_ends() {
     both(refuse_the_connection);
+}
+
+#[test]
+fn the_auth_is_shown_the_scheme_the_connection_states() {
+    both(shows_the_scheme);
+}
+
+#[test]
+fn a_pending_auth_call_parks_only_its_own_stream_on_its_own_ticket() {
+    both(parks_on_its_own_ticket);
 }
