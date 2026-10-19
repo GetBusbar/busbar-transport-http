@@ -119,6 +119,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "zeroize",
 ]
 
 [[package]]
