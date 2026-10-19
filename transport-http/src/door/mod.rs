@@ -544,8 +544,9 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// offered as written.
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
-    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
-        return v4.to_string();
+    // A canonical dotted quad (the only spelling `is_ipv4_literal` accepts) prints as written.
+    if busbar_contract::net::is_ipv4_literal(bare) {
+        return bare.to_owned();
     }
     sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
 }
