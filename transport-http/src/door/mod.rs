@@ -42,8 +42,11 @@
 //! One clock bounds each exchange, as 1.5.5's `limits.upstream_request_timeout_secs` did: from the
 //! attempt's start (the deadline the caller stamps on `emit`) to the response body's end.
 //!
-//! No op pends. An op that has nothing more to do answers what it has, with the next instant it
-//! must be called at when hyper is waiting on a timer.
+//! An op that has nothing more to do answers what it has, with the next instant it must be called
+//! at when hyper is waiting on a timer. The one op that may wait is the accepted side's call on the
+//! host auth handle (below): a pending `auth.call` answers the op PENDING under the SDK's `Pend`
+//! contract, and the op, re-entered with `FLAG_RESUME`, takes no input twice and re-issues the same
+//! completion handle.
 //!
 //! Every slot is a `SafeSlot` on the SDK's safe surface: the instance is the SDK's typed
 //! `sdk::Instance<Instance>`, host-lent bytes and host buffers go through `Lent` and `HostBuf`, and
@@ -62,10 +65,23 @@
 //! the connection to the claimed upgrade framer: as the far side sent it while nothing has been
 //! answered (the upgrade framer answers the upgrade itself), or from the byte after a request the
 //! host answered `101`. `refuse`, `adopt` and every carrier op are refused.
+//!
+//! THE ACCEPTED SIDE GOES THROUGH THE GUEST LIST (`BUSBAR-1.6.0.md` §6, "Auth points and guest
+//! lists", item 4, l.938-962; coordinator ruling 22). `begin` on [`SIDE_ACCEPT`] keeps the
+//! listener's lines (`BeginIn::lines`, [`guest`]); after every drive, each decoded request is
+//! matched, its line's auth called at its points, what the auth names stripped, and the request
+//! handed in, all through the host auth handle the instance was opened with (`OpenIn::host`'s
+//! services: `auth.call`, `unit.hand_in`, `unit.refuse`, [`HostKernel`]). Only an admitted request
+//! goes up; a refused one is answered with the kernel's bytes, framed verbatim ([`accept`]).
 
 pub(crate) mod accept;
 pub(crate) mod dest_head;
 pub(crate) mod engine;
+pub(crate) mod guest;
+
+// This crate's own seal over what the auth handle answers (`Services::auth_call`): an accepting
+// side's answer names what to strip and carries no secret of its own.
+busbar_contract::own_seal!(Own);
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK,
 // expanded over this crate's own `hyper` and `bytes`.
@@ -76,14 +92,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
+use std::task::Poll;
+
+use busbar_contract::abi::host::service::{AuthRef, UnitRef};
+use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
 };
+use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::Refusal;
+use busbar_contract::abi::sdk::services::{
+    HeadViewArgs, Pend, Place, RefusalCopy, ServiceError, Services,
+};
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
@@ -97,7 +120,7 @@ use busbar_contract::abi::transport::{
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
-use accept::Accepted;
+use accept::{Accepted, Kernel};
 use busbar_contract::abi::transport::check::check_emit_status;
 use engine::{Framing, Posture, Proto};
 #[cfg(test)]
@@ -316,6 +339,9 @@ pub(crate) struct Instance {
     settings: RwLock<Settings>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
     next: AtomicU64,
+    /// The host services `open` was handed (`OpenIn::host`): the auth handle an accepted side
+    /// admits its requests through. `None`: the host offers none, and no request is admitted.
+    services: Option<Services>,
 }
 
 impl Instance {
@@ -417,10 +443,12 @@ slot!(
     Open, OpenIn, OpenOut, |instance, i, o| {
         match read_settings(i.field(|x| &x.settings).bytes()) {
             Ok(settings) => {
+                let services = i.host().and_then(|h| Services::of(h.get()));
                 instance.open(Instance {
                     settings: RwLock::new(settings),
                     framings: Mutex::new(HashMap::new()),
                     next: AtomicU64::new(1),
+                    services,
                 });
                 Outcome::Ready
             }
@@ -667,11 +695,19 @@ impl SafeSlot for Begin {
         let settings = inst.settings();
         if i.side == SIDE_ACCEPT {
             // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
-            // listener did (`accept`): no agreed protocol is read here.
+            // listener did (`accept`): no agreed protocol is read here. It is framed under the
+            // listener's guest list, in the kernel's match order (`BeginIn::lines`).
+            let lines: Option<Vec<guest::Line>> = i.lines().iter().map(guest::Line::of).collect();
+            let Some(lines) = lines else {
+                o.error("begin: a guest-list line's route is not text");
+                return Outcome::Failed;
+            };
             // As on the dialled side: the framing joins the table only once its first step is
-            // READY, so a failed begin leaves no entry the host holds no token for.
-            let mut h = Held::Accept(Accepted::accept(i.sink.now_monotonic_ns));
-            let r = step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+            // READY, so a failed begin leaves no entry the host holds no token for. Nothing is
+            // admitted at `begin` (no request is decoded yet); the peer point is called on the
+            // connection's first drive with bytes, before any request is admitted.
+            let mut h = Held::Accept(Accepted::accept(i.sink.now_monotonic_ns, lines));
+            let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
             if r != Outcome::Ready {
                 return r;
             }
@@ -712,7 +748,7 @@ impl SafeSlot for Begin {
         // The framing joins the instance's table only once its first step is READY: a begin that
         // fails hands the host no token, so nothing would ever release an entry it left behind.
         let mut h = Held::Dial(framing);
-        let r = step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+        let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
         if r != Outcome::Ready {
             return r;
         }
@@ -738,7 +774,7 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |h| {
+        with(&p, i.head, i.framing, i.field(|x| &x.sink), &mut o, |h| {
             match h {
                 Held::Dial(f) => f.ingest(bytes, i.end != 0),
                 Held::Accept(a) => a.ingest(bytes, i.end != 0),
@@ -762,20 +798,27 @@ impl SafeSlot for Emit {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
         let mut full = false;
-        let r = with(&p, i.framing, i.field(|x| &x.sink), &mut o, |h| match h {
-            Held::Dial(f) => {
-                // A dialled stream's emits carry a request: no answer's status rides them.
-                check_emit_status(&i, false).map_err(refused_status)?;
-                f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
-            }
-            Held::Accept(a) => {
-                // The first emit on an accepted stream is its answer's head, with its status;
-                // every other carries none.
-                check_emit_status(&i, a.answers_head(i.stream)).map_err(refused_status)?;
-                full = a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?;
-                Ok(())
-            }
-        });
+        let r = with(
+            &p,
+            i.head,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |h| match h {
+                Held::Dial(f) => {
+                    // A dialled stream's emits carry a request: no answer's status rides them.
+                    check_emit_status(&i, false).map_err(refused_status)?;
+                    f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+                }
+                Held::Accept(a) => {
+                    // The first emit on an accepted stream is its answer's head, with its status;
+                    // every other carries none.
+                    check_emit_status(&i, a.answers_head(i.stream)).map_err(refused_status)?;
+                    full = a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?;
+                    Ok(())
+                }
+            },
+        );
         if full && r == Outcome::Ready {
             mark_stream_full(&mut o);
         }
@@ -794,7 +837,9 @@ impl SafeSlot for Timer {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        with(&p, i.head, i.framing, i.field(|x| &x.sink), &mut o, |_| {
+            Ok(())
+        })
     }
 }
 
@@ -949,29 +994,48 @@ impl SafeSlot for Encode {
     }
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink.
+/// Run `f` on framing `token`, then drive it and fill the sink. An op re-entered with
+/// `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its input whole the first time:
+/// `f` is not run again.
 fn with(
     p: &sdk::Instance<'_, Instance>,
+    head: InHead,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
-    let held = p
-        .get()
-        .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
+    let Some(inst) = p.get() else {
+        o.error("no such framing");
+        return Outcome::Failed;
+    };
+    let held = inst.framings.lock().expect("framings").get(&token).cloned();
     let Some(held) = held else {
         o.error("no such framing");
         return Outcome::Failed;
     };
+    let mut kernel = HostKernel {
+        services: inst.services.as_ref(),
+        ticket: head.ticket,
+        conn: token,
+    };
     let mut h = held.lock().expect("framing");
-    step(&mut h, sink, o, f)
+    if head.flags & FLAG_RESUME != 0 {
+        return step(&mut h, sink, o, Some(&mut kernel), |_| Ok(()));
+    }
+    step(&mut h, sink, o, Some(&mut kernel), f)
 }
+
+/// How many admit-then-drive rounds one op runs: each round admits every request decoded so far,
+/// and the drive after it lets hyper write the answers and decode what follows. What is left waits
+/// for the next op.
+const ADMIT_ROUNDS: usize = 16;
 
 fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
+    kernel: Option<&mut HostKernel<'_>>,
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(h) {
@@ -990,10 +1054,106 @@ fn step(
         }
         Held::Accept(a) => {
             a.drive(sink.now_monotonic_ns);
+            if let Some(k) = kernel {
+                for _ in 0..ADMIT_ROUNDS {
+                    let did = a.admit(k);
+                    if did.parked {
+                        // A pending `auth.call` (the SDK's `Pend`: only on a ticketed op): the op
+                        // waits for the host's wake, its output held in the framing.
+                        return Outcome::Pending;
+                    }
+                    if !did.moved {
+                        break;
+                    }
+                    a.drive(sink.now_monotonic_ns);
+                }
+            }
             fill(a, sink, o, class_of, fault_of);
         }
     }
     Outcome::Ready
+}
+
+/// THE HOST AUTH HANDLE as the accepted side calls it: the SDK's `Services` wrappers, each call
+/// under the op's ticket and the completion sequence the framing issued
+/// (`abi::mechanism::ticket::CompletionHandle`), on connection `conn` (the framing's token).
+pub(crate) struct HostKernel<'a> {
+    services: Option<&'a Services>,
+    ticket: Ticket,
+    conn: u64,
+}
+
+impl HostKernel<'_> {
+    const fn handle(&self, seq: u32) -> CompletionHandle {
+        CompletionHandle {
+            ticket: self.ticket,
+            seq,
+            _reserved: 0,
+        }
+    }
+}
+
+impl Kernel for HostKernel<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn auth_call(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        point: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+        body: Option<&[u8]>,
+    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)> {
+        let Some(s) = self.services else {
+            return Poll::Ready(Err(ServiceError::Unserved));
+        };
+        s.auth_call::<Own>(
+            self.handle(seq),
+            auth,
+            unit,
+            point,
+            self.conn,
+            stream,
+            request,
+            body,
+        )
+        .map(|r| r.map(|c| (c.flow, c.unit, c.names)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hand_in(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        line: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError> {
+        let s = self.services.ok_or(ServiceError::Unserved)?;
+        s.unit_hand_in(
+            self.handle(seq),
+            auth,
+            unit,
+            line,
+            self.conn,
+            stream,
+            request,
+        )
+    }
+
+    fn refuse(
+        &mut self,
+        seq: u32,
+        unit: UnitRef,
+        cause: u32,
+        line: u32,
+        stream: u64,
+    ) -> Result<RefusalCopy, ServiceError> {
+        let s = self.services.ok_or(ServiceError::Unserved)?;
+        s.unit_refuse(self.handle(seq), unit, cause, line, self.conn, stream)
+    }
 }
 
 /// An emit whose status breaks `check_emit_status`, as the failure its op answers.

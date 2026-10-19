@@ -10,6 +10,59 @@ use http_body_util::BodyExt;
 
 const SEC: u64 = 1_000_000_000;
 
+/// The kernel a `none` line meets: every hand-in CONTINUE; no auth is called on it and nothing is
+/// refused.
+struct Open;
+
+impl Kernel for Open {
+    #[allow(clippy::too_many_arguments)]
+    fn auth_call(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+        _: Option<&[u8]>,
+    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)> {
+        Poll::Ready(Err(ServiceError::Unserved))
+    }
+    fn hand_in(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError> {
+        Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }))
+    }
+    fn refuse(
+        &mut self,
+        _: u32,
+        _: UnitRef,
+        _: u32,
+        _: u32,
+        _: u64,
+    ) -> Result<RefusalCopy, ServiceError> {
+        Err(ServiceError::Unserved)
+    }
+}
+
+/// An accepted connection under one `none` line that takes every request.
+fn accepted() -> Accepted {
+    Accepted::accept(SEC, vec![Line::any(1)])
+}
+
+/// Drive the connection at `now`, admit what it decoded, and drive what the admission let move.
+fn run(a: &mut Accepted, now: u64) {
+    a.drive(now);
+    a.admit(&mut Open);
+    a.drive(now);
+}
+
 /// What the framing handed up, by stream: field blocks, body bytes, whether the request is whole.
 #[derive(Debug, Default)]
 struct Up {
@@ -136,9 +189,9 @@ fn door(
     body: &[u8],
     sized: bool,
 ) -> Vec<u8> {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(request, false);
-    a.drive(SEC);
+    run(&mut a, SEC);
     let u = up(&mut a);
     assert_eq!(u.heads.len(), 1, "one request");
     let stream = u.heads[0].0;
@@ -155,7 +208,7 @@ fn door(
     assert!(!a.answers_head(stream), "the head went");
     a.emit(stream, body, true, 0).expect("body");
     // The answer goes out before any read end, as on the v1.5.5 side.
-    a.drive(2 * SEC);
+    run(&mut a, 2 * SEC);
     a.take_wire(usize::MAX)
 }
 
@@ -163,12 +216,12 @@ const GET: &[u8] = b"GET /v1/models?x=1 HTTP/1.1\r\nhost: busbar.test\r\nuser-ag
 
 #[test]
 fn a_request_goes_up_as_its_head_slots_one_field_block_and_its_body() {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(
         b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\nconnection: keep-alive\r\ncontent-length: 5\r\ncontent-type: application/json\r\n\r\nhello",
         false,
     );
-    a.drive(SEC);
+    run(&mut a, SEC);
     let u = up(&mut a);
     assert_eq!(u.heads.len(), 1);
     let (stream, words, block) = &u.heads[0];
@@ -231,31 +284,31 @@ fn an_error_answer_is_the_bytes_v155_wrote() {
 
 #[test]
 fn a_header_read_past_30s_ends_the_connection_unanswered() {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(b"GET / HTTP/1.1\r\nhost: slow", false);
-    a.drive(SEC);
+    run(&mut a, SEC);
     assert!(a.next_deadline().is_some(), "the header read is bounded");
-    a.drive(SEC + 29 * SEC);
+    run(&mut a, SEC + 29 * SEC);
     assert!(!a.ended(), "not before 30s");
-    a.drive(SEC + 31 * SEC);
+    run(&mut a, SEC + 31 * SEC);
     assert!(a.ended(), "the bound ends the connection");
     assert!(up(&mut a).heads.is_empty(), "no request went up");
 }
 
 #[test]
 fn a_status_on_a_stream_with_no_request_is_refused() {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     assert!(a.emit(9, b"", true, 200).is_err());
 }
 
 #[test]
 fn a_switched_connection_detaches_what_followed_its_request() {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(
         b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n\x81\x05hello",
         false,
     );
-    a.drive(SEC);
+    run(&mut a, SEC);
     let u = up(&mut a);
     let stream = u.heads[0].0;
     a.emit(
@@ -265,7 +318,7 @@ fn a_switched_connection_detaches_what_followed_its_request() {
         101,
     )
     .expect("101");
-    a.drive(SEC);
+    run(&mut a, SEC);
     let rest = a.detach().expect("switched").expect("something switched");
     let rest: Vec<u8> = rest.drain(..).collect();
     assert_eq!(rest, b"\x81\x05hello", "the bytes after the request");
@@ -282,9 +335,9 @@ fn a_switched_connection_detaches_what_followed_its_request() {
 fn an_unanswered_connection_detaches_as_sent_for_the_upgrade_framer_to_answer() {
     let request: &[u8] =
         b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n";
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(request, false);
-    a.drive(SEC);
+    run(&mut a, SEC);
     assert_eq!(up(&mut a).heads.len(), 1, "the request went up");
     a.ingest(b"\x81\x02hi", false);
     let rest: Vec<u8> = a
@@ -302,21 +355,21 @@ fn an_unanswered_connection_detaches_as_sent_for_the_upgrade_framer_to_answer() 
 
 #[test]
 fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
-    let mut a = Accepted::accept(SEC);
+    let mut a = accepted();
     a.ingest(GET, false);
-    a.drive(SEC);
+    run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
     a.emit(stream, b"content-length: 0\r\n", true, 204)
         .expect("answered");
-    a.drive(SEC);
+    run(&mut a, SEC);
     assert!(
         a.detach().expect("no failure").is_none(),
         "an answered connection"
     );
 
-    let mut h2 = Accepted::accept(SEC);
+    let mut h2 = accepted();
     h2.ingest(H2_PREFACE, false);
-    h2.drive(SEC);
+    run(&mut h2, SEC);
     assert!(
         h2.detach().expect("no failure").is_none(),
         "an HTTP/2 connection"
