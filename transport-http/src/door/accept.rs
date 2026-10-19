@@ -372,17 +372,16 @@ impl Accepted {
 
     /// Bound the copy kept for a hand-over as sent (Q128 reader A finding 1; THE DESIGN §1
     /// l.199-201, a bound on live work is a refusal at admission): it goes once a request asking no
-    /// upgrade was decoded (no hand-over as sent is possible after it), and past the head limit
-    /// hyper reads a head under (`engine::HEAD_MAX_BYTES`, all an upgrade request and what follows
-    /// it may hold before it is answered) the connection is refused.
+    /// upgrade, or one carrying a body, was decoded (no hand-over as sent is possible after it),
+    /// and past the head limit hyper reads a head under (`engine::HEAD_MAX_BYTES`, all an upgrade
+    /// request and what follows it may hold before it is answered) it goes too: the connection is
+    /// served on, as v1.5.5's server served it (Q128 reader B finding 2).
     fn bound_raw(&mut self) {
         if std::mem::take(&mut self.shared.lock().expect("shared").no_hand_over) {
             self.let_raw_go();
         }
         if self.raw.as_ref().is_some_and(|r| r.len() > HEAD_MAX_BYTES) {
             self.let_raw_go();
-            self.conn = None;
-            self.ended = true;
         }
     }
 
@@ -627,6 +626,17 @@ impl Accepted {
         for s in writable {
             sh.out.push_back(Piece::writable(s));
         }
+        let gone: Vec<u64> = sh
+            .streams
+            .iter()
+            .filter(|(_, a)| finished(a))
+            .map(|(s, _)| *s)
+            .collect();
+        for s in gone {
+            if let Some(mut a) = sh.streams.remove(&s) {
+                let_held_go(&mut a.held);
+            }
+        }
         let pieces: Vec<Piece> = sh.out.drain(..).collect();
         drop(sh);
         self.out.extend(pieces);
@@ -748,6 +758,7 @@ fn serve(
     let asks_upgrade = req.headers().contains_key(http::header::UPGRADE);
     let upgrade = asks_upgrade.then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
+    let bodiless = body.is_end_stream();
     let (tx, rx) = futures_channel::oneshot::channel();
     let stream = {
         let mut s = sh.lock().expect("shared");
@@ -773,7 +784,9 @@ fn serve(
             },
         );
         s.waiting.push(id);
-        if !asks_upgrade {
+        // The copy holds an upgrade request's HEAD only (Q128 reader B finding 2): a request that
+        // asks no upgrade, or one that carries a body, ends any hand-over as sent.
+        if !asks_upgrade || !bodiless {
             s.no_hand_over = true;
         }
         id
@@ -851,7 +864,7 @@ fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
                     a.held.extend_from_slice(&d);
                 }
                 if a.held.len() as u64 > limit {
-                    a.held.zeroize();
+                    let_held_go(&mut a.held);
                     a.held_over = true;
                     a.body = None;
                     return;
@@ -859,7 +872,7 @@ fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
             }
             // A body the far side broke off is no request to judge: the stream is left to hyper.
             Poll::Ready(Some(Err(_))) => {
-                a.held.zeroize();
+                let_held_go(&mut a.held);
                 a.body = None;
                 a.gate = Gate::Failed;
                 a.respond = None;
@@ -1169,7 +1182,7 @@ impl Accepted {
         did: &mut Admitted,
     ) {
         let seq = self.next_seq();
-        a.held.zeroize();
+        let_held_go(&mut a.held);
         // A request with no line has no unit (l.947: "A request that matches no line has no unit").
         let unit = if line == LINE_NONE {
             UnitRef::NONE
@@ -1189,13 +1202,43 @@ impl Accepted {
     }
 }
 
+/// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
+/// it (Q128 reader B finding 1).
+fn let_held_go(held: &mut Vec<u8>) {
+    held.zeroize();
+    *held = Vec::new();
+}
+
+/// Whether request `a` is over on both sides and its record can go (Q128 reader B finding 1; THE
+/// DESIGN §1 l.199-203, retention bounds only settled handles): its request side is done (refused,
+/// failed, or admitted and whole) and its answer is done (no head owed, and any body hyper still
+/// had to take taken). A request that asked to upgrade is kept while its answer is owed or it
+/// switched, for `detach`. What stays is therefore what hyper itself holds live, bounded as
+/// v1.5.5's server bounded it: one request at a time on HTTP/1.1, and hyper's HTTP/2 concurrent
+/// stream limit (hyper 1.11.1 `proto/h2/server.rs`:69, `max_concurrent_streams: Some(200)`, which
+/// v1.5.5's builder left as is, `crates/busbar/src/tls.rs`:559-566); past it hyper refuses the
+/// stream itself.
+fn finished(a: &Answer) -> bool {
+    let request_done = match a.gate {
+        Gate::Refused | Gate::Failed => true,
+        Gate::Admitted => a.body.is_none(),
+        _ => false,
+    };
+    let answer_done = a.respond.is_none()
+        && a.reply.as_ref().is_none_or(|q| {
+            let q = q.lock().expect("reply");
+            q.ended && q.chunks.is_empty()
+        });
+    request_done && answer_done && !a.switched
+}
+
 /// Leave request `a` unanswered: its answer's sender dropped, hyper ends the stream (HTTP/2) or
 /// the connection (HTTP/1.1) with no bytes of this transport's own.
 fn fail(a: &mut Answer, did: &mut Admitted) {
     a.respond = None;
     a.parts = None;
     a.body = None;
-    a.held.zeroize();
+    let_held_go(&mut a.held);
     a.gate = Gate::Failed;
     did.moved = true;
 }
@@ -1209,7 +1252,7 @@ fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
     out.push_back(head_piece(id, &parts));
     if !a.held.is_empty() {
         out.push_back(Piece::data(id, Bytes::copy_from_slice(&a.held)));
-        a.held.zeroize();
+        let_held_go(&mut a.held);
     }
     if a.held_whole {
         out.push_back(Piece::end(id));
