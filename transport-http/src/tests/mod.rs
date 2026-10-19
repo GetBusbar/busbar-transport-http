@@ -152,7 +152,10 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
     );
     assert!(raw::parse_message(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_some());
     assert!(raw::parse_message(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_some());
-    assert!(raw::parse_message(b"HTTP/1.1 200 OK\r\n\r\n").is_some());
+    assert!(
+        raw::parse_message(b"HTTP/1.1 200 OK\r\n\r\n").is_none(),
+        "a status line is not a request: the envelope `emit` reads always is one"
+    );
 }
 
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
