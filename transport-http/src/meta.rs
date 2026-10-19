@@ -59,11 +59,11 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // (reqwest 0.12 over hyper 1.11.0, v1.5.5 Cargo.lock) did: hyper `src/proto/h2/client.rs`
     // l.710-713, `set_content_length_if_missing` when the body's exact size is 0 and
     // `method_has_defined_payload_semantics`. A 1.5.5 parity exception, recorded as the
-    // coordinator's ruling (D) on Q128 transport-http. That line is added after the auth, and it is not one an
-    // auth could sign: the only fleet style handed the head (`STYLE_NEEDS_HEADERS`, sigv4) signs a
-    // fixed set that never names `content-length`, and every other style is handed no head at all.
-    // Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's client), and busbar-auth-sigv4's
-    // `no_length_line_is_ever_signed`.
+    // coordinator's ruling (D) on Q128 transport-http. That line is added after the auth, and it
+    // is not one an auth could sign: a header-signing auth style (one declaring
+    // `STYLE_NEEDS_HEADERS`) signs a fixed set that never names `content-length`, and every other
+    // style is handed no head at all. Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's
+    // client), and the header-signing style's own no-length-signed cell.
     facts: busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
