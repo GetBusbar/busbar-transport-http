@@ -10,7 +10,7 @@ fn parses_a_request_line_and_headers() {
     let msg = parse_message(raw).unwrap();
     assert_eq!(
         msg.start,
-        RawStartLine::Request {
+        RawStartLine {
             method: "GET".to_string(),
             path: Some("/v1/models".to_string())
         }
@@ -82,16 +82,12 @@ fn a_transfer_coding_on_any_line_is_a_declared_coding() {
     )]));
 }
 
+/// A status line is not a request: the envelope `emit` is handed always is one, so a message that
+/// opens with a status line does not parse (and `complete_message` refuses it as framing).
 #[test]
-fn parses_a_status_line() {
-    let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
-    let msg = parse_message(raw).unwrap();
+fn a_status_line_is_not_a_request() {
     assert_eq!(
-        msg.start,
-        RawStartLine::Status {
-            code: 404,
-            reason: "Not Found".to_string()
-        }
+        parse_message(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+        None
     );
-    assert!(msg.body.is_empty());
 }

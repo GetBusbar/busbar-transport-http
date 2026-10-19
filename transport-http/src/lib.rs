@@ -34,8 +34,6 @@ mod meta;
 mod raw;
 mod transport;
 
-pub use raw::{RawMessage, RawStartLine};
-
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this row: its key, the
@@ -48,8 +46,6 @@ pub mod linked {
     /// The layers this framer declares it is built over: none. The connector chooses the carrier
     /// from the target's scheme (`BUSBAR-1.6.0.md`: "no transport names another").
     pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
-    /// Whether this wire carries sessions.
-    pub const SESSION: bool = crate::meta::SESSION;
 
     /// The `http` framer's memory-ABI door: the one entry, linked here and exported by the
     /// dropped-in build alike.

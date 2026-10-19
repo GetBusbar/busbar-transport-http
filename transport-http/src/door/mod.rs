@@ -55,8 +55,8 @@
 //! framer's") is busbar-transport-http#24 (INBOUND-LISTEN, ARCHITECT ruling 2026-10-17: an accept
 //! side is required for 1.6.0), its own change.
 
-pub mod dest_head;
-pub mod engine;
+pub(crate) mod dest_head;
+pub(crate) mod engine;
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK,
 // expanded over this crate's own `hyper` and `bytes`.
@@ -95,7 +95,7 @@ use hyper_io::{fill, Owed};
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
 /// The settings this transport reads, at their 1.5.5 paths.
-pub mod setting {
+pub(crate) mod setting {
     /// Force cleartext HTTP/2 prior knowledge.
     pub const H2_PRIOR_KNOWLEDGE: &str = "advanced.upstream_h2_prior_knowledge";
     /// Pin the connection to HTTP/1.1.
@@ -280,7 +280,7 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
-pub const STATEMENT: Statement = Statement {
+pub(crate) const STATEMENT: Statement = Statement {
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
@@ -298,7 +298,7 @@ struct Settings {
 }
 
 /// The settings in force, and the framings the instance holds.
-pub struct Instance {
+pub(crate) struct Instance {
     /// Swapped whole by `refresh`; read once by each op that dials or offers, so one op never sees
     /// half of one reload and half of the next.
     settings: RwLock<Settings>,
@@ -370,7 +370,7 @@ macro_rules! slot {
     ($(#[$doc:meta])* $name:ident, $in:ty, $out:ty,
      |$inst:pat_param, $input:pat_param, $o:ident| $body:block) => {
         $(#[$doc])*
-        pub struct $name;
+        pub(crate) struct $name;
         impl SafeSlot for $name {
             type In = $in;
             type Out = $out;
@@ -551,7 +551,7 @@ fn offered_name(host: &str) -> String {
 }
 
 /// `locate`.
-pub struct Locate;
+pub(crate) struct Locate;
 impl SafeSlot for Locate {
     type In = LocateIn;
     type Out = LocateOut;
@@ -618,7 +618,7 @@ impl SafeSlot for Locate {
 }
 
 /// `begin`.
-pub struct Begin;
+pub(crate) struct Begin;
 impl SafeSlot for Begin {
     type In = BeginIn;
     type Out = FramerOut;
@@ -671,7 +671,7 @@ impl SafeSlot for Begin {
 }
 
 /// `ingest`.
-pub struct Ingest;
+pub(crate) struct Ingest;
 impl SafeSlot for Ingest {
     type In = IngestIn;
     type Out = FramerOut;
@@ -690,7 +690,7 @@ impl SafeSlot for Ingest {
 }
 
 /// `emit`.
-pub struct Emit;
+pub(crate) struct Emit;
 impl SafeSlot for Emit {
     type In = EmitIn;
     type Out = FramerOut;
@@ -709,7 +709,7 @@ impl SafeSlot for Emit {
 }
 
 /// `timer`.
-pub struct Timer;
+pub(crate) struct Timer;
 impl SafeSlot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
@@ -724,7 +724,7 @@ impl SafeSlot for Timer {
 }
 
 /// `finish`.
-pub struct Finish;
+pub(crate) struct Finish;
 impl SafeSlot for Finish {
     type In = FinishIn;
     type Out = FramerOut;
@@ -749,7 +749,7 @@ impl SafeSlot for Finish {
 }
 
 /// `encode`: one HTTP/1.1 request message into the wire buffer.
-pub struct Encode;
+pub(crate) struct Encode;
 impl SafeSlot for Encode {
     type In = EncodeIn;
     type Out = FramerOut;

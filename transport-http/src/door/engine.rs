@@ -305,9 +305,7 @@ impl Framing {
         let raw = complete_message(buf, head, max)
             .map_err(|e| Failure(format!("request message: {e:?}")))?;
         let Some(raw) = raw else { return Ok(()) };
-        let RawStartLine::Request { method, path } = &raw.start else {
-            return Err(Failure("a status line is not a request".into()));
-        };
+        let RawStartLine { method, path } = &raw.start;
         let target = request_target(&self.dial, path.as_deref(), !self.carried)
             .map_err(|e| Failure(format!("{e:?}")))?;
         self.carried = true;
