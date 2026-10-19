@@ -468,6 +468,32 @@ fn a_chunked_request_message_is_refused_and_nothing_goes_out() {
     }
 }
 
+/// RED (Q128 transport-http, bytes past the declared length): an emitted message whose bytes run
+/// past its stated `content-length` is refused at emit and nothing of it reaches the wire. RED on
+/// the framing that sent the declared prefix and dropped the rest.
+#[test]
+fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    let wire = f.take_wire(usize::MAX);
+    assert!(
+        r.is_err(),
+        "bytes past the stated length are refused: {r:?}"
+    );
+    assert!(
+        wire.is_empty(),
+        "nothing of the refused message reaches the wire: {:?}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
 /// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
 /// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8

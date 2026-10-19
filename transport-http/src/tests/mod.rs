@@ -297,3 +297,32 @@ fn a_field_name_that_is_not_a_token_is_refused() {
     let text = String::from_utf8(ok).unwrap();
     assert_eq!(text.matches("authorization").count(), 1);
 }
+
+/// RED (Q128 transport-http, bytes past the declared length): a message whose bytes run past the
+/// `Content-Length` its head declares is refused (`Framing`), never cut to the length and the rest
+/// silently dropped. The length is the one the host stated before the auth; bytes past it are
+/// bytes the head does not describe. RED on the reader that sent the declared prefix and threw the
+/// remainder away.
+#[test]
+fn egress_refuses_bytes_past_the_declared_length() {
+    let over = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcEXTRA";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(over, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "bytes past the declared length are refused, not dropped"
+    );
+    let empty_over = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(empty_over, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a head that declares no length carries no body byte"
+    );
+    let exact = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    let mut cache = EgressHead::default();
+    let done = complete_message(exact, &mut cache, usize::MAX)
+        .unwrap()
+        .expect("exactly the declared length completes");
+    assert_eq!(done.body, b"abc");
+}
