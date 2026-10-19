@@ -326,3 +326,22 @@ fn egress_refuses_bytes_past_the_declared_length() {
         .expect("exactly the declared length completes");
     assert_eq!(done.body, b"abc");
 }
+
+/// RED (Q128 transport-http, the non-token method): `encode` refuses a method that is not an RFC 9110
+/// token, and a target carrying a space, as `Unrepresentable`, never answering READY with a request
+/// line its own `emit` then refuses. RED on the encode that checked only for line-ending bytes.
+#[test]
+fn encode_refuses_a_request_line_its_emit_could_not_read() {
+    let refused = |method: &[u8], path: &[u8]| {
+        crate::transport::render_envelope(&[("method", method), ("path", path)], b"").is_err()
+    };
+    assert!(refused(b"GE T", b"/x"), "a space in the method");
+    assert!(refused(b"G(T", b"/x"), "a separator in the method");
+    assert!(refused(b"", b"/x"), "an empty method");
+    assert!(refused(b"GET", b"/a b"), "a space in the target");
+    assert!(
+        !refused(b"GET", b"/x"),
+        "a token method and a clean target render"
+    );
+    assert!(!refused(b"M-SEARCH", b"/x"), "any token method renders");
+}
