@@ -355,13 +355,24 @@ fn the_entry_claims_http_https_and_sse() {
 }
 
 /// RED (coordinator ruling L1; contract `FACT_ACCEPTS`/`FACT_DIALS`/`FACT_DETACHES`/`FACT_ADOPTS`):
-/// the tail states exactly the ops this door serves. At this commit that is dialling alone; it states
-/// no retired bit (bit 1, spec l.3779; the rule it named is proven by
-/// `the_head_on_the_wire_is_every_line_the_auth_saw`). RED on the tail that declared nothing.
+/// the tail states exactly the ops this door serves: dialling, the accepted side (`begin` on
+/// `SIDE_ACCEPT`, INBOUND-LISTEN), and `detach` on an upgrade line (BUSBAR-1.6.0.md l.4092, T6: http
+/// detaches, the upgrade's transport adopts). NOT adopting: nothing hands a connection to http
+/// (l.4092), and `adopt` stays declined. It states no retired bit (bit 1, spec l.3779; the rule it
+/// named is proven by `the_head_on_the_wire_is_every_line_the_auth_saw`). RED on the tail that
+/// stated dialling alone.
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
-    use busbar_contract::abi::transport::FACT_DIALS;
-    assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
+    use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
+    assert_eq!(
+        crate::meta::TAIL.facts,
+        FACT_DIALS | FACT_ACCEPTS | FACT_DETACHES
+    );
+    assert_eq!(
+        crate::meta::TAIL.facts & FACT_ADOPTS,
+        0,
+        "adopt stays declined"
+    );
 }
 
 /// THE INBOUND CLAIM ROWS ARE WHAT THE ACCEPT SIDE MATCHES (`BUSBAR-1.6.0.md` §6 "Auth points and
