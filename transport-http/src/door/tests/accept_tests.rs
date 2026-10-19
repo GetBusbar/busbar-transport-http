@@ -47,6 +47,7 @@ impl Kernel for Open {
         _: u32,
         _: u32,
         _: u64,
+        _: &HeadViewArgs<'_>,
     ) -> Result<RefusalCopy, ServiceError> {
         Err(ServiceError::Unserved)
     }
@@ -472,6 +473,7 @@ impl Kernel for Refusing {
         _: u32,
         _: u32,
         _: u64,
+        _: &HeadViewArgs<'_>,
     ) -> Result<RefusalCopy, ServiceError> {
         Ok(RefusalCopy {
             status: 401,

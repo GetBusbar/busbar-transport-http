@@ -1322,6 +1322,7 @@ impl Kernel for HostKernel<'_> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn refuse(
         &mut self,
         seq: u32,
@@ -1329,9 +1330,18 @@ impl Kernel for HostKernel<'_> {
         cause: u32,
         line: u32,
         stream: u64,
+        request: &HeadViewArgs<'_>,
     ) -> Result<RefusalCopy, ServiceError> {
         let s = self.services.ok_or(ServiceError::Unserved)?;
-        s.unit_refuse(self.handle(seq), unit, cause, line, self.conn, stream)
+        s.unit_refuse(
+            self.handle(seq),
+            unit,
+            cause,
+            line,
+            self.conn,
+            stream,
+            request,
+        )
     }
 }
 
