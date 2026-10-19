@@ -216,7 +216,7 @@ pub(crate) fn complete_message(
 
     // Whole: the head is spent with the message it belonged to, so the next one parses its own,
     // and the decoder that read this body is spent with it too.
-    let mut head = cache.head.take().expect("set just above");
+    let head = cache.head.take().expect("set just above");
     cache.decoder = None;
     cache.fed = 0;
     // A trailer is a line after the head, and after the auth: it never joins the head (THE
