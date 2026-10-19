@@ -32,9 +32,6 @@ pub(crate) const SECURE_KEY: &str = "https";
 /// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
-/// Neither claim carries a session.
-pub(crate) const SESSION: bool = false;
-
 pub(crate) const NONE: AbiStr = AbiStr {
     ptr: std::ptr::null(),
     len: 0,

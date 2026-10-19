@@ -190,7 +190,7 @@ fn the_envelope_encodes_as_an_http_message() {
     let parsed = raw::parse_message(&bytes).expect("a message it can read");
     assert_eq!(
         parsed.start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "POST".to_string(),
             path: Some("/v1/messages".to_string())
         }
@@ -207,7 +207,7 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
     assert!(unnamed.starts_with(b"GET  HTTP/1.1\r\n"), "{unnamed:?}");
     assert_eq!(
         raw::parse_message(&unnamed).expect("readable").start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "GET".to_string(),
             path: None
         }
@@ -219,7 +219,7 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
     .unwrap();
     assert_eq!(
         raw::parse_message(&root).expect("readable").start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "GET".to_string(),
             path: Some("/".to_string())
         }

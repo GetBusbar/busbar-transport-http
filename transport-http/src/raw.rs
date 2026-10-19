@@ -7,30 +7,21 @@
 //! names one is refused by `complete_message`, since the host states the length line before the
 //! auth (THE DESIGN §6 step 5). The door's responses are read by hyper, never by this.
 
-/// The message's first line, kept as whichever of the two shapes it turned out to be.
+/// The message's request line, `METHOD path HTTP/version`: the only start line this reader takes.
+/// The envelope `emit` is handed is a request; a status line is not one and does not parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RawStartLine {
-    /// `METHOD path HTTP/version`.
-    Request {
-        /// The request method.
-        method: String,
-        /// The request target the message STATED; `None` = it named none (an empty target word,
-        /// `METHOD  HTTP/version`). A stated `/` is `Some("/")`: it is a target like any other.
-        path: Option<String>,
-    },
-    /// `HTTP/version status reason`.
-    Status {
-        /// The status code.
-        code: u16,
-        /// The status reason phrase.
-        reason: String,
-    },
+pub struct RawStartLine {
+    /// The request method.
+    pub method: String,
+    /// The request target the message STATED; `None` = it named none (an empty target word,
+    /// `METHOD  HTTP/version`). A stated `/` is `Some("/")`: it is a target like any other.
+    pub path: Option<String>,
 }
 
 /// One parsed message: its start line, its headers in wire order, and its body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawMessage {
-    /// The request or status line.
+    /// The request line.
     pub start: RawStartLine,
     /// Header name/value pairs, in the order they appeared. A value is its bytes as sent (obs-text
     /// included), without the optional whitespace around it.
@@ -103,15 +94,9 @@ fn parse_start_line(line: &str) -> Option<RawStartLine> {
     let a = parts.next()?;
     let b = parts.next()?;
     let c = parts.next().unwrap_or("");
-    if let Some(version) = a.strip_prefix("HTTP/") {
-        if !is_http1(version) {
-            return None;
-        }
-        let code: u16 = b.parse().ok()?;
-        return Some(RawStartLine::Status {
-            code,
-            reason: c.to_string(),
-        });
+    // A status line (`HTTP/version code reason`) is not a request: refused here, as the line it is.
+    if a.starts_with("HTTP/") {
+        return None;
     }
     // Otherwise: `METHOD path HTTP/version`. The version token is REQUIRED. Without the check a
     // two-word first line — anything at all, followed by a space — parses as a request, so a blob
@@ -122,7 +107,7 @@ fn parse_start_line(line: &str) -> Option<RawStartLine> {
     if !is_http1(version) {
         return None;
     }
-    Some(RawStartLine::Request {
+    Some(RawStartLine {
         method: a.to_string(),
         path: (!b.is_empty()).then(|| b.to_string()),
     })
