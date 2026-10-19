@@ -404,9 +404,11 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 }
 
 /// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
-/// request's head is read under): past it the connection is refused, not grown.
+/// request's head is read under): past it no hand-over as sent is possible, so the copy goes, and
+/// the connection is NOT cut (Q128 reader B finding 2, overriding reader A's earlier "refuse over
+/// it": v1.5.5's server served such a connection on).
 #[test]
-fn a_copy_past_the_head_limit_refuses_the_connection() {
+fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     const HEAD_LIMIT: usize = 8192 + 4096 * 100;
     let mut a = accepted();
     let _ = a.ingest(
@@ -418,11 +420,150 @@ fn a_copy_past_the_head_limit_refuses_the_connection() {
     let chunk = vec![b'x'; 64 * 1024];
     for _ in 0..8 {
         let _ = a.ingest(&chunk, false);
+        run(&mut a, SEC);
+        assert!(
+            a.raw.as_ref().map_or(0, Vec::len) <= HEAD_LIMIT,
+            "the copy never grows past the head limit"
+        );
     }
-    run(&mut a, SEC);
-    assert!(
-        a.raw.as_ref().map_or(0, Vec::len) <= HEAD_LIMIT,
-        "the copy never grows past the head limit"
+    assert!(a.raw.is_none(), "past the limit the copy is let go");
+    assert!(!a.ended(), "the connection is not cut");
+}
+
+/// A kernel that refuses: every auth call and hand-in STOP, every refusal the kernel's 401.
+struct Refusing;
+
+impl Kernel for Refusing {
+    #[allow(clippy::too_many_arguments)]
+    fn auth_call(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+        _: Option<&[u8]>,
+    ) -> Pend<AuthCalled> {
+        Poll::Ready(Ok((
+            busbar_contract::abi::host::service::FLOW_STOP,
+            UnitRef { id: 1, mac: 1 },
+            Vec::new(),
+        )))
+    }
+    fn hand_in(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError> {
+        Ok((
+            busbar_contract::abi::host::service::FLOW_STOP,
+            UnitRef { id: 1, mac: 1 },
+        ))
+    }
+    fn refuse(
+        &mut self,
+        _: u32,
+        _: UnitRef,
+        _: u32,
+        _: u32,
+        _: u64,
+    ) -> Result<RefusalCopy, ServiceError> {
+        Ok(RefusalCopy {
+            status: 401,
+            fields: vec![("content-type".into(), b"application/json".to_vec())],
+            body: b"{}".to_vec(),
+        })
+    }
+}
+
+/// Drive, then admit through `k` and drive until nothing moves, as a ticketed op does.
+fn run_with(a: &mut Accepted, now: u64, k: &mut dyn Kernel) {
+    a.drive(now);
+    while a.admit(k).moved {
+        a.drive(now);
+    }
+}
+
+/// THE CONNECTION FORGETS EVERY FINISHED REQUEST (Q128 reader B finding 1, HIGH; THE DESIGN §1
+/// l.199-203): N requests refused before any verdict could hold their bodies, and N answered, leave
+/// a record count bounded by the live requests, and no held body's allocation.
+#[test]
+fn a_connection_forgets_every_finished_request() {
+    const N: usize = 50;
+    let mut a = Accepted::accept(
+        SEC,
+        vec![Line::any_needing(
+            1,
+            busbar_contract::abi::auth::POINT_HEAD_BODY,
+            64,
+        )],
     );
-    assert!(a.ended(), "past the limit the connection is refused");
+    for _ in 0..N {
+        let _ = a.ingest(
+            b"POST /v1/x HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello",
+            false,
+        );
+        run_with(&mut a, SEC, &mut Refusing);
+        let wire = a.take_wire(usize::MAX);
+        assert!(
+            wire.starts_with(b"HTTP/1.1 401 Unauthorized\r\n"),
+            "{wire:?}"
+        );
+    }
+    {
+        let sh = a.shared.lock().expect("shared");
+        assert!(sh.streams.len() <= 1, "{} records kept", sh.streams.len());
+        assert!(
+            sh.streams.values().all(|s| s.held.capacity() == 0),
+            "no held body's allocation is kept"
+        );
+    }
+    let mut a = accepted();
+    for _ in 0..N {
+        let _ = a.ingest(GET, false);
+        run(&mut a, SEC);
+        let stream = up(&mut a).heads[0].0;
+        a.emit(stream, b"content-length: 0\r\n", true, 204)
+            .expect("answered");
+        run(&mut a, SEC);
+        assert!(a
+            .take_wire(usize::MAX)
+            .starts_with(b"HTTP/1.1 204 No Content\r\n"));
+    }
+    let n = a.shared.lock().expect("shared").streams.len();
+    assert!(n <= 1, "{n} records kept");
+}
+
+/// A request that carries an `Upgrade` line AND a body is served as any other: its body never fills
+/// the hand-over copy, so the connection is not cut, and it gets its normal answer (Q128 reader B
+/// finding 2: the copy holds an upgrade request's HEAD only).
+#[test]
+fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
+    let mut a = accepted();
+    let _ = a.ingest(
+        b"POST /v1/x HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: h2c\r\ncontent-length: 600000\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    let chunk = vec![b'x'; 60_000];
+    let mut carried = 0;
+    for _ in 0..10 {
+        let _ = a.ingest(&chunk, false);
+        run(&mut a, SEC);
+        carried += up(&mut a).body.len();
+    }
+    assert_eq!(carried, 600_000, "the whole body went up");
+    assert!(!a.ended(), "the connection is not cut");
+    a.emit(stream, b"content-length: 2\r\n", false, 200)
+        .expect("head");
+    a.emit(stream, b"ok", true, 0).expect("body");
+    run(&mut a, SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(wire.starts_with(b"HTTP/1.1 200 OK\r\n"), "{wire:?}");
 }
