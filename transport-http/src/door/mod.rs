@@ -105,7 +105,7 @@ use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::Refusal;
 use busbar_contract::abi::sdk::services::{
-    HeadViewArgs, Pend, Place, RefusalCopy, ServiceError, Services,
+    HeadViewArgs, Pend, RefusalCopy, ServiceError, Services,
 };
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
@@ -120,7 +120,7 @@ use busbar_contract::abi::transport::{
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
-use accept::{Accepted, Kernel};
+use accept::{Accepted, AuthCalled, Kernel};
 use busbar_contract::abi::transport::check::check_emit_status;
 use engine::{Framing, Posture, Proto};
 #[cfg(test)]
@@ -1104,7 +1104,7 @@ impl Kernel for HostKernel<'_> {
         stream: u64,
         request: &HeadViewArgs<'_>,
         body: Option<&[u8]>,
-    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)> {
+    ) -> Pend<AuthCalled> {
         let Some(s) = self.services else {
             return Poll::Ready(Err(ServiceError::Unserved));
         };
