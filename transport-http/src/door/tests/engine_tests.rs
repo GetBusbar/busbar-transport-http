@@ -497,3 +497,57 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
         );
     }
 }
+
+/// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
+/// 2026-10-19): the head the auth saw is the head on the wire. The host states the length before
+/// the auth (last, after the framer's own lines, as 1.5.5's goldens order it); the framer renders
+/// exactly that head, one length line and no other, and the connection sends it unchanged. A
+/// non-empty body with no stated length cannot be framed without a line the auth never saw, so it
+/// is refused. RED on the framer that appended its own length line to every request.
+#[test]
+fn the_wire_head_is_the_head_the_auth_saw() {
+    let seen: &[(&str, &[u8])] = &[
+        ("method", b"POST"),
+        ("path", b"/v1/x"),
+        ("content-type", b"application/json"),
+        ("accept", b"*/*"),
+        ("host", b"127.0.0.1:9"),
+        ("content-length", b"2"),
+    ];
+    let message = crate::transport::render_envelope(seen, b"hi").expect("render");
+    let text = String::from_utf8_lossy(&message).to_ascii_lowercase();
+    assert_eq!(text.matches("content-length:").count(), 1, "{text:?}");
+    let wire = h1_wire(&message);
+    let head: Vec<&str> = wire
+        .split("\r\n\r\n")
+        .next()
+        .expect("a head")
+        .split("\r\n")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        head,
+        [
+            "content-type: application/json",
+            "accept: */*",
+            "host: 127.0.0.1:9",
+            "content-length: 2"
+        ],
+        "the wire head is the head the auth saw: {wire:?}"
+    );
+    assert!(
+        crate::transport::render_envelope(&seen[..5], b"hi").is_err(),
+        "a body with no stated length is refused"
+    );
+    // An empty body states no length, and none goes out (1.5.5's client sent none).
+    let get: &[(&str, &[u8])] = &[
+        ("method", b"GET"),
+        ("path", b"/x"),
+        ("host", b"127.0.0.1:9"),
+    ];
+    let bare = h1_wire(&crate::transport::render_envelope(get, b"").expect("render"));
+    assert!(
+        !bare.to_ascii_lowercase().contains("content-length"),
+        "{bare:?}"
+    );
+}
