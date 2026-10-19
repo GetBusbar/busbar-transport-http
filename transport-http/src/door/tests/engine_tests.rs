@@ -657,11 +657,13 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
 }
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
-/// 2026-10-19): the head the auth saw is the head on the wire. The host states the length before
-/// the auth (last, after the framer's own lines, as 1.5.5's goldens order it); the framer renders
-/// exactly that head, one length line and no other, and the connection sends it unchanged. A
-/// non-empty body with no stated length cannot be framed without a line the auth never saw, so it
-/// is refused. RED on the framer that appended its own length line to every request.
+/// 2026-10-19): the head the auth saw is the head on the wire, one length line and no other, last,
+/// after the framer's own lines, as 1.5.5's goldens order it, and the connection sends it unchanged.
+/// PHASE 2 (THE DESIGN §6 item 5, l.966; ruling 18; the transport ABI's
+/// `LocateOut::states_length`: "The host never adds that line"): the length line is the framer's
+/// OWN, written BEFORE its auth is called, so a non-empty body with no stated length is no longer
+/// refused: `encode` writes its one length line, and the wire head is the same head. RED on the
+/// framer that appended a length line to every request, and on the one that refused to write it.
 #[test]
 fn the_wire_head_is_the_head_the_auth_saw() {
     let seen: &[(&str, &[u8])] = &[
@@ -693,9 +695,19 @@ fn the_wire_head_is_the_head_the_auth_saw() {
         ],
         "the wire head is the head the auth saw: {wire:?}"
     );
-    assert!(
-        crate::transport::render_envelope(&seen[..5], b"hi").is_err(),
-        "a body with no stated length is refused"
+    // No stated length: the framer writes its own, one, last, before any auth, and the wire head
+    // is the same head.
+    let own = crate::transport::render_envelope(&seen[..5], b"hi").expect("render");
+    let own_text = String::from_utf8_lossy(&own).to_ascii_lowercase();
+    assert_eq!(
+        own_text.matches("content-length:").count(),
+        1,
+        "{own_text:?}"
+    );
+    assert_eq!(
+        h1_wire(&own),
+        wire,
+        "the framer's own length line frames the same head"
     );
     // An empty body states no length, and none goes out (1.5.5's client sent none).
     let get: &[(&str, &[u8])] = &[
