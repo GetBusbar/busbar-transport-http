@@ -797,3 +797,21 @@ fn locate_states_the_framers_own_head_lines() {
         "accept: */*\r\nhost: [::1]\r\n"
     );
 }
+
+/// RED (THE DESIGN §6 step 5, ruling (A) 2026-10-19): `locate` asks the host to state the request's
+/// length line (`LocateOut::states_length`), so the length is in the head before the auth runs and
+/// nothing adds it after. RED on the framer that asked for none.
+#[test]
+fn locate_asks_the_host_to_state_the_length() {
+    let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");
+    let (mut a, mut n, mut l, mut d) = (vec![0; 512], vec![0; 512], vec![0; 64], vec![0; 512]);
+    let mut i: LocateIn = z();
+    i.target = s("http://127.0.0.1:9");
+    (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
+    (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
+    (i.alpn_buf, i.alpn_cap) = (l.as_mut_ptr(), l.len());
+    (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), d.len());
+    let mut o: LocateOut = z();
+    call(door.ops.locate, door.inst, &mut i, &mut o, slot::LOCATE);
+    assert_eq!(o.states_length, 1);
+}
