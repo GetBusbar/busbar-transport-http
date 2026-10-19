@@ -21,7 +21,8 @@ use std::time::Duration;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, BLOB_JSON};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::{
-    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, Ops, SIDE_DIAL,
+    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, LocateIn,
+    LocateOut, Ops, SIDE_DIAL,
 };
 use tokio::io::AsyncReadExt;
 
@@ -166,7 +167,24 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
     call(ops.begin, inst, &mut b, &mut fo, slot::BEGIN);
     let framing = fo.framing;
     out.extend_from_slice(&wire[..fo.yielded.wire_len as usize]);
-    let fields = [
+    // THE HOST'S MERGE (THE DESIGN §6 step 5): the lines the framer's `locate` states for the
+    // target, added after the caller's fields, before the auth.
+    let mut defaults = vec![0_u8; 512];
+    let (mut a, mut n, mut l) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
+    let mut li: LocateIn = z();
+    li.target = s(&target);
+    (li.authority_buf, li.authority_cap) = (a.as_mut_ptr(), a.len());
+    (li.name_buf, li.name_cap) = (n.as_mut_ptr(), n.len());
+    (li.alpn_buf, li.alpn_cap) = (l.as_mut_ptr(), l.len());
+    (li.defaults_buf, li.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
+    let mut lo: LocateOut = z();
+    call(ops.locate, inst, &mut li, &mut lo, slot::LOCATE);
+    let stated = String::from_utf8_lossy(&defaults[..lo.defaults_written as usize]).into_owned();
+    let lines: Vec<(&str, &str)> = stated
+        .split("\r\n")
+        .filter_map(|l| l.split_once(": "))
+        .collect();
+    let mut fields = vec![
         Field {
             name: s("method"),
             value: s("POST"),
@@ -184,6 +202,10 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
             value: s("application/json"),
         },
     ];
+    fields.extend(lines.iter().map(|(n, v)| Field {
+        name: s(n),
+        value: s(v),
+    }));
     let mut e: EncodeIn = z();
     e.fields = fields.as_ptr();
     e.fields_len = fields.len();

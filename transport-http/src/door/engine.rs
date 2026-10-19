@@ -278,7 +278,7 @@ impl Framing {
         let mut req = b
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
-        client_posture(&mut req, self.proto);
+        target_form(&mut req, self.proto);
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
@@ -382,33 +382,41 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
     http::Uri::from_parts(parts).unwrap_or(dial)
 }
 
-/// The client defaults the http transport owns (THE DESIGN §5: "When the caller sets none, the
-/// http door adds `accept: */*`, and on h1 the host header and origin-form target: the http
-/// transport owns the client defaults"), so the bytes on the wire are the bytes 1.5.5 sent:
-/// `accept: */*` after the caller's fields where it set none, as reqwest added its default; on
-/// HTTP/1.1, hyper-util's `host` field (the port only when it is not the scheme's own) with the
-/// target rewritten to origin form. On HTTP/2 the target stays absolute: it becomes `:scheme`,
-/// `:authority` and `:path`.
-fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) {
-    req.headers_mut()
-        .entry(http::header::ACCEPT)
-        .or_insert(http::HeaderValue::from_static("*/*"));
-    if proto == Proto::H2 {
-        return;
-    }
-    let uri = req.uri().clone();
-    if let Some(host) = uri.host() {
-        let secure = matches!(uri.scheme_str(), Some("https"));
-        let value = match uri.port_u16() {
+/// THE FRAMER'S OWN HEAD LINES for a request to `target`: the client defaults the http transport
+/// owns (THE DESIGN §5: "When the caller sets none, the http door adds `accept: */*`, and on h1 the
+/// host header and origin-form target: the http transport owns the client defaults"), in 1.5.5's
+/// order: `accept: */*`, as reqwest added its default after the caller's fields, then hyper-util's
+/// `host` (the port only when it is not the scheme's own). `locate` states them and the host adds
+/// each the request does not carry BEFORE the auth signs the head (THE DESIGN §6 step 5, OWNER-
+/// LOCKED: "Nothing is added to the head after the auth has run"); `encode` adds none. Field lines,
+/// `name: value` CRLF each. On HTTP/2 the `host` line is the target's `:authority`, as there.
+pub(crate) fn client_defaults(target: &http::Uri) -> String {
+    let mut lines = String::from("accept: */*\r\n");
+    if let Some(host) = target.host() {
+        let secure = matches!(target.scheme_str(), Some("https"));
+        let value = match target.port_u16() {
             Some(443) if secure => host.to_owned(),
             Some(80) if !secure => host.to_owned(),
             Some(p) => format!("{host}:{p}"),
             None => host.to_owned(),
         };
-        if let Ok(v) = http::HeaderValue::from_str(&value) {
-            req.headers_mut().entry(http::header::HOST).or_insert(v);
-        }
+        lines.push_str("host: ");
+        lines.push_str(&value);
+        lines.push_str("\r\n");
     }
+    lines
+}
+
+/// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
+/// to origin form (the `host` line the host added carries the authority); on HTTP/2 it stays
+/// absolute, becoming `:scheme`, `:authority` and `:path`, and a `host` line is that `:authority`,
+/// not a field of its own (1.5.5's HTTP/2 requests carried none).
+fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) {
+    if proto == Proto::H2 {
+        req.headers_mut().remove(http::header::HOST);
+        return;
+    }
+    let uri = req.uri().clone();
     *req.uri_mut() = match uri.path_and_query() {
         Some(p) if p.as_str() != "/" => p.as_str().parse().unwrap_or_default(),
         _ => http::Uri::default(),
