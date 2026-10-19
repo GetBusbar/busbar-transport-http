@@ -48,7 +48,7 @@ use std::time::Duration;
 use busbar_contract::abi::auth::{POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
 use busbar_contract::abi::host::service::{
     AuthRef, UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS,
-    REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED,
+    REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED, SCHEME_PLAIN,
 };
 use busbar_contract::abi::mechanism::ticket::Ticket;
 use busbar_contract::abi::sdk::services::{HeadViewArgs, Pend, Place, RefusalCopy, ServiceError};
@@ -161,8 +161,8 @@ struct Answer {
     held_over: bool,
     /// The request's unit, as the kernel answered it.
     unit: UnitRef,
-    /// A pending `auth.call`'s sequence number, re-issued on the next drive.
-    parked: Option<u32>,
+    /// A pending `auth.call`'s handle, `(ticket, seq)`: re-issued only on that ticket's resume.
+    parked: Option<(Ticket, u32)>,
     /// The head went up to the host.
     up: bool,
 }
@@ -206,6 +206,11 @@ pub type AuthCalled = (u32, UnitRef, Vec<(String, Place)>);
 /// `op::UNIT_HAND_IN`, `op::UNIT_REFUSE`), each call under completion sequence `seq` of the op's
 /// ticket; the door's is the SDK's `Services` (`door::HostKernel`).
 pub trait Kernel {
+    /// The ticket of the op the calls are made on; a call that pends is parked on it.
+    fn ticket(&self) -> Ticket {
+        Ticket::NONE
+    }
+
     /// `auth.call`: the flow, the request's unit and the names to strip.
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
@@ -276,13 +281,13 @@ pub struct Accepted {
     peer_auths: Vec<AuthRef>,
     /// How many of them answered CONTINUE.
     peer_done: usize,
-    /// A pending peer call's sequence number.
-    peer_parked: Option<u32>,
+    /// A pending peer call's handle, `(ticket, seq)`.
+    peer_parked: Option<(Ticket, u32)>,
     /// The last completion sequence number issued.
     seq: u32,
-    /// The ticket of the op that answered PENDING on a parked `auth.call`, until it resumes, its
-    /// cancel lets the call go, or the op answers anything else.
-    parked_on: Option<Ticket>,
+    /// The upstream's scheme the auth handle is shown (`SCHEME_*`, never `0`), as the host stated
+    /// it for the connection ([`Accepted::with_scheme`]).
+    scheme: u8,
     /// The host refused the whole connection: its bytes are written, and nothing more is framed.
     refused_whole: bool,
     /// Bytes owed to the far side that are not hyper's: a whole-connection refusal's.
@@ -337,7 +342,7 @@ impl Accepted {
             peer_done: 0,
             peer_parked: None,
             seq: 0,
-            parked_on: None,
+            scheme: SCHEME_PLAIN,
             refused_whole: false,
             owed: VecDeque::new(),
         }
@@ -385,25 +390,31 @@ impl Accepted {
         }
     }
 
-    /// The ticket of the op parked on a pending `auth.call`, recorded when that op answers PENDING
-    /// and cleared when it answers anything else.
-    pub fn park_on(&mut self, ticket: Option<Ticket>) {
-        self.parked_on = ticket;
+    /// THE SCHEME the auth handle is shown for this connection's requests (`HeadView::scheme`,
+    /// `SCHEME_PLAIN` or `SCHEME_SECURE`; `SCHEME_UNDECLARED` is refused off the peer point): the
+    /// one the host states for the accepted connection (`door::Begin`).
+    #[must_use]
+    pub const fn with_scheme(mut self, scheme: u8) -> Self {
+        self.scheme = scheme;
+        self
     }
 
-    /// CANCEL of the op on `ticket`: when it is the op parked on a pending `auth.call`, the parked
-    /// call is let go (a later op calls afresh, under a new handle) and `true` (its bytes were
-    /// taken: the cancel is partial).
+    /// CANCEL of the op on `ticket`: every `auth.call` parked on it is let go (a later op calls
+    /// afresh, under a new handle), and `true` when there was one (the op's bytes were taken: the
+    /// cancel is partial).
     pub fn cancel(&mut self, ticket: Ticket) -> bool {
-        if self.parked_on != Some(ticket) {
-            return false;
+        let mut any = false;
+        if self.peer_parked.is_some_and(|(t, _)| t == ticket) {
+            self.peer_parked = None;
+            any = true;
         }
-        self.parked_on = None;
-        self.peer_parked = None;
         for a in self.shared.lock().expect("shared").streams.values_mut() {
-            a.parked = None;
+            if a.parked.is_some_and(|(t, _)| t == ticket) {
+                a.parked = None;
+                any = true;
+            }
         }
-        true
+        any
     }
 
     /// Whether the host refused the whole connection.
@@ -893,6 +904,7 @@ fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
 fn head_view<'a>(
     parts: &'a http::request::Parts,
     fields: &'a [(&'a str, &'a [u8])],
+    scheme: u8,
 ) -> HeadViewArgs<'a> {
     let authority = parts.uri.authority().map_or_else(
         || {
@@ -910,7 +922,7 @@ fn head_view<'a>(
         authority,
         query: parts.uri.query(),
         fields,
-        ..HeadViewArgs::default()
+        scheme,
     }
 }
 
@@ -998,7 +1010,14 @@ impl Accepted {
             return did;
         }
         while self.peer_done < self.peer_auths.len() {
-            let seq = self.peer_parked.take().unwrap_or_else(|| self.next_seq());
+            // A peer call parked on another op's ticket is that op's to resume: no request is
+            // admitted before the peer point decides (item 7).
+            let seq = match self.peer_parked {
+                Some((t, seq)) if t == k.ticket() => seq,
+                Some(_) => return did,
+                None => self.next_seq(),
+            };
+            self.peer_parked = None;
             let auth = self.peer_auths[self.peer_done];
             match k.auth_call(
                 seq,
@@ -1010,7 +1029,7 @@ impl Accepted {
                 None,
             ) {
                 Poll::Pending => {
-                    self.peer_parked = Some(seq);
+                    self.peer_parked = Some((k.ticket(), seq));
                     did.parked = true;
                     return did;
                 }
@@ -1036,6 +1055,15 @@ impl Accepted {
                 continue;
             };
             let before = a.gate;
+            // A request parked on this op's ticket stops the op: it answers PENDING and yields
+            // nothing until its resume, which carries on from here (the transport contract: a
+            // pending answer parks only its own stream; the requests behind it wait for that resume
+            // or for a fresh op on another ticket).
+            if did.parked {
+                sh.streams.insert(id, a);
+                sh.waiting.push(id);
+                continue;
+            }
             self.admit_one(id, &mut a, &mut sh.out, k, &mut did);
             // A request that moved on (to holding its body, say) is driven again before the op
             // answers.
@@ -1110,9 +1138,17 @@ impl Accepted {
                     let l = &self.lines[n];
                     let (auth, line, body_point) =
                         (l.auth, l.line, l.points & POINT_HEAD_BODY != 0);
-                    let seq = a.parked.take().unwrap_or_else(|| self.next_seq());
+                    // A call parked on another op's ticket is re-issued only on that ticket's
+                    // resume, never under another (busbar e858ecc: a pending answer parks only its
+                    // own stream).
+                    let seq = match a.parked {
+                        Some((t, seq)) if t == k.ticket() => seq,
+                        Some(_) => return,
+                        None => self.next_seq(),
+                    };
+                    a.parked = None;
                     let fields = field_lines(parts);
-                    let view = head_view(parts, &fields);
+                    let view = head_view(parts, &fields, self.scheme);
                     let (point, body) = if body_point {
                         (POINT_HEAD_BODY, Some(a.held.as_slice()))
                     } else {
@@ -1122,7 +1158,7 @@ impl Accepted {
                     drop(fields);
                     match answered {
                         Poll::Pending => {
-                            a.parked = Some(seq);
+                            a.parked = Some((k.ticket(), seq));
                             did.parked = true;
                             return;
                         }
@@ -1144,7 +1180,7 @@ impl Accepted {
                     let (auth, line) = (self.lines[n].auth, self.lines[n].line);
                     let seq = self.next_seq();
                     let fields = field_lines(parts);
-                    let view = head_view(parts, &fields);
+                    let view = head_view(parts, &fields, self.scheme);
                     let handed = k.hand_in(seq, auth, a.unit, line, id, &view);
                     drop(fields);
                     match handed {
