@@ -39,10 +39,13 @@ fn is_token(name: &[u8]) -> bool {
 ///
 /// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
 /// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
-/// reparse): `Encode::Unrepresentable`. So is a length that does not frame the body: a stated
-/// `content-length` other than the body's, or a non-empty body with none stated. The length is one
-/// of the transport's own lines the host states BEFORE the auth (THE DESIGN §6 step 5): this
-/// renders it where the host put it and adds no line of its own.
+/// reparse): `Encode::Unrepresentable`. So is a stated `content-length` other than the body's.
+/// THE LENGTH LINE IS THE FRAMER'S OWN (coordinator ruling 18; THE DESIGN §6 item 5, l.966: "The
+/// transport finalises the head (its own lines: host, length, framing)"; the transport ABI's
+/// `LocateOut::states_length`: "the framer writes `content-length` ... into its head itself ...
+/// The host never adds that line"): a non-empty body whose head states none gets
+/// `content-length: <its length>` here, last, BEFORE any auth runs (the auth is called on the
+/// dialled side's `emit`, after this message is rendered).
 pub(crate) fn render_envelope(
     fields: &[(&str, &[u8])],
     body: &[u8],
@@ -82,18 +85,17 @@ pub(crate) fn render_envelope(
     // them exactly, and an empty body states none (1.5.5's client sent none for one on HTTP/1.1;
     // on HTTP/2 its framing added `content-length: 0` for a payload method, as this door's does:
     // the one exception `meta::TAIL` names).
-    let framed = match field("content-length") {
-        Some(v) => {
-            std::str::from_utf8(v)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                == Some(body.len())
-        }
-        None => body.is_empty(),
-    };
+    let stated = field("content-length");
+    let framed = stated.is_none_or(|v| {
+        std::str::from_utf8(v)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            == Some(body.len())
+    });
     if !framed {
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
+    let own_length = (stated.is_none() && !body.is_empty()).then(|| body.len().to_string());
 
     let mut out = Vec::with_capacity(body.len() + 128);
     out.extend_from_slice(method);
@@ -107,6 +109,11 @@ pub(crate) fn render_envelope(
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(b": ");
         out.extend_from_slice(value);
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(len) = own_length {
+        out.extend_from_slice(b"content-length: ");
+        out.extend_from_slice(len.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");

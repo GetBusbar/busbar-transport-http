@@ -32,8 +32,13 @@ use hyper::body::{Body, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::rt::{Executor, Sleep};
 
-use crate::raw::RawStartLine;
+use crate::raw::{RawMessage, RawStartLine};
 use crate::{complete_message, request_target, retry_after_secs, EgressHead};
+use busbar_contract::abi::auth::{FIELD_QUERY, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
+use busbar_contract::abi::host::service::{AuthRef, UnitRef, FLOW_CONTINUE, SCHEME_PLAIN};
+use busbar_contract::abi::mechanism::ticket::Ticket;
+use busbar_contract::abi::sdk::services::{HeadViewArgs, Pend};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Which HTTP a framing speaks, as connection security (or the operator's cleartext key) agreed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +80,9 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
     Writing(Vec<u8>, EgressHead, u64),
+    /// A whole request, its head finalised with the framer's own lines, waiting for its binding's
+    /// auth ([`Framing::authorize`]).
+    Authing(Box<Authing>),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
     /// Sent; waiting for the response head.
@@ -119,6 +127,74 @@ pub struct Framing {
     out: VecDeque<Piece>,
     failed: Option<Failure>,
     now_unix_ns: u64,
+    /// The binding's auth (`BeginIn::auth`, `BeginIn::points`; none = no auth is called).
+    binding: Binding,
+    /// The scheme the auth is shown (`HeadView::scheme`).
+    scheme: u8,
+    /// Each stream's unit, as the host stated it on its emit (`EmitIn::unit`).
+    units: Vec<(u64, UnitRef)>,
+    /// The last completion sequence number issued.
+    seq: u32,
+}
+
+/// A dialled connection's auth binding (THE DESIGN §6 item 5, l.964-967: "each outbound need's
+/// binding holds its auth handle"; `BeginIn::auth`, `BeginIn::points`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Binding {
+    /// The binding's auth handle; `AuthRef::NONE` with no points.
+    pub auth: AuthRef,
+    /// `POINT_*`: the points its auth needs; `0` = none (no auth is called).
+    pub points: u32,
+}
+
+impl Binding {
+    /// No auth.
+    pub const NONE: Self = Self {
+        auth: AuthRef::NONE,
+        points: 0,
+    };
+}
+
+/// A request waiting for its binding's auth.
+struct Authing {
+    /// The request's target, absolute.
+    target: http::Uri,
+    /// The finalised request: the plane's lines, then the framer's own.
+    raw: RawMessage,
+    /// The attempt's deadline (host ns).
+    deadline: u64,
+    /// The stream's unit.
+    unit: UnitRef,
+    /// A pending call's handle, `(ticket, seq)`.
+    parked: Option<(Ticket, u32)>,
+}
+
+/// What an outbound binding's `auth.call` answers: the flow and the auth's fields (name, value,
+/// `FIELD_*` flags), the values held zeroised.
+pub struct Signed {
+    /// `FLOW_CONTINUE` | `FLOW_STOP`.
+    pub flow: u32,
+    /// The fields that join the head; with `FIELD_QUERY`, the target's query.
+    pub fields: Vec<(String, Zeroizing<Vec<u8>>, u32)>,
+}
+
+/// THE HOST AUTH HANDLE as the dialled side calls it (`op::AUTH_CALL` with an outbound binding's
+/// ref), each call under the op's ticket and a completion sequence the framing issues.
+pub trait Signer {
+    /// The ticket of the op the calls are made on.
+    fn ticket(&self) -> Ticket;
+    /// `auth.call`.
+    #[allow(clippy::too_many_arguments)]
+    fn sign(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        point: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+        body: Option<&[u8]>,
+    ) -> Pend<Signed>;
 }
 
 impl Framing {
@@ -184,7 +260,243 @@ impl Framing {
             out: VecDeque::new(),
             failed: None,
             now_unix_ns: 0,
+            binding: Binding::NONE,
+            scheme: SCHEME_PLAIN,
+            units: Vec::new(),
+            seq: 0,
         })
+    }
+
+    /// Bind this connection's auth (`BeginIn::auth` at `BeginIn::points`), shown the upstream's
+    /// `scheme` (`HeadView::scheme`, `SCHEME_PLAIN` or `SCHEME_SECURE`).
+    #[must_use]
+    pub const fn with_binding(mut self, binding: Binding, scheme: u8) -> Self {
+        self.binding = binding;
+        self.scheme = scheme;
+        self
+    }
+
+    /// The unit the host states for `stream`'s request (`EmitIn::unit`): every auth call for it
+    /// carries it.
+    pub fn unit_for(&mut self, stream: u64, unit: UnitRef) {
+        if unit.is_none() {
+            return;
+        }
+        match self.units.iter_mut().find(|(s, _)| *s == stream) {
+            Some(u) => u.1 = unit,
+            None => self.units.push((stream, unit)),
+        }
+    }
+
+    fn next_seq(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
+    }
+
+    /// THE PEER POINT, once per connection at its `begin` (`BeginIn::points` with `POINT_PEER`;
+    /// the Peer rule: the call carries no request, its answer only continue or stop). `Ready(Err)`:
+    /// the auth stopped or refused the connection, and the open fails.
+    pub fn peer(&mut self, k: &mut dyn Signer) -> Poll<Result<(), Failure>> {
+        if self.binding.points & POINT_PEER == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let seq = self.next_seq();
+        match k.sign(
+            seq,
+            self.binding.auth,
+            UnitRef::NONE,
+            POINT_PEER,
+            0,
+            &HeadViewArgs::default(),
+            None,
+        ) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(s)) if s.flow == FLOW_CONTINUE => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(_)) => Poll::Ready(Err(Failure(
+                "begin: the binding's auth stopped the connection".into(),
+            ))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(Failure(format!(
+                "begin: the binding's auth refused the connection ({e:?})"
+            )))),
+        }
+    }
+
+    /// CALL THE BINDING'S AUTH on every request whose head is final (THE DESIGN §6 item 5,
+    /// l.964-967): the auth is shown the whole head the framer finalised (the plane's lines, then
+    /// its own `accept`, `host` and length line), at the binding's head point, with the stream's
+    /// unit; its fields join the head FIRST, as v1.5.5 wrote them (`wire_golden`'s `egress.auth`
+    /// cells: `authorization` ahead of the plane's lines), replacing any plane line of the same name,
+    /// its query fields join the target, and NOTHING is added after. An auth that stops or refuses
+    /// fails the request: no head without its lines ever goes out. `true`: a call is pending, its
+    /// stream parked on this op's ticket.
+    pub fn authorize(&mut self, k: &mut dyn Signer) -> bool {
+        let mut parked = false;
+        for idx in 0..self.exchanges.len() {
+            if !matches!(self.exchanges[idx].1, Stage::Authing(..)) {
+                continue;
+            }
+            let stream = self.exchanges[idx].0;
+            let Stage::Authing(mut a) = std::mem::replace(&mut self.exchanges[idx].1, Stage::Done)
+            else {
+                continue;
+            };
+            let seq = match a.parked {
+                Some((t, seq)) if t == k.ticket() => seq,
+                Some(_) => {
+                    self.exchanges[idx].1 = Stage::Authing(a);
+                    continue;
+                }
+                None => self.next_seq(),
+            };
+            a.parked = None;
+            let point = if self.binding.points & POINT_HEAD_BODY != 0 {
+                POINT_HEAD_BODY
+            } else {
+                POINT_HEAD
+            };
+            let lines: Vec<(&str, &[u8])> = a
+                .raw
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_slice()))
+                .collect();
+            let authority = a
+                .target
+                .authority()
+                .map_or("", http::uri::Authority::as_str);
+            let view = HeadViewArgs {
+                method: a.raw.start.method.as_str(),
+                target: a.target.path(),
+                authority,
+                query: a.target.query(),
+                fields: &lines,
+                scheme: self.scheme,
+            };
+            let body = (point == POINT_HEAD_BODY).then_some(a.raw.body.as_slice());
+            let signed = k.sign(seq, self.binding.auth, a.unit, point, stream, &view, body);
+            drop(lines);
+            match signed {
+                Poll::Pending => {
+                    a.parked = Some((k.ticket(), seq));
+                    self.exchanges[idx].1 = Stage::Authing(a);
+                    parked = true;
+                }
+                Poll::Ready(Ok(s)) if s.flow == FLOW_CONTINUE => match self.signed(*a, s) {
+                    Ok(stage) => self.exchanges[idx].1 = stage,
+                    Err(f) => self.refuse_stream(stream, f),
+                },
+                Poll::Ready(Ok(_)) => self.refuse_stream(
+                    stream,
+                    Failure("the binding's auth stopped the request".into()),
+                ),
+                Poll::Ready(Err(e)) => self.refuse_stream(
+                    stream,
+                    Failure(format!("the binding's auth refused the request ({e:?})")),
+                ),
+            }
+        }
+        self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
+        parked
+    }
+
+    /// A request the auth would not sign: it fails its STREAM on HTTP/2, and the framing on
+    /// HTTP/1.1, where the connection carries one exchange. Nothing of it goes out.
+    fn refuse_stream(&mut self, stream: u64, f: Failure) {
+        if self.proto == Proto::H2 {
+            self.out.push_back(Piece::failure(stream, &f.0));
+        } else {
+            self.failed = Some(f);
+        }
+    }
+
+    /// The signed request: the auth's lines FIRST, then the finalised head less any line the auth
+    /// replaced, the auth's query fields joined to the target; queued to go out as it is.
+    fn signed(&self, a: Authing, s: Signed) -> Result<Stage, Failure> {
+        let Authing {
+            target,
+            raw,
+            deadline,
+            ..
+        } = a;
+        let mut lines: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut query: Vec<(String, Zeroizing<Vec<u8>>)> = Vec::new();
+        for (name, value, flags) in s.fields {
+            if flags & FIELD_QUERY != 0 {
+                query.push((name, value));
+            } else {
+                lines.push((name, value.to_vec()));
+            }
+        }
+        let replaced = |n: &str| lines.iter().any(|(a, _)| a.eq_ignore_ascii_case(n));
+        let plane: Vec<(String, Vec<u8>)> = raw
+            .headers
+            .into_iter()
+            .filter(|(n, _)| !replaced(n))
+            .collect();
+        lines.extend(plane);
+        let target = with_query(target, &query)?;
+        let req = self.request(target, &raw.start.method, &lines, raw.body);
+        for (_, v) in &mut lines {
+            v.zeroize();
+        }
+        let wait = self.io.timer().sleep_until_ns(deadline);
+        Ok(Stage::Queued(req?, wait))
+    }
+
+    /// The request `method` `target` with head `lines`, in order, and `body`, in this connection's
+    /// target form. Every line goes out as stated: a transfer coding never reaches here
+    /// (`complete_message` refuses one), and the length line is the one the auth saw, so hyper,
+    /// handed it, adds none.
+    fn request(
+        &self,
+        target: http::Uri,
+        method: &str,
+        lines: &[(String, Vec<u8>)],
+        body: Vec<u8>,
+    ) -> Result<http::Request<Full<Bytes>>, Failure> {
+        let mut b = http::Request::builder().method(method).uri(target);
+        for (k, v) in lines {
+            b = b.header(k.as_str(), v.as_slice());
+        }
+        let mut req = b
+            .body(Full::new(Bytes::from(body)))
+            .map_err(|e| Failure(format!("request: {e}")))?;
+        target_form(&mut req, self.proto);
+        Ok(req)
+    }
+
+    /// THE FRAMER'S OWN LINES (THE DESIGN §6 item 5, l.966; coordinator ruling 18; the phase-2
+    /// brief: the host adds none): the plane's lines as stated, then `accept: */*` and `host` where
+    /// the plane set none ([`client_defaults`], 1.5.5's order: reqwest's `accept` after the caller's
+    /// fields, then hyper's `host`), then the length line last: the one stated (written by `encode`
+    /// when the plane stated none, [`crate::transport::render_envelope`]) or, for a non-empty body
+    /// with none, the body's own length. Nothing is added after these, and the auth is shown them.
+    fn finalised(&self, mut raw: RawMessage) -> RawMessage {
+        let has =
+            |raw: &RawMessage, n: &str| raw.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+        let length = raw
+            .headers
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .map(|i| raw.headers.remove(i));
+        let (accept, host) = (!has(&raw, "accept"), !has(&raw, "host"));
+        if accept {
+            raw.headers.push(("accept".into(), b"*/*".to_vec()));
+        }
+        if host {
+            if let Some(h) = host_value(&self.dial) {
+                raw.headers.push(("host".into(), h.into_bytes()));
+            }
+        }
+        match length {
+            Some(l) => raw.headers.push(l),
+            None if !raw.body.is_empty() => raw.headers.push((
+                "content-length".into(),
+                raw.body.len().to_string().into_bytes(),
+            )),
+            None => {}
+        }
+        raw
     }
 
     /// The far side sent `bytes` (`end` = and then ended).
@@ -304,23 +616,32 @@ impl Framing {
         }
         let raw = complete_message(buf, head, max)
             .map_err(|e| Failure(format!("request message: {e:?}")))?;
+        let deadline = *deadline;
         let Some(raw) = raw else { return Ok(()) };
-        let RawStartLine { method, path } = &raw.start;
+        let RawStartLine { path, .. } = &raw.start;
         let target = request_target(&self.dial, path.as_deref(), !self.carried)
             .map_err(|e| Failure(format!("{e:?}")))?;
         self.carried = true;
-        let mut b = http::Request::builder().method(method.as_str()).uri(target);
-        for (k, v) in &raw.headers {
-            // Every line goes out as stated. A transfer coding never reaches here
-            // (`complete_message` refuses one); the length line is the one the auth saw (THE
-            // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
-            b = b.header(k.as_str(), v.as_slice());
+        let raw = self.finalised(raw);
+        if self.binding.points & (POINT_HEAD | POINT_HEAD_BODY) != 0 {
+            // The head is final: the binding's auth is called on it before anything goes out
+            // (`Framing::authorize`).
+            let unit = self
+                .units
+                .iter()
+                .position(|(s, _)| *s == stream)
+                .map_or(UnitRef::NONE, |i| self.units.swap_remove(i).1);
+            self.exchanges[idx].1 = Stage::Authing(Box::new(Authing {
+                target,
+                raw,
+                deadline,
+                unit,
+                parked: None,
+            }));
+            return Ok(());
         }
-        let mut req = b
-            .body(Full::new(Bytes::from(raw.body)))
-            .map_err(|e| Failure(format!("request: {e}")))?;
-        target_form(&mut req, self.proto);
-        let wait = self.io.timer().sleep_until_ns(*deadline);
+        let req = self.request(target, &raw.start.method, &raw.headers, raw.body)?;
+        let wait = self.io.timer().sleep_until_ns(deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
     }
@@ -439,27 +760,73 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
 /// owns (THE DESIGN §5: "When the caller sets none, the http door adds `accept: */*`, and on h1 the
 /// host header and origin-form target: the http transport owns the client defaults"), in 1.5.5's
 /// order: `accept: */*`, as reqwest added its default after the caller's fields, then hyper-util's
-/// `host` (the port only when it is not the scheme's own). `locate` states them and the host adds
-/// each the request does not carry BEFORE the auth signs the head (THE DESIGN §6 step 5, OWNER-
-/// LOCKED: "Nothing is added to the head after the auth has run"); `encode` adds none. Field lines,
-/// `name: value` CRLF each. On HTTP/2 the `host` line is the target's `:authority`, as there.
+/// `host` (the port only when it is not the scheme's own). The framer writes each the request does
+/// not carry itself, BEFORE its auth is called ([`Framing`]'s finalised head; THE DESIGN §6 item 5:
+/// "Nothing is added to the head after the auth has run"). Field lines, `name: value` CRLF each, as
+/// the cells read them. On HTTP/2 the `host` line is the target's `:authority`, as there.
+#[cfg(test)]
 pub(crate) fn client_defaults(target: &http::Uri) -> String {
     let mut lines = String::from("accept: */*\r\n");
-    // The host 1.5.5's client sent: an IPv4 spelling as the address it names.
-    let target = canonical_host(target.clone());
-    if let Some(host) = target.host() {
-        let secure = matches!(target.scheme_str(), Some("https"));
-        let value = match target.port_u16() {
-            Some(443) if secure => host.to_owned(),
-            Some(80) if !secure => host.to_owned(),
-            Some(p) => format!("{host}:{p}"),
-            None => host.to_owned(),
-        };
+    if let Some(value) = host_value(target) {
         lines.push_str("host: ");
         lines.push_str(&value);
         lines.push_str("\r\n");
     }
     lines
+}
+
+/// The `host` line's value 1.5.5's client sent for `target`: an IPv4 spelling as the address it
+/// names, the port only when it is not the scheme's own.
+fn host_value(target: &http::Uri) -> Option<String> {
+    let target = canonical_host(target.clone());
+    let host = target.host()?;
+    let secure = matches!(target.scheme_str(), Some("https"));
+    Some(match target.port_u16() {
+        Some(443) if secure => host.to_owned(),
+        Some(80) if !secure => host.to_owned(),
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    })
+}
+
+/// `target` with the auth's query fields joined to its query, in the order written, each
+/// `name=value` percent-encoded outside RFC 3986's unreserved set (`abi::auth::FIELD_QUERY`).
+fn with_query(
+    target: http::Uri,
+    fields: &[(String, Zeroizing<Vec<u8>>)],
+) -> Result<http::Uri, Failure> {
+    if fields.is_empty() {
+        return Ok(target);
+    }
+    let encode = |b: &[u8], out: &mut String| {
+        for &c in b {
+            if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+                out.push(char::from(c));
+            } else {
+                out.push_str(&format!("%{c:02X}"));
+            }
+        }
+    };
+    let mut pq = Zeroizing::new(target.path().to_owned());
+    let mut sep = '?';
+    if let Some(q) = target.query() {
+        pq.push('?');
+        pq.push_str(q);
+        sep = '&';
+    }
+    for (name, value) in fields {
+        pq.push(sep);
+        encode(name.as_bytes(), &mut *pq);
+        pq.push('=');
+        encode(value, &mut *pq);
+        sep = '&';
+    }
+    let mut parts = target.into_parts();
+    parts.path_and_query = Some(
+        http::uri::PathAndQuery::try_from(pq.as_str())
+            .map_err(|e| Failure(format!("the auth's query: {e}")))?,
+    );
+    http::Uri::from_parts(parts).map_err(|e| Failure(format!("the auth's query: {e}")))
 }
 
 /// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
@@ -504,7 +871,7 @@ fn advance(
     let own = |e: hyper::Error| (Failure(e.to_string()), false);
     loop {
         match stage {
-            Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(()),
+            Stage::Writing(..) | Stage::Authing(..) | Stage::Refused | Stage::Done => return Ok(()),
             Stage::Queued(_, wait) => {
                 if wait.as_mut().poll(cx).is_ready() {
                     return Err(timed_out());
