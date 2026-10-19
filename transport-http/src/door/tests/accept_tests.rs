@@ -567,3 +567,119 @@ fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let wire = a.take_wire(usize::MAX);
     assert!(wire.starts_with(b"HTTP/1.1 200 OK\r\n"), "{wire:?}");
 }
+
+/// One HTTP/2 frame: its type, flags, stream and payload (RFC 9113 §4.1).
+fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len())
+        .expect("a small frame")
+        .to_be_bytes();
+    let mut f = vec![len[1], len[2], len[3], ty, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// An HTTP/2 connection with one whole `GET /` request on stream 1, admitted and gone up: the
+/// accepted side and the request's stream.
+fn h2_request() -> (Accepted, u64) {
+    let mut a = accepted();
+    a.ingest(H2_PREFACE, false);
+    a.ingest(&frame(4, 0, 0, &[]), false);
+    // HPACK: `:method GET`, `:scheme http`, `:path /` (static indices 2, 6, 4), `:authority`
+    // (static name 1, literal value, no indexing).
+    let mut block = vec![0x82, 0x86, 0x84, 0x01, 11];
+    block.extend_from_slice(b"busbar.test");
+    a.ingest(&frame(1, 0x5, 1, &block), false);
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert_eq!(u.heads.len(), 1, "the request went up");
+    let _ = a.take_wire(usize::MAX);
+    (a, u.heads[0].0)
+}
+
+/// The far side resets stream 1 (RST_STREAM, CANCEL).
+fn reset(a: &mut Accepted) {
+    a.ingest(&frame(3, 0, 1, &8u32.to_be_bytes()), false);
+    run(a, SEC);
+}
+
+/// THE FAR SIDE ABANDONS AN ANSWER (Q128 reader A, MEDIUM; THE DESIGN §1 l.199-201, §6 item 6
+/// l.971-973): the host is told the stream ended (its failure piece), the stream's record goes at
+/// once, and a later emit on it is refused, never queued where nobody drains it.
+#[test]
+fn a_stream_the_far_side_resets_mid_answer_ends_failed_and_is_let_go() {
+    let (mut a, stream) = h2_request();
+    a.emit(stream, b"content-type: text/event-stream\r\n", false, 200)
+        .expect("the head");
+    a.emit(stream, b"data: 1\n\n", false, 0).expect("a chunk");
+    run(&mut a, SEC);
+    reset(&mut a);
+    assert!(up(&mut a).failed, "the host is told the stream ended");
+    assert!(
+        !a.shared
+            .lock()
+            .expect("shared")
+            .streams
+            .contains_key(&stream),
+        "the stream's record is let go"
+    );
+    assert!(
+        a.emit(stream, b"data: 2\n\n", false, 0).is_err(),
+        "a later emit is refused, not queued"
+    );
+}
+
+/// The far side resets a request before its answer head went: the same.
+#[test]
+fn a_stream_the_far_side_resets_before_its_head_ends_failed_and_is_let_go() {
+    let (mut a, stream) = h2_request();
+    reset(&mut a);
+    assert!(up(&mut a).failed, "the host is told the stream ended");
+    assert!(
+        !a.shared
+            .lock()
+            .expect("shared")
+            .streams
+            .contains_key(&stream),
+        "the stream's record is let go"
+    );
+    assert!(
+        a.emit(stream, b"content-length: 0\r\n", true, 200).is_err(),
+        "a later emit is refused"
+    );
+}
+
+/// A streaming answer held at its high-water mark, its stream reset: the host is woken (the
+/// stream's failure piece ends its hold), not left waiting for a writable piece that never comes.
+#[test]
+fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
+    let (mut a, stream) = h2_request();
+    a.emit(
+        stream,
+        b"content-type: application/octet-stream\r\n",
+        false,
+        200,
+    )
+    .expect("the head");
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut full = false;
+    for _ in 0..16 {
+        full = a.emit(stream, &chunk, false, 0).expect("a chunk");
+        run(&mut a, SEC);
+        if full {
+            break;
+        }
+    }
+    assert!(full, "the answer reached its high-water mark");
+    let _ = up(&mut a);
+    reset(&mut a);
+    assert!(up(&mut a).failed, "the held stream is woken by its end");
+    assert!(
+        !a.shared
+            .lock()
+            .expect("shared")
+            .streams
+            .contains_key(&stream),
+        "its record and queued bytes are let go"
+    );
+}
