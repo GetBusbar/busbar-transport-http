@@ -951,7 +951,7 @@ impl AcceptHost {
     /// An accepted connection on a listener with guest list `lines`, the auth handle answered by
     /// `script` (`OpenIn::host`'s services table).
     fn open_with(ops: &'static Ops, lines: Vec<LineEntry>, script: Script) -> Self {
-        Self::open_on(ops, lines, script, |_| {})
+        Self::open_on(ops, lines, script, |_| {}, SCHEME_PLAIN)
     }
 
     /// [`AcceptHost::open_with`] on a connection whose `ConnFacts` `facts` fills, as the host's
@@ -961,6 +961,7 @@ impl AcceptHost {
         lines: Vec<LineEntry>,
         script: Script,
         facts: fn(&mut ConnFacts),
+        scheme: u8,
     ) -> Self {
         let state = facts;
         let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
@@ -1008,6 +1009,8 @@ impl AcceptHost {
         state(&mut facts);
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
+        // The listener's scheme, as the host states it (busbar step 2, `BeginIn::scheme`).
+        i.scheme = scheme;
         i.facts = &facts;
         i.lines = h.lines.as_ptr();
         i.lines_len = h.lines.len();
@@ -1385,6 +1388,8 @@ struct Script {
     seqs: Vec<u32>,
     /// Each `auth.call`'s ticket.
     tickets: Vec<Ticket>,
+    /// The request each `unit.refuse` was handed, in order.
+    refused: Vec<View>,
     asked: Vec<Asked>,
 }
 
@@ -1618,6 +1623,7 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
             cause: i.cause,
             line: i.line,
         });
+        script.refused.push(view_of(&i.request));
         if script.fails.refuse {
             return outcome(out, Outcome::Failed);
         }
@@ -2340,26 +2346,45 @@ fn refuse_the_connection(label: &str, ops: &'static Ops) {
 /// it, the host's statement is `BeginIn::facts` ("what connection security established"): a secure
 /// layer presents the host's certificate and agrees a protocol; a cleartext connection has neither.
 fn shows_the_scheme(label: &str, ops: &'static Ops) {
-    let cases: [SchemeCase; 3] = [
-        ("cleartext", |_| {}, SCHEME_PLAIN),
-        // Q128 readers A and B (r211, r212): a TLS client offering no ALPN and no certificate.
+    // The scheme is the one the HOST states for the listener (busbar step 2, `BeginIn::scheme`:
+    // "from the listener (whether the connector terminated connection security on it)"), never
+    // inferred from the handshake's facts (Q128 r232 LOW 2's fix).
+    let cases: [SchemeCase; 4] = [
+        ("cleartext", |_| {}, SCHEME_PLAIN, SCHEME_PLAIN),
+        // A TLS client offering no SNI, no ALPN and no certificate.
         (
-            "TLS, SNI only",
-            |f| f.offered_name = s("busbar.test"),
+            "TLS, no SNI, ALPN or certificate",
+            |_| {},
+            SCHEME_SECURE,
             SCHEME_SECURE,
         ),
         (
-            "TLS, ALPN agreed",
-            |f| f.agreed_protocol = s("http/1.1"),
+            "TLS, SNI and ALPN",
+            |f| {
+                f.offered_name = s("busbar.test");
+                f.agreed_protocol = s("http/1.1");
+            },
             SCHEME_SECURE,
+            SCHEME_SECURE,
+        ),
+        // Facts the inference read as TLS, on a listener the host states cleartext.
+        (
+            "cleartext, facts naming SNI and ALPN",
+            |f| {
+                f.offered_name = s("busbar.test");
+                f.agreed_protocol = s("http/1.1");
+            },
+            SCHEME_PLAIN,
+            SCHEME_PLAIN,
         ),
     ];
-    for (secured, facts, want) in cases {
+    for (secured, facts, stated, want) in cases {
         let mut h = AcceptHost::open_on(
             ops,
             vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
             Script::default(),
             facts,
+            stated,
         );
         assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
         let asked = h.asked();
@@ -2498,8 +2523,9 @@ fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// One scheme cell: its label, the facts the host states, the scheme the auth must be shown.
-type SchemeCase = (&'static str, fn(&mut ConnFacts), u8);
+/// One scheme cell: its label, the handshake facts, the scheme the host states for the listener,
+/// the scheme the auth must be shown.
+type SchemeCase = (&'static str, fn(&mut ConnFacts), u8, u8);
 
 /// One HTTP/2 frame: its type, flags, stream and payload (RFC 9113 §4.1).
 fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -2540,6 +2566,7 @@ fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
         vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
         Script::default(),
         |f| f.agreed_protocol = s("h2"),
+        SCHEME_SECURE,
     );
     assert_eq!(
         h.ingest(&h2_requests(&[(1, "/v1/messages")])),
@@ -2606,6 +2633,46 @@ fn a_pending_auth_parks_only_its_stream(label: &str, ops: &'static Ops) {
         "{label}: A stays parked"
     );
     h.close();
+}
+
+/// THE REQUEST BEING REFUSED (busbar step 2, `UnitRefuseIn::request`: "The request being refused,
+/// as decoded ... Its `scheme` is the one the transport states for the connection"): `unit.refuse`
+/// is handed the decoded request for every cause, the no-route and method-miss refusals included.
+fn refusal_carries_the_request(label: &str, ops: &'static Ops) {
+    for (req, method, target) in [
+        (
+            &b"GET /nope?x=1 HTTP/1.1\r\nhost: busbar.test\r\n\r\n"[..],
+            "GET",
+            "/nope",
+        ),
+        (
+            &b"GET /v1/messages HTTP/1.1\r\nhost: busbar.test\r\n\r\n"[..],
+            "GET",
+            "/v1/messages",
+        ),
+    ] {
+        let h = admitted(
+            ops,
+            vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+            Script::default(),
+            req,
+        );
+        let refused = SCRIPTS.lock().expect("scripts")[&h.ctx].refused.clone();
+        let [view] = &refused[..] else {
+            panic!("{label}: one refusal: {refused:?}");
+        };
+        assert_eq!(
+            (view.method.as_str(), view.target.as_str()),
+            (method, target),
+            "{label}"
+        );
+        assert!(view.has_field("host"), "{label}: {view:?}");
+        assert_eq!(
+            view.scheme, SCHEME_PLAIN,
+            "{label}: the connection's scheme"
+        );
+        h.close();
+    }
 }
 
 /// Run `cell` through the linked door and the dropped-in one.
@@ -2754,4 +2821,9 @@ fn an_alpn_h2_connection_is_served_as_h2() {
 #[test]
 fn a_pending_auth_call_parks_only_its_own_stream_and_others_flow() {
     both(a_pending_auth_parks_only_its_stream);
+}
+
+#[test]
+fn unit_refuse_is_handed_the_request_it_refuses() {
+    both(refusal_carries_the_request);
 }
