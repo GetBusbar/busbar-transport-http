@@ -162,7 +162,7 @@ impl Accepted {
             .into_owned();
         Self {
             io,
-            conn: Some(Box::pin(async move { conn.await })),
+            conn: Some(Box::pin(conn)),
             shared,
             out: VecDeque::new(),
             ended: false,
