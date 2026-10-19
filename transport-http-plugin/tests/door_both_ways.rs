@@ -1268,7 +1268,18 @@ struct Script {
     auth: VecDeque<(u32, Vec<(&'static str, u32)>)>,
     /// `unit.hand_in`'s flow.
     hand_in: u32,
+    /// The services that answer FAILED (no answer at all): `auth.call`, `unit.hand_in`,
+    /// `unit.refuse`.
+    fails: Fails,
     asked: Vec<Asked>,
+}
+
+/// Which of the auth handle's services answer FAILED.
+#[derive(Default, Clone, Copy)]
+struct Fails {
+    auth: bool,
+    hand_in: bool,
+    refuse: bool,
 }
 
 /// The unit the scripted kernel mints on a request's first call.
@@ -1349,9 +1360,13 @@ unsafe fn view_of(v: &HeadView) -> View {
 }
 
 fn ready(out: *mut ServiceOut) -> RawOutcome {
+    outcome(out, Outcome::Ready)
+}
+
+fn outcome(out: *mut ServiceOut, o: Outcome) -> RawOutcome {
     // SAFETY: the wrapper's live `out`.
-    unsafe { (*out).outcome = RawOutcome::of(Outcome::Ready) };
-    RawOutcome::of(Outcome::Ready)
+    unsafe { (*out).outcome = RawOutcome::of(o) };
+    RawOutcome::of(o)
 }
 
 extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
@@ -1367,6 +1382,9 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
             view: view_of(&i.request),
             body: (!i.body.ptr.is_null()).then(|| bytes_of(i.body.ptr, i.body.len)),
         });
+        if script.fails.auth {
+            return outcome(out, Outcome::Failed);
+        }
         let (flow, names) = script
             .auth
             .pop_front()
@@ -1418,6 +1436,9 @@ extern "C" fn unit_hand_in(ctx: HostCtx, input: *const c_void, out: *mut Service
             line: i.line,
             view: view_of(&i.request),
         });
+        if script.fails.hand_in {
+            return outcome(out, Outcome::Failed);
+        }
         i.answer.write_unaligned(AuthAnswer {
             size: size_of::<AuthAnswer>() as u32,
             flow: script.hand_in,
@@ -1464,17 +1485,17 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
     // SAFETY: the SDK wrapper hands a live `UnitRefuseIn` and a live `out`.
     unsafe {
         let i = input.cast::<UnitRefuseIn>().read_unaligned();
-        SCRIPTS
-            .lock()
-            .expect("scripts")
-            .get_mut(&ctx.handle)
-            .expect("a script")
-            .asked
-            .push(Asked::Refuse {
-                unit: i.unit.id,
-                cause: i.cause,
-                line: i.line,
-            });
+        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let script = scripts.get_mut(&ctx.handle).expect("a script");
+        script.asked.push(Asked::Refuse {
+            unit: i.unit.id,
+            cause: i.cause,
+            line: i.line,
+        });
+        if script.fails.refuse {
+            return outcome(out, Outcome::Failed);
+        }
+        drop(scripts);
         let (status, body) = refusal(i.cause);
         // The kernel's memory, valid past the call (the test leaks it).
         let fields: &'static [Field] = Box::leak(Box::new([Field {
@@ -1801,6 +1822,166 @@ fn unit_carried(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// A request the kernel neither admitted nor refused: nothing went up to the plane, and the door
+/// wrote no answer of its own (coordinator ruling on #24 open question 4: a request never goes
+/// upstream when the hand-in or the refusal fails).
+fn never_reached_the_plane(label: &str, h: &AcceptHost) {
+    assert_eq!(h.heads_up(), 0, "{label}: nothing went up to the host");
+    assert!(h.words.is_empty(), "{label}: no head slots went up");
+    assert!(
+        h.got.is_empty(),
+        "{label}: no piece of the request went up: {:?}",
+        h.got
+    );
+    assert!(
+        h.out.is_empty(),
+        "{label}: no bytes of the transport's own: {:?}",
+        String::from_utf8_lossy(&h.out)
+    );
+}
+
+/// The hand-in answers FAILED: the request is not handed up.
+fn hand_in_fails(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            fails: Fails {
+                hand_in: true,
+                ..Fails::default()
+            },
+            ..Script::default()
+        },
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(&asked[..], [Asked::HandIn { line: 5, .. }]),
+        "{label}: {asked:?}"
+    );
+    never_reached_the_plane(label, &h);
+    h.close();
+}
+
+/// The auth call answers FAILED: no hand-in, nothing up.
+fn auth_call_fails(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            fails: Fails {
+                auth: true,
+                ..Fails::default()
+            },
+            ..Script::default()
+        },
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [Asked::Auth {
+                point: POINT_HEAD,
+                ..
+            }]
+        ),
+        "{label}: {asked:?}"
+    );
+    never_reached_the_plane(label, &h);
+    h.close();
+}
+
+/// The refusal answers FAILED, after no route and after a hand-in STOP: nothing up either way.
+fn refusal_fails(label: &str, ops: &'static Ops) {
+    let fails = Fails {
+        refuse: true,
+        ..Fails::default()
+    };
+    let h = admitted(
+        ops,
+        vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            fails,
+            ..Script::default()
+        },
+        b"GET /nope HTTP/1.1\r\nhost: busbar.test\r\n\r\n",
+    );
+    assert_eq!(
+        h.asked(),
+        vec![Asked::Refuse {
+            unit: 0,
+            cause: REFUSE_NO_ROUTE,
+            line: LINE_NONE
+        }],
+        "{label}"
+    );
+    never_reached_the_plane(label, &h);
+    h.close();
+    let h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            hand_in: FLOW_STOP,
+            fails,
+            ..Script::default()
+        },
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [
+                Asked::HandIn { .. },
+                Asked::Refuse {
+                    cause: REFUSE_CHECK_FAILED,
+                    line: 5,
+                    ..
+                }
+            ]
+        ),
+        "{label}: {asked:?}"
+    );
+    never_reached_the_plane(label, &h);
+    h.close();
+}
+
+/// A query key the far side percent-encoded is the key it decodes to, as v1.5.5 read every inbound
+/// query key (`crates/busbar/src/auth/token.rs`:996-1003 `parse_query`, :1012-1035 `pct_decode`:
+/// `%XX` and `+` decoded before the key is compared): `%6Bey` is `key`, stripped; `Key` is not.
+fn strips_a_decoded_query_key(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            auth: VecDeque::from([(FLOW_CONTINUE, vec![("key", FIELD_QUERY)])]),
+            ..Script::default()
+        },
+        b"POST /v1/messages?beta=1&%6Bey=sk-secret&Key=keep HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello",
+    );
+    let asked = h.asked();
+    let [Asked::Auth { .. }, Asked::HandIn { view, .. }] = &asked[..] else {
+        panic!("{label}: an auth call, then the hand-in: {asked:?}");
+    };
+    assert_eq!(view.query.as_deref(), Some("beta=1&Key=keep"), "{label}");
+    assert_eq!(
+        h.words,
+        vec![(
+            1,
+            b"POST".to_vec(),
+            b"/v1/messages?beta=1&Key=keep".to_vec()
+        )],
+        "{label}: the stripped target went up"
+    );
+    let up: Vec<u8> = h.got.iter().flat_map(|g| g.1.clone()).collect();
+    assert!(
+        !up.windows(9).any(|w| w == b"sk-secret"),
+        "{label}: the plane never sees a credential"
+    );
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -1852,4 +2033,24 @@ fn a_none_line_is_handed_in_with_no_unit_and_goes_up() {
 #[test]
 fn the_unit_the_first_call_minted_is_carried_on_every_later_one() {
     both(unit_carried);
+}
+
+#[test]
+fn a_failed_hand_in_never_reaches_the_plane() {
+    both(hand_in_fails);
+}
+
+#[test]
+fn a_failed_auth_call_never_reaches_the_plane() {
+    both(auth_call_fails);
+}
+
+#[test]
+fn a_failed_refusal_never_reaches_the_plane() {
+    both(refusal_fails);
+}
+
+#[test]
+fn a_percent_encoded_query_key_is_stripped_as_the_key_it_decodes_to() {
+    both(strips_a_decoded_query_key);
 }
