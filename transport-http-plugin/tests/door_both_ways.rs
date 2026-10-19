@@ -11,23 +11,35 @@
 //! Each scenario runs twice, through the linked door and through the cdylib `cargo test` built from
 //! `src/lib.rs`, and both must print the same proof lines.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use busbar_contract::abi::auth::{
+    FieldSpan, FIELD_QUERY, FIELD_SENSITIVE, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER, SPAN_ABSENT,
+};
+use busbar_contract::abi::host::service::{
+    AuthAnswer, AuthCallIn, AuthRef, HeadView, HostSlots, RefusalAnswer, ServiceOut, UnitHandInIn,
+    UnitRef, UnitRefuseIn, FLOW_CONTINUE, FLOW_STOP, LINE_NONE, REFUSE_CHECK_FAILED,
+    REFUSE_METHOD_MISS, REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED, SERVICES,
+};
 use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
+    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, RawOutcome, Span, BLOB_JSON, BLOB_OCTETS,
 };
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
+use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
+use busbar_contract::abi::transport::route::{
+    LineEntry, RouteMatch, METHOD_ANY, METHOD_POST, PATH_EXACT,
+};
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
     HeadSlots, IngestIn, LocateIn, LocateOut, Ops, PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME,
@@ -909,11 +921,39 @@ struct AcceptHost {
     /// Every request piece: (stream, bytes, flags), and every head slot's method and target.
     got: Vec<(u64, Vec<u8>, u16)>,
     words: Vec<(u64, Vec<u8>, Vec<u8>)>,
+    /// The listener's guest list, lent for the framing's life (`BeginIn::lines`).
+    lines: Box<[LineEntry]>,
+    /// The scripted kernel's context: the key of this host's [`Script`].
+    ctx: u64,
 }
 
 impl AcceptHost {
+    /// An accepted connection on a listener whose one line takes every `POST /v1/messages` with
+    /// auth `none`, its hand-in answered CONTINUE: the request goes up as before.
     fn open(ops: &'static Ops) -> Self {
+        Self::open_with(
+            ops,
+            vec![line(1, 0, METHOD_ANY, "/v1/messages", 0)],
+            Script::default(),
+        )
+    }
+
+    /// An accepted connection on a listener with guest list `lines`, the auth handle answered by
+    /// `script` (`OpenIn::host`'s services table).
+    fn open_with(ops: &'static Ops, lines: Vec<LineEntry>, script: Script) -> Self {
+        let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
+        SCRIPTS.lock().expect("scripts").insert(ctx, script);
+        let tables = HostTables {
+            size: size_of::<HostTables>() as u32,
+            _reserved: 0,
+            ctx: HostCtx { handle: ctx },
+            wake: None,
+            conns: std::ptr::null(),
+            services: &*SLOTS,
+            io: std::ptr::null(),
+        };
         let mut i: OpenIn = z();
+        i.host = &tables;
         let mut o: OpenOut = z();
         assert_eq!(
             call(
@@ -936,12 +976,16 @@ impl AcceptHost {
             out: Vec::new(),
             got: Vec::new(),
             words: Vec::new(),
+            lines: lines.into_boxed_slice(),
+            ctx,
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
         i.facts = &facts;
+        i.lines = h.lines.as_ptr();
+        i.lines_len = h.lines.len();
         i.sink = h.sink();
         let mut o: FramerOut = z();
         let r = call(ops.begin, h.inst, &mut i, &mut o, slot::BEGIN);
@@ -1025,10 +1069,21 @@ impl AcceptHost {
         self.take(r, &o)
     }
 
+    /// Every call the door made on the auth handle, in order.
+    fn asked(&self) -> Vec<Asked> {
+        SCRIPTS.lock().expect("scripts")[&self.ctx].asked.clone()
+    }
+
+    /// The request head pieces that went up.
+    fn heads_up(&self) -> usize {
+        self.got.iter().filter(|g| g.2 & PIECE_FIELDS != 0).count()
+    }
+
     fn close(self) {
         let mut i: InHead = z();
         let mut o: OutHead = z();
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
+        SCRIPTS.lock().expect("scripts").remove(&self.ctx);
     }
 }
 
@@ -1162,4 +1217,639 @@ fn the_accepted_side_answers_alike_linked_and_dropped_in() {
         println!("PROOF {image}: accept offer {offer:?}");
         assert_eq!(offer, b"\x08http/1.1", "{image}");
     }
+}
+
+// ── the guest list and the auth handle (BUSBAR-1.6.0.md §6 "Auth points and guest lists") ──────
+
+/// One call the door made on the host auth handle, as the scripted kernel read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Asked {
+    /// `auth.call`: the point, the handle's id, the unit's id, the request view and the body.
+    Auth {
+        point: u32,
+        auth: u64,
+        unit: u64,
+        view: View,
+        body: Option<Vec<u8>>,
+    },
+    /// `unit.hand_in`: the handle's id, the unit's id, the line and the (stripped) request view.
+    HandIn {
+        auth: u64,
+        unit: u64,
+        line: u32,
+        view: View,
+    },
+    /// `unit.refuse`: the unit's id, the cause and the line.
+    Refuse { unit: u64, cause: u32, line: u32 },
+}
+
+/// A [`HeadView`] as the kernel read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct View {
+    method: String,
+    target: String,
+    query: Option<String>,
+    fields: Vec<(String, Vec<u8>)>,
+}
+
+impl View {
+    fn has_field(&self, name: &str) -> bool {
+        self.fields
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(name))
+    }
+}
+
+/// What the scripted kernel answers on one connection, and what it was asked.
+#[derive(Default)]
+struct Script {
+    /// Each `auth.call`'s answer in turn: the flow and the names to strip (`FIELD_SENSITIVE` a
+    /// field line, `FIELD_QUERY` a query key). Past the last: CONTINUE, nothing named.
+    auth: VecDeque<(u32, Vec<(&'static str, u32)>)>,
+    /// `unit.hand_in`'s flow.
+    hand_in: u32,
+    asked: Vec<Asked>,
+}
+
+/// The unit the scripted kernel mints on a request's first call.
+const MINTED: UnitRef = UnitRef { id: 41, mac: 42 };
+
+/// Each connection's script, by its host context.
+static SCRIPTS: Mutex<BTreeMap<u64, Script>> = Mutex::new(BTreeMap::new());
+static NEXT_CTX: AtomicU64 = AtomicU64::new(1);
+
+/// The host services table: the auth handle's three slots, scripted; every other unserved.
+static SLOTS: LazyLock<HostSlots> = LazyLock::new(|| {
+    let mut t: HostSlots = z();
+    t.size = size_of::<HostSlots>() as u32;
+    t.slots = SERVICES;
+    t.auth_call = Some(auth_call);
+    t.unit_hand_in = Some(unit_hand_in);
+    t.unit_refuse = Some(unit_refuse);
+    t
+});
+
+/// A guest-list line: id `id`, its auth handle `100 + id`, an exact path.
+fn line(id: u32, points: u32, methods: u32, path: &'static str, body_limit: u64) -> LineEntry {
+    LineEntry {
+        line: id,
+        points,
+        auth: AuthRef {
+            id: 100 + u64::from(id),
+            mac: 7,
+        },
+        body_limit,
+        route: RouteMatch {
+            methods,
+            path_form: PATH_EXACT,
+            path: s(path),
+            fields: std::ptr::null(),
+            fields_len: 0,
+            rung: 0,
+            _reserved: 0,
+        },
+    }
+}
+
+/// The bytes `s` names (an absent string reads empty).
+///
+/// # Safety
+/// A non-NULL `s` names `s.len` live bytes.
+unsafe fn bytes_of(p: *const u8, len: usize) -> Vec<u8> {
+    if p.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the caller's contract.
+    unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
+}
+
+/// A [`HeadView`] read.
+///
+/// # Safety
+/// `v` is the door's live view, borrowed for the call.
+unsafe fn view_of(v: &HeadView) -> View {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let text = |a: AbiStr| String::from_utf8(bytes_of(a.ptr, a.len)).expect("text");
+        let fields = if v.fields.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(v.fields, v.fields_len)
+                .iter()
+                .map(|f| (text(f.name), bytes_of(f.value.ptr, f.value.len)))
+                .collect()
+        };
+        View {
+            method: text(v.method),
+            target: text(v.target),
+            query: (!v.query.ptr.is_null()).then(|| text(v.query)),
+            fields,
+        }
+    }
+}
+
+fn ready(out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the wrapper's live `out`.
+    unsafe { (*out).outcome = RawOutcome::of(Outcome::Ready) };
+    RawOutcome::of(Outcome::Ready)
+}
+
+extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the SDK wrapper hands a live `AuthCallIn`, its buffers and a live `out`.
+    unsafe {
+        let i = input.cast::<AuthCallIn>().read_unaligned();
+        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let script = scripts.get_mut(&ctx.handle).expect("a script");
+        script.asked.push(Asked::Auth {
+            point: i.point,
+            auth: i.auth.id,
+            unit: i.unit.id,
+            view: view_of(&i.request),
+            body: (!i.body.ptr.is_null()).then(|| bytes_of(i.body.ptr, i.body.len)),
+        });
+        let (flow, names) = script
+            .auth
+            .pop_front()
+            .unwrap_or((FLOW_CONTINUE, Vec::new()));
+        let mut at = 0usize;
+        for (n, (name, flags)) in names.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(name.as_ptr(), i.buf.add(at), name.len());
+            i.spans.add(n).write_unaligned(FieldSpan {
+                name: Span {
+                    offset: at as u32,
+                    len: name.len() as u32,
+                },
+                value: Span {
+                    offset: SPAN_ABSENT,
+                    len: 0,
+                },
+                flags: *flags,
+                _reserved: 0,
+            });
+            at += name.len();
+        }
+        let unit = if i.point == POINT_PEER {
+            UnitRef::NONE
+        } else if i.unit.is_none() {
+            MINTED
+        } else {
+            i.unit
+        };
+        i.answer.write_unaligned(AuthAnswer {
+            size: size_of::<AuthAnswer>() as u32,
+            flow,
+            unit,
+        });
+        (*out).len = at as u64;
+        (*out).items = names.len() as u64;
+    }
+    ready(out)
+}
+
+extern "C" fn unit_hand_in(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the SDK wrapper hands a live `UnitHandInIn` and a live `out`.
+    unsafe {
+        let i = input.cast::<UnitHandInIn>().read_unaligned();
+        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let script = scripts.get_mut(&ctx.handle).expect("a script");
+        script.asked.push(Asked::HandIn {
+            auth: i.auth.id,
+            unit: i.unit.id,
+            line: i.line,
+            view: view_of(&i.request),
+        });
+        i.answer.write_unaligned(AuthAnswer {
+            size: size_of::<AuthAnswer>() as u32,
+            flow: script.hand_in,
+            unit: if i.unit.is_none() { MINTED } else { i.unit },
+        });
+    }
+    ready(out)
+}
+
+/// The kernel's refusal for `cause`: its status and body (1.5.5's no-route and size-gate bodies,
+/// `http.crosscut__unknown-path__bare` and `http.crosscut__413__openai`), `content-type` its one
+/// field.
+fn refusal(cause: u32) -> (u16, &'static str) {
+    match cause {
+        REFUSE_NO_ROUTE => (
+            404,
+            r#"{"error":{"code":null,"message":"the requested resource was not found","param":null,"type":"not_found_error"}}"#,
+        ),
+        REFUSE_METHOD_MISS => (405, r#"{"error":"method"}"#),
+        REFUSE_OVER_GATE => (
+            413,
+            r#"{"error":{"code":null,"message":"request body exceeds the maximum allowed size","param":null,"type":"request_too_large"}}"#,
+        ),
+        REFUSE_STOPPED => (401, r#"{"error":"unauthenticated"}"#),
+        _ => (403, r#"{"error":"check"}"#),
+    }
+}
+
+/// The bytes the kernel's refusal for `cause` becomes on HTTP/1.1, undated: its status line, its
+/// field, the length hyper states for a body of known size (as v1.5.5's `Full` body), its body.
+fn refusal_wire(cause: u32) -> String {
+    let (status, body) = refusal(cause);
+    let reason = hyper::StatusCode::from_u16(status)
+        .expect("status")
+        .canonical_reason()
+        .expect("reason");
+    format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    // SAFETY: the SDK wrapper hands a live `UnitRefuseIn` and a live `out`.
+    unsafe {
+        let i = input.cast::<UnitRefuseIn>().read_unaligned();
+        SCRIPTS
+            .lock()
+            .expect("scripts")
+            .get_mut(&ctx.handle)
+            .expect("a script")
+            .asked
+            .push(Asked::Refuse {
+                unit: i.unit.id,
+                cause: i.cause,
+                line: i.line,
+            });
+        let (status, body) = refusal(i.cause);
+        // The kernel's memory, valid past the call (the test leaks it).
+        let fields: &'static [Field] = Box::leak(Box::new([Field {
+            name: s("content-type"),
+            value: s("application/json"),
+        }]));
+        i.answer.write_unaligned(RefusalAnswer {
+            size: size_of::<RefusalAnswer>() as u32,
+            status,
+            _reserved: 0,
+            fields: fields.as_ptr(),
+            fields_len: fields.len(),
+            body: Blob {
+                ptr: body.as_ptr(),
+                len: body.len(),
+                fmt: BLOB_OCTETS,
+                flags: 0,
+            },
+        });
+    }
+    ready(out)
+}
+
+/// One request on a fresh accepted connection with guest list `lines` and kernel `script`.
+fn admitted(ops: &'static Ops, lines: Vec<LineEntry>, script: Script, req: &[u8]) -> AcceptHost {
+    let mut h = AcceptHost::open_with(ops, lines, script);
+    assert_eq!(h.ingest(req), Outcome::Ready);
+    h
+}
+
+/// A request refused by the kernel: the kernel's bytes framed verbatim, nothing up.
+fn refused_verbatim(label: &str, h: &AcceptHost, cause: u32) {
+    assert_eq!(h.heads_up(), 0, "{label}: nothing went up to the host");
+    assert!(h.words.is_empty(), "{label}: no head slots went up");
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        refusal_wire(cause),
+        "{label}: the kernel's refusal, framed verbatim"
+    );
+}
+
+const POST_HELLO: &[u8] =
+    b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello";
+
+/// No line's route holds: `unit.refuse(NO_ROUTE, LINE_NONE)` with no unit, its bytes framed.
+fn no_route(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        b"GET /nope HTTP/1.1\r\nhost: busbar.test\r\n\r\n",
+    );
+    assert_eq!(
+        h.asked(),
+        vec![Asked::Refuse {
+            unit: 0,
+            cause: REFUSE_NO_ROUTE,
+            line: LINE_NONE
+        }],
+        "{label}"
+    );
+    refused_verbatim(label, &h, REFUSE_NO_ROUTE);
+    h.close();
+}
+
+/// The path holds on a line that admits no `GET`: `METHOD_MISS` on that line.
+fn method_miss(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        b"GET /v1/messages HTTP/1.1\r\nhost: busbar.test\r\n\r\n",
+    );
+    assert_eq!(
+        h.asked(),
+        vec![Asked::Refuse {
+            unit: 0,
+            cause: REFUSE_METHOD_MISS,
+            line: 7
+        }],
+        "{label}"
+    );
+    refused_verbatim(label, &h, REFUSE_METHOD_MISS);
+    h.close();
+}
+
+/// The head auth answers STOP: `unit.refuse(STOPPED)` with the unit it minted; no hand-in.
+fn head_stop(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            auth: VecDeque::from([(FLOW_STOP, Vec::new())]),
+            ..Script::default()
+        },
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert_eq!(asked.len(), 2, "{label}: {asked:?}");
+    assert!(
+        matches!(
+            &asked[0],
+            Asked::Auth {
+                point: POINT_HEAD,
+                auth: 103,
+                unit: 0,
+                body: None,
+                ..
+            }
+        ),
+        "{label}: {asked:?}"
+    );
+    assert_eq!(
+        asked[1],
+        Asked::Refuse {
+            unit: MINTED.id,
+            cause: REFUSE_STOPPED,
+            line: 3
+        },
+        "{label}"
+    );
+    refused_verbatim(label, &h, REFUSE_STOPPED);
+    h.close();
+}
+
+/// A `HeadBody` line whose body passes its limit: `OVER_GATE` is asked BEFORE any verdict, and
+/// the auth is never called (1.5.5 answered 413 before inbound SigV4, spec §6 item 4).
+fn over_gate(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 4)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(
+        h.asked(),
+        vec![Asked::Refuse {
+            unit: 0,
+            cause: REFUSE_OVER_GATE,
+            line: 8
+        }],
+        "{label}: no auth call before the size gate"
+    );
+    refused_verbatim(label, &h, REFUSE_OVER_GATE);
+    h.close();
+}
+
+/// A `HeadBody` line within its limit: the auth is shown the head and the whole body, then the
+/// request goes up whole.
+fn head_body_within(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 16)],
+        Script::default(),
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(&asked[..], [
+            Asked::Auth { point: POINT_HEAD_BODY, auth: 108, unit: 0, body: Some(b), .. },
+            Asked::HandIn { auth: 108, unit: 41, line: 8, .. },
+        ] if b == b"hello"),
+        "{label}: {asked:?}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}");
+    let body: Vec<u8> = h
+        .got
+        .iter()
+        .filter(|g| g.2 & PIECE_FIELDS == 0)
+        .flat_map(|g| g.1.clone())
+        .collect();
+    assert_eq!(body, b"hello", "{label}");
+    h.close();
+}
+
+/// What the auth names is stripped before the hand-in and before anything goes up: a field line
+/// (named in another case: ASCII case-insensitive) and a query key (case-sensitive: `Key` stays).
+fn strips(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            auth: VecDeque::from([(
+                FLOW_CONTINUE,
+                vec![("X-Api-Key", FIELD_SENSITIVE), ("key", FIELD_QUERY)],
+            )]),
+            ..Script::default()
+        },
+        b"POST /v1/messages?beta=1&key=sk-secret&Key=keep HTTP/1.1\r\nhost: busbar.test\r\nx-api-key: sk-secret\r\ncontent-length: 5\r\n\r\nhello",
+    );
+    let asked = h.asked();
+    let [Asked::Auth { view: shown, .. }, Asked::HandIn {
+        auth: 103,
+        unit,
+        line: 3,
+        view,
+    }] = &asked[..]
+    else {
+        panic!("{label}: an auth call, then the hand-in: {asked:?}");
+    };
+    assert_eq!(*unit, MINTED.id, "{label}: the unit the auth call minted");
+    assert!(
+        shown.has_field("x-api-key"),
+        "{label}: the auth saw the credential"
+    );
+    assert_eq!(
+        shown.query.as_deref(),
+        Some("beta=1&key=sk-secret&Key=keep"),
+        "{label}"
+    );
+    assert_eq!(view.target, "/v1/messages", "{label}");
+    assert!(
+        !view.has_field("x-api-key"),
+        "{label}: stripped before the hand-in"
+    );
+    assert!(view.has_field("host"), "{label}");
+    assert_eq!(view.query.as_deref(), Some("beta=1&Key=keep"), "{label}");
+    assert_eq!(
+        h.words,
+        vec![(
+            1,
+            b"POST".to_vec(),
+            b"/v1/messages?beta=1&Key=keep".to_vec()
+        )],
+        "{label}: the stripped target went up"
+    );
+    let up: Vec<u8> = h.got.iter().flat_map(|g| g.1.clone()).collect();
+    assert!(
+        !up.windows(9).any(|w| w == b"sk-secret") && !up.windows(9).any(|w| w == b"x-api-key"),
+        "{label}: the plane never sees a credential: {:?}",
+        String::from_utf8_lossy(&up)
+    );
+    h.close();
+}
+
+/// The hand-in answers STOP: `unit.refuse(CHECK_FAILED)` with the unit, nothing up.
+fn hand_in_stop(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            hand_in: FLOW_STOP,
+            ..Script::default()
+        },
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert_eq!(asked.len(), 3, "{label}: {asked:?}");
+    assert!(
+        matches!(
+            asked[1],
+            Asked::HandIn {
+                unit: 41,
+                line: 3,
+                ..
+            }
+        ),
+        "{label}"
+    );
+    assert_eq!(
+        asked[2],
+        Asked::Refuse {
+            unit: MINTED.id,
+            cause: REFUSE_CHECK_FAILED,
+            line: 3
+        },
+        "{label}"
+    );
+    refused_verbatim(label, &h, REFUSE_CHECK_FAILED);
+    h.close();
+}
+
+/// A `none` line: no auth call; the hand-in carries no unit (the kernel mints it there), and the
+/// request goes up.
+fn none_line(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [Asked::HandIn {
+                auth: 105,
+                unit: 0,
+                line: 5,
+                ..
+            }]
+        ),
+        "{label}: {asked:?}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// The unit is carried: a `{Peer, Head}` line calls the peer point once (no request, no unit),
+/// then the head (no unit yet), and the hand-in carries the unit the head call minted.
+fn unit_carried(label: &str, ops: &'static Ops) {
+    let h = admitted(
+        ops,
+        vec![line(
+            6,
+            POINT_PEER | POINT_HEAD,
+            METHOD_POST,
+            "/v1/messages",
+            0,
+        )],
+        Script::default(),
+        POST_HELLO,
+    );
+    let asked = h.asked();
+    assert!(
+        matches!(&asked[..], [
+            Asked::Auth { point: POINT_PEER, auth: 106, unit: 0, view: p, body: None },
+            Asked::Auth { point: POINT_HEAD, auth: 106, unit: 0, .. },
+            Asked::HandIn { auth: 106, unit: 41, line: 6, .. },
+        ] if *p == View::default()),
+        "{label}: {asked:?}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// Run `cell` through the linked door and the dropped-in one.
+fn both(cell: fn(&str, &'static Ops)) {
+    let (d, _lib) = dropped();
+    for (label, ops) in [("linked", linked()), ("dropped", d)] {
+        cell(label, ops);
+    }
+}
+
+#[test]
+fn an_unrouted_request_is_the_kernels_no_route_refusal_and_nothing_goes_up() {
+    both(no_route);
+}
+
+#[test]
+fn a_path_no_line_admits_the_method_of_is_the_kernels_method_miss() {
+    both(method_miss);
+}
+
+#[test]
+fn a_head_auth_stop_is_the_kernels_refusal_with_the_unit() {
+    both(head_stop);
+}
+
+#[test]
+fn a_held_body_over_its_limit_is_refused_before_any_auth_call() {
+    both(over_gate);
+}
+
+#[test]
+fn a_held_body_within_its_limit_is_shown_to_the_auth_then_goes_up() {
+    both(head_body_within);
+}
+
+#[test]
+fn what_the_auth_names_is_stripped_before_the_hand_in_and_before_anything_goes_up() {
+    both(strips);
+}
+
+#[test]
+fn a_hand_in_stop_is_the_kernels_check_failed_refusal() {
+    both(hand_in_stop);
+}
+
+#[test]
+fn a_none_line_is_handed_in_with_no_unit_and_goes_up() {
+    both(none_line);
+}
+
+#[test]
+fn the_unit_the_first_call_minted_is_carried_on_every_later_one() {
+    both(unit_carried);
 }
