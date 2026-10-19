@@ -44,7 +44,7 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // No fact is stated. NOTHING IS ADDED TO THE HEAD AFTER THE AUTH HAS RUN (BUSBAR-1.6.0.md
+    // Bit 1 is not stated: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH HAS RUN (BUSBAR-1.6.0.md
     // l.3779, §4 item 5; ruling 23) is a rule this transport keeps and proves in its own suite
     // (`the_head_on_the_wire_is_every_line_the_auth_saw`), not a fact a tail states. The framer's
     // own lines (`accept`, `host`) are stated at `locate` and the length line for a non-empty body
@@ -63,7 +63,9 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // `STYLE_NEEDS_HEADERS`) signs a fixed set that never names `content-length`, and every other
     // style is handed no head at all. Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's
     // client), and the header-signing style's own no-length-signed cell.
-    facts: 0,
+    // The ops this door serves (coordinator ruling L1): it dials. It states no retired bit (bit 1,
+    // spec l.3779): the rule that bit named is proven in this suite, not stated.
+    facts: busbar_contract::abi::transport::FACT_DIALS,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
