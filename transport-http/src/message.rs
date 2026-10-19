@@ -219,10 +219,11 @@ pub(crate) fn complete_message(
     let mut head = cache.head.take().expect("set just above");
     cache.decoder = None;
     cache.fed = 0;
-    // A trailer is a header that arrived late; it goes where every other header went, so
-    // nothing downstream has to know which side of the body it was written on.
-    head.headers
-        .extend(trailers.into_iter().map(|(n, v)| (n, v.into_bytes())));
+    // A trailer is a line after the head, and after the auth: it never joins the head (THE
+    // DESIGN §6 step 5), so a request carrying one is refused.
+    if !trailers.is_empty() {
+        return Err(TransportError::Framing);
+    }
     Ok(Some(raw::RawMessage {
         start: head.start,
         headers: head.headers,
