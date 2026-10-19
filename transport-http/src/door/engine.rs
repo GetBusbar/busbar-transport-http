@@ -266,11 +266,10 @@ impl Framing {
         self.carried = true;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
-            // hyper frames the body below; a length or coding the message carried describes the
-            // wire it was written for, not the one going out.
-            if k.eq_ignore_ascii_case("transfer-encoding")
-                || k.eq_ignore_ascii_case("content-length")
-            {
+            // A coding the message carried describes the wire it was written for (its chunks are
+            // decoded above), not the one going out. Its length line is the one the auth saw (THE
+            // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
+            if k.eq_ignore_ascii_case("transfer-encoding") {
                 continue;
             }
             b = b.header(k.as_str(), v.as_slice());

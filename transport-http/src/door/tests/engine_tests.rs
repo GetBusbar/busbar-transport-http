@@ -333,7 +333,11 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
     );
     answered(&mut f);
     let root = crate::transport::render_envelope(
-        &[("method", b"POST".as_slice()), ("path", b"/".as_slice())],
+        &[
+            ("method", b"POST".as_slice()),
+            ("path", b"/".as_slice()),
+            ("content-length", b"2".as_slice()),
+        ],
         b"{}",
     )
     .unwrap();
@@ -388,7 +392,13 @@ fn rendered_and_sent(
     };
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
     f.drive(0, 0);
-    let message = crate::transport::render_envelope(fields, body).expect("render");
+    // The length line the host states before the auth.
+    let len = body.len().to_string();
+    let mut stated = fields.to_vec();
+    if !body.is_empty() {
+        stated.push(("content-length", len.as_bytes()));
+    }
+    let message = crate::transport::render_envelope(&stated, body).expect("render");
     let r = f.emit(1, &message, 0, 0);
     f.drive(0, 0);
     (r, f.take_wire(usize::MAX))

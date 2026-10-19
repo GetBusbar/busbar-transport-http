@@ -212,6 +212,7 @@ fn the_envelope_encodes_as_an_http_message() {
             ("method", b"POST".as_slice()),
             ("path", b"/v1/messages".as_slice()),
             ("authorization", b"Token substituted".as_slice()),
+            ("content-length", b"13".as_slice()),
         ],
         b"{\"model\":\"m\"}",
     )
@@ -225,7 +226,7 @@ fn the_envelope_encodes_as_an_http_message() {
     assert!(text.contains("authorization: Token substituted\r\n"));
     assert!(
         text.contains("content-length: 13\r\n"),
-        "the length is a fact about the bytes below, stated by the transport"
+        "the length the head states, rendered where it was stated"
     );
     assert!(text.ends_with("\r\n\r\n{\"model\":\"m\"}"));
 
@@ -285,7 +286,7 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
         ("path", b"/a\r\nHost: elsewhere".as_slice()),
     ];
     for field in poisoned {
-        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"body")
+        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"")
             .expect_err("a field carrying a line ending is not encodable");
         assert_eq!(
             err,
@@ -296,8 +297,14 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     }
     // And an ordinary envelope beside them still encodes, so the check refuses injection rather
     // than refusing headers.
-    crate::transport::render_envelope(&[("x-note", b"ok".as_slice())], b"body")
-        .expect("a clean field still encodes");
+    crate::transport::render_envelope(
+        &[
+            ("x-note", b"ok".as_slice()),
+            ("content-length", b"4".as_slice()),
+        ],
+        b"body",
+    )
+    .expect("a clean field still encodes");
 }
 
 /// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
