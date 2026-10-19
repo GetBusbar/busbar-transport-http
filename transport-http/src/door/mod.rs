@@ -658,15 +658,20 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
+        // The framing joins the instance's table only once its first step is READY: a begin that
+        // fails hands the host no token, so nothing would ever release an entry it left behind.
+        let mut h = Held { framing };
+        let r = step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+        if r != Outcome::Ready {
+            return r;
+        }
         let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        let held = Arc::new(Mutex::new(Held { framing }));
         inst.framings
             .lock()
             .expect("framings")
-            .insert(token, held.clone());
+            .insert(token, Arc::new(Mutex::new(h)));
         o.set(|x| &x.framing, token);
-        let mut h = held.lock().expect("framing");
-        step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        r
     }
 }
 
