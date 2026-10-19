@@ -78,9 +78,10 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
-    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
+    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CLAIM_SECURE, FAULT_CALLER,
+    FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL,
+    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    YIELD_ENDED,
 };
 use busbar_contract::transport::registry::{
     facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
@@ -133,7 +134,7 @@ const CLAIM_NAMES: &[AbiStr] = &[
     abi_str(crate::meta::SECURE_KEY),
 ];
 
-/// The `http` claim's row; `https` is the same wire, so it carries the same row.
+/// The `http` claim's row: plaintext.
 const HTTP_ROW: Claim = Claim {
     selector_forms: bytes_str(&SELECTOR_CODES),
     egress_selector_forms: abi_str(""),
@@ -144,7 +145,14 @@ const HTTP_ROW: Claim = Claim {
     session_bound: 0,
     unit0_trigger: 0,
     status_at: STATUS_AT_FIRST_FRAME,
-    _reserved: 0,
+    flags: 0,
+};
+
+/// The `https` claim's row: the same wire as `http`, which the connector secures (`CLAIM_SECURE`;
+/// BUSBAR-1.6.0.md Part 2 #50). Everything else is `http`'s, so its bytes on the wire are too.
+const HTTPS_ROW: Claim = Claim {
+    flags: CLAIM_SECURE,
+    ..HTTP_ROW
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
@@ -162,9 +170,9 @@ pub(crate) const CLAIMS: &[Claim] = &[
         session_bound: 0,
         unit0_trigger: 0,
         status_at: STATUS_AT_FIRST_FRAME,
-        _reserved: 0,
+        flags: 0,
     },
-    HTTP_ROW,
+    HTTPS_ROW,
 ];
 
 /// HTTP's status classes, read alike on every claim.

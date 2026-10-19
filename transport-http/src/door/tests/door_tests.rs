@@ -323,3 +323,23 @@ fn the_entry_claims_http_https_and_sse() {
         .collect();
     assert_eq!(https, http);
 }
+
+/// RED (BUSBAR-1.6.0.md #50, l.2237; contract `Claim::flags`, busbar #1225): each claimed scheme's
+/// row states whether the connector secures it. `http` and `sse` are plaintext (flags 0); `https` is
+/// the `http` wire secured (`CLAIM_SECURE`). Row i describes claim i. RED on the rows that left every
+/// claim's flags at 0, so an `https` target read as plaintext from the Statement alone.
+#[test]
+fn the_secured_scheme_is_the_one_claim_stating_claim_secure() {
+    use busbar_contract::abi::transport::CLAIM_SECURE;
+    // Claim order, by name length as `the_entry_claims_http_https_and_sse` reads it (the crate
+    // forbids the unsafe a read of the names' bytes would take): `http`, `sse`, `https`.
+    let lens: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
+    assert_eq!(lens, [4, 3, 5], "http, sse, https");
+    assert_eq!(CLAIMS.len(), lens.len(), "row i describes claim i");
+    let flags: Vec<u32> = CLAIMS.iter().map(|r| r.flags).collect();
+    assert_eq!(
+        flags,
+        [0, 0, CLAIM_SECURE],
+        "http and sse plaintext; https secured"
+    );
+}
