@@ -357,23 +357,29 @@ impl Owed for Framing {
     }
 }
 
-/// The dial target with an IPv4 spelling in its host written as the dotted quad it names
-/// ([`super::offered_name`]), so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2)
-/// carry the address 1.5.5's client sent: its URL parser canonicalized the host before the
-/// request was built (`https://127.1:4318/` went out as `host: 127.0.0.1:4318`). Any other host is
-/// kept as written.
+/// The dial target with its authority as 1.5.5's client sent it (its URL parser, WHATWG in
+/// reqwest 0.12, normalised the host before the request was built): the host lower-cased, an IPv4
+/// spelling written as the dotted quad it names ([`super::offered_name`]; `https://127.1:4318/`
+/// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
+/// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
 fn canonical_host(dial: http::Uri) -> http::Uri {
     let Some(host) = dial.host() else {
         return dial;
     };
-    let name = super::offered_name(host);
-    if name == host {
-        return dial;
-    }
-    let authority = match dial.port_u16() {
+    let name = super::offered_name(&host.to_ascii_lowercase());
+    let default_port = match dial.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    };
+    let port = dial.port_u16().filter(|p| Some(*p) != default_port);
+    let authority = match port {
         Some(p) => format!("{name}:{p}"),
         None => name,
     };
+    if dial.authority().map(http::uri::Authority::as_str) == Some(authority.as_str()) {
+        return dial;
+    }
     let Ok(authority) = authority.parse::<http::uri::Authority>() else {
         return dial;
     };
