@@ -63,9 +63,15 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // `STYLE_NEEDS_HEADERS`) signs a fixed set that never names `content-length`, and every other
     // style is handed no head at all. Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's
     // client), and the header-signing style's own no-length-signed cell.
-    // The ops this door serves (coordinator ruling L1): it dials. It states no retired bit (bit 1,
-    // spec l.3779): the rule that bit named is proven in this suite, not stated.
-    facts: busbar_contract::abi::transport::FACT_DIALS,
+    // The ops this door serves (coordinator ruling L1): it dials; it serves the accepted side
+    // (`begin` on `SIDE_ACCEPT`, INBOUND-LISTEN, `door::accept`); and it detaches an upgrade line,
+    // the handoff the spec requires (BUSBAR-1.6.0.md l.4092, T6: http detaches, the upgrade's
+    // transport adopts). It does NOT adopt: nothing hands a connection to http (l.4092), so `adopt`
+    // stays declined and `FACT_ADOPTS` is not stated. It states no retired bit (bit 1, spec
+    // l.3779): the rule that bit named is proven in this suite, not stated.
+    facts: busbar_contract::abi::transport::FACT_DIALS
+        | busbar_contract::abi::transport::FACT_ACCEPTS
+        | busbar_contract::abi::transport::FACT_DETACHES,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
