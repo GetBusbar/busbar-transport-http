@@ -122,22 +122,54 @@ pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])
     miss.map_or(Matched::NoRoute, Matched::MethodMiss)
 }
 
-/// `query` without every key `names` lists as a query key ([`Place::Query`]), compared
-/// case-sensitively and as the far side spelled it; the pairs kept, in order. `None` when nothing
-/// is left.
+/// `query` without every key `names` lists as a query key ([`Place::Query`]); the pairs kept, in
+/// order and as the far side spelled them. A key is compared as it percent-decodes, exactly as
+/// v1.5.5 read every inbound query key (`crates/busbar/src/auth/token.rs`:996-1003 `parse_query`,
+/// :1012-1035 `pct_decode`: `%XX` and `+` decoded, a malformed `%` kept as written), and
+/// case-sensitively: `%6Bey` is the key `key`, `Key` is not. v1.5.5 itself read no credential from
+/// an inbound query (its token carriers were header lines only, `crates/busbar/src/auth/mod.rs`
+/// :593-615), so its one inbound query reader is the rule. `None` when nothing is left.
 #[must_use]
 pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> {
     let kept: Vec<&str> = query
         .split('&')
         .filter(|pair| {
-            let key = pair.split_once('=').map_or(*pair, |(k, _)| k);
+            let key = decoded(pair.split_once('=').map_or(*pair, |(k, _)| k));
             !names
                 .iter()
-                .any(|(n, place)| *place == Place::Query && n == key)
+                .any(|(n, place)| *place == Place::Query && n.as_bytes() == key.as_slice())
         })
         .collect();
     let kept = kept.join("&");
     (!kept.is_empty()).then_some(kept)
+}
+
+/// A query component percent-decoded as v1.5.5's `pct_decode` did (`auth/token.rs`:1012-1035):
+/// `+` is a space, `%` with two hex digits is their byte, any other `%` is itself.
+fn decoded(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                match (
+                    char::from(b[i + 1]).to_digit(16),
+                    char::from(b[i + 2]).to_digit(16),
+                ) {
+                    (Some(h), Some(l)) => {
+                        out.extend(u8::try_from(h * 16 + l));
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether field line `name` is one `names` lists as a field line ([`Place::Field`]), compared
