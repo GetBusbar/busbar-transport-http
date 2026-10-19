@@ -39,7 +39,6 @@
 //! this transport writes no refusal bytes of its own.
 
 use std::collections::{HashMap, VecDeque};
-use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -51,6 +50,7 @@ use busbar_contract::abi::host::service::{
     AuthRef, UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS,
     REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED,
 };
+use busbar_contract::abi::mechanism::ticket::Ticket;
 use busbar_contract::abi::sdk::services::{HeadViewArgs, Pend, Place, RefusalCopy, ServiceError};
 use busbar_contract::abi::transport::fields;
 use bytes::Bytes;
@@ -58,7 +58,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::server::conn::auto;
 use zeroize::Zeroize;
 
-use super::engine::Failure;
+use super::engine::{Failure, HEAD_MAX_BYTES};
 use super::guest::{self, Line, Matched};
 use super::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 
@@ -87,6 +87,9 @@ struct ReplyQ {
     ended: bool,
     full: bool,
     waker: Option<Waker>,
+    /// The host refused the stream after its head went (`RefuseIn::head_sent`): the answer ends
+    /// failed, never as whole.
+    broken: bool,
 }
 
 /// An answer body fed by the host's emits. Its size is never stated here: a head that states
@@ -96,13 +99,21 @@ struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
 
 impl Body for Reply {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let mut q = self.0.lock().expect("reply");
+        if q.broken {
+            // hyper ends the answer failed: HTTP/1.1 closes the connection with no terminating
+            // chunk, HTTP/2 resets the stream.
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "the host refused the stream after its head",
+            ))));
+        }
         if let Some(c) = q.chunks.pop_front() {
             q.queued -= c.len();
             return Poll::Ready(Some(Ok(Frame::data(c))));
@@ -182,6 +193,9 @@ struct Shared {
     streams: HashMap<u64, Answer>,
     /// The streams not yet through the guest list, in arrival order.
     waiting: Vec<u64>,
+    /// A request asking no upgrade was decoded: the connection can no longer be handed over as
+    /// sent, so the copy kept for that goes.
+    no_hand_over: bool,
 }
 
 /// What an inbound `auth.call` answers the accepted side: the flow (`FLOW_*`), the request's unit,
@@ -266,6 +280,13 @@ pub struct Accepted {
     peer_parked: Option<u32>,
     /// The last completion sequence number issued.
     seq: u32,
+    /// The ticket of the op that answered PENDING on a parked `auth.call`, until it resumes, its
+    /// cancel lets the call go, or the op answers anything else.
+    parked_on: Option<Ticket>,
+    /// The host refused the whole connection: its bytes are written, and nothing more is framed.
+    refused_whole: bool,
+    /// Bytes owed to the far side that are not hyper's: a whole-connection refusal's.
+    owed: VecDeque<u8>,
 }
 
 impl Drop for Accepted {
@@ -284,6 +305,7 @@ impl Accepted {
             next: 1,
             streams: HashMap::new(),
             waiting: Vec::new(),
+            no_hand_over: false,
         }));
         let mut peer_auths: Vec<AuthRef> = Vec::new();
         for l in lines.iter().filter(|l| l.points & POINT_PEER != 0) {
@@ -315,6 +337,9 @@ impl Accepted {
             peer_done: 0,
             peer_parked: None,
             seq: 0,
+            parked_on: None,
+            refused_whole: false,
+            owed: VecDeque::new(),
         }
     }
 
@@ -333,10 +358,138 @@ impl Accepted {
 
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
-        if let Some(raw) = self.raw.as_mut() {
+        let h2 = self.raw.as_mut().is_some_and(|raw| {
             raw.extend_from_slice(bytes);
+            raw.starts_with(H2_PREFACE)
+        });
+        // An HTTP/2 connection is never handed over (`detach`): it keeps no copy (Q128 reader A
+        // finding 1).
+        if h2 {
+            self.let_raw_go();
         }
         self.io.ingest(bytes, end);
+    }
+
+    /// Bound the copy kept for a hand-over as sent (Q128 reader A finding 1; THE DESIGN §1
+    /// l.199-201, a bound on live work is a refusal at admission): it goes once a request asking no
+    /// upgrade was decoded (no hand-over as sent is possible after it), and past the head limit
+    /// hyper reads a head under (`engine::HEAD_MAX_BYTES`, all an upgrade request and what follows
+    /// it may hold before it is answered) the connection is refused.
+    fn bound_raw(&mut self) {
+        if std::mem::take(&mut self.shared.lock().expect("shared").no_hand_over) {
+            self.let_raw_go();
+        }
+        if self.raw.as_ref().is_some_and(|r| r.len() > HEAD_MAX_BYTES) {
+            self.let_raw_go();
+            self.conn = None;
+            self.ended = true;
+        }
+    }
+
+    /// The ticket of the op parked on a pending `auth.call`, recorded when that op answers PENDING
+    /// and cleared when it answers anything else.
+    pub fn park_on(&mut self, ticket: Option<Ticket>) {
+        self.parked_on = ticket;
+    }
+
+    /// CANCEL of the op on `ticket`: when it is the op parked on a pending `auth.call`, the parked
+    /// call is let go (a later op calls afresh, under a new handle) and `true` (its bytes were
+    /// taken: the cancel is partial).
+    pub fn cancel(&mut self, ticket: Ticket) -> bool {
+        if self.parked_on != Some(ticket) {
+            return false;
+        }
+        self.parked_on = None;
+        self.peer_parked = None;
+        for a in self.shared.lock().expect("shared").streams.values_mut() {
+            a.parked = None;
+        }
+        true
+    }
+
+    /// Whether the host refused the whole connection.
+    #[must_use]
+    pub const fn refused_whole(&self) -> bool {
+        self.refused_whole
+    }
+
+    /// THE HOST'S REFUSAL (`refuse`, the transport ABI's `RefuseIn`; Q128 reader B finding 2,
+    /// ruling 22):
+    ///
+    /// * for the WHOLE connection (`stream` `None`): `bytes` are the transport's whole envelope, as
+    ///   the host rendered it (the connector's `unit0_refusal`), written as they are; hyper is let
+    ///   go and the connection is over;
+    /// * for a stream whose answer head has not gone: `bytes` are its answer's body, at `status`
+    ///   (`100..=599`, else `500`, the status v1.5.5's server gave a handler's failure), its length
+    ///   stated, as v1.5.5's server answered a handler's error response;
+    /// * for a stream whose head went (`head_sent`): the answer ends failed (HTTP/1.1 closes the
+    ///   connection with no terminating chunk, HTTP/2 resets the stream); `bytes` are not written.
+    ///
+    /// A re-call after `YIELD_MORE` carries no bytes and only drains what the first owed.
+    ///
+    /// # Errors
+    ///
+    /// No request the host was handed on `stream`, or one whose answer already went.
+    pub fn refuse(
+        &mut self,
+        stream: Option<u64>,
+        bytes: &[u8],
+        status: u32,
+        head_sent: bool,
+    ) -> Result<(), Failure> {
+        let Some(stream) = stream else {
+            if !self.refused_whole {
+                self.refused_whole = true;
+                self.conn = None;
+                self.ended = true;
+                self.let_raw_go();
+                self.owed.extend(bytes);
+            }
+            return Ok(());
+        };
+        let mut sh = self.shared.lock().expect("shared");
+        let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
+            return Err(Failure(format!("refuse: no request on stream {stream}")));
+        };
+        if head_sent {
+            let Some(q) = a.reply.as_ref() else {
+                return Err(Failure(format!("refuse: stream {stream} sent no head")));
+            };
+            let mut q = q.lock().expect("reply");
+            q.broken = true;
+            if let Some(w) = q.waker.take() {
+                w.wake();
+            }
+            return Ok(());
+        }
+        if a.respond.is_none() {
+            // The re-call of a refusal already framed carries nothing new.
+            if bytes.is_empty() && a.gate == Gate::Refused {
+                return Ok(());
+            }
+            return Err(Failure(format!(
+                "refuse: stream {stream}'s answer already went"
+            )));
+        }
+        let status = u16::try_from(status)
+            .ok()
+            .filter(|s| (100..=599).contains(s))
+            .unwrap_or(500);
+        let framed = frame_refusal(
+            a,
+            RefusalCopy {
+                status,
+                fields: Vec::new(),
+                body: bytes.to_vec(),
+            },
+        );
+        if !framed {
+            return Err(Failure(format!("refuse: {status} is no answer")));
+        }
+        a.gate = Gate::Refused;
+        drop(sh);
+        self.let_raw_go();
+        Ok(())
     }
 
     /// Whether `stream`'s next emit carries its answer's head.
@@ -477,12 +630,13 @@ impl Accepted {
         let pieces: Vec<Piece> = sh.out.drain(..).collect();
         drop(sh);
         self.out.extend(pieces);
+        self.bound_raw();
     }
 
     /// DETACH the connection for the upgrade framer to adopt, two ways:
     ///
     /// * a connection NOTHING ANSWERED yet goes AS SENT, its upgrade request first, for a framer
-    ///   that answers the upgrade itself (ws's `adopt` takes the request it answers). An HTTP/2
+    ///   that answers the upgrade itself (its `adopt` takes the request it answers). An HTTP/2
     ///   connection (it opened with the preface) carries no upgrade and is not handed over;
     /// * a connection whose request the host answered `101` goes from the byte after that request.
     ///
@@ -565,10 +719,13 @@ impl Accepted {
 
 impl Owed for Accepted {
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
-        self.io.take_wire(cap)
+        let mut wire = self.io.take_wire(cap);
+        let room = cap.saturating_sub(wire.len()).min(self.owed.len());
+        wire.extend(self.owed.drain(..room));
+        wire
     }
     fn wire_pending(&self) -> bool {
-        self.io.wire_pending()
+        self.io.wire_pending() || !self.owed.is_empty()
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
         &mut self.out
@@ -588,10 +745,8 @@ fn serve(
     sh: Arc<Mutex<Shared>>,
     mut req: http::Request<Incoming>,
 ) -> BoxFut<Result<http::Response<Reply>, std::io::Error>> {
-    let upgrade = req
-        .headers()
-        .contains_key(http::header::UPGRADE)
-        .then(|| hyper::upgrade::on(&mut req));
+    let asks_upgrade = req.headers().contains_key(http::header::UPGRADE);
+    let upgrade = asks_upgrade.then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
     let (tx, rx) = futures_channel::oneshot::channel();
     let stream = {
@@ -618,6 +773,9 @@ fn serve(
             },
         );
         s.waiting.push(id);
+        if !asks_upgrade {
+            s.no_hand_over = true;
+        }
         id
     };
     let _ = stream;

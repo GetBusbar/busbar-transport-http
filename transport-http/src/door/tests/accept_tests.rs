@@ -7,6 +7,7 @@
 
 use super::*;
 use http_body_util::BodyExt;
+use std::convert::Infallible;
 
 const SEC: u64 = 1_000_000_000;
 
