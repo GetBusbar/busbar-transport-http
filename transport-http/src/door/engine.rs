@@ -316,6 +316,8 @@ impl Framing {
             // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
             b = b.header(k.as_str(), v.as_slice());
         }
+        // RED ARM (do not merge): a line added after the auth has run.
+        b = b.header("x-added-after-auth", "1");
         let mut req = b
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
