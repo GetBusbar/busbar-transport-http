@@ -816,9 +816,9 @@ fn with_query(
     }
     for (name, value) in fields {
         pq.push(sep);
-        encode(name.as_bytes(), &mut *pq);
+        encode(name.as_bytes(), &mut pq);
         pq.push('=');
-        encode(value, &mut *pq);
+        encode(value, &mut pq);
         sep = '&';
     }
     let mut parts = target.into_parts();
