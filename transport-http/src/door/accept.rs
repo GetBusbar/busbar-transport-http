@@ -1062,11 +1062,11 @@ impl Accepted {
                         &fields,
                     ) {
                         Matched::NoRoute => {
-                            return self.refuse(id, a, REFUSE_NO_ROUTE, LINE_NONE, k, did);
+                            return self.kernel_refuse(id, a, REFUSE_NO_ROUTE, LINE_NONE, k, did);
                         }
                         Matched::MethodMiss(n) => {
                             let line = self.lines[n].line;
-                            return self.refuse(id, a, REFUSE_METHOD_MISS, line, k, did);
+                            return self.kernel_refuse(id, a, REFUSE_METHOD_MISS, line, k, did);
                         }
                         Matched::Line(n) => {
                             let points = self.lines[n].points;
@@ -1085,7 +1085,7 @@ impl Accepted {
                     if a.held_over {
                         // The size gate, before any verdict.
                         let line = self.lines[n].line;
-                        return self.refuse(id, a, REFUSE_OVER_GATE, line, k, did);
+                        return self.kernel_refuse(id, a, REFUSE_OVER_GATE, line, k, did);
                     }
                     if !a.held_whole {
                         return;
@@ -1119,7 +1119,7 @@ impl Accepted {
                                 return fail(a, did);
                             }
                             if flow != FLOW_CONTINUE {
-                                return self.refuse(id, a, REFUSE_STOPPED, line, k, did);
+                                return self.kernel_refuse(id, a, REFUSE_STOPPED, line, k, did);
                             }
                             a.gate = Gate::HandIn(n);
                         }
@@ -1137,7 +1137,14 @@ impl Accepted {
                         Ok((flow, unit)) => {
                             a.unit = unit;
                             if flow != FLOW_CONTINUE {
-                                return self.refuse(id, a, REFUSE_CHECK_FAILED, line, k, did);
+                                return self.kernel_refuse(
+                                    id,
+                                    a,
+                                    REFUSE_CHECK_FAILED,
+                                    line,
+                                    k,
+                                    did,
+                                );
                             }
                             go_up(id, a, out);
                             did.moved = true;
@@ -1152,7 +1159,7 @@ impl Accepted {
 
     /// Ask the kernel for request `id`'s refusal (`cause`, `line`) and frame it verbatim; nothing
     /// goes up. No refusal from the kernel leaves the stream unanswered.
-    fn refuse(
+    fn kernel_refuse(
         &mut self,
         id: u64,
         a: &mut Answer,
