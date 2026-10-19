@@ -11,13 +11,21 @@ fn blob(s: &'static str) -> &'static [u8] {
 /// The settings default to 1.5.5's posture, and a value of the wrong kind is refused by name.
 #[test]
 fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
-    let (p, prior, h1) = read_settings(blob("{}")).expect("defaults");
+    let Settings {
+        posture: p,
+        prior_knowledge: prior,
+        http1_only: h1,
+    } = read_settings(blob("{}")).expect("defaults");
     assert_eq!(p.keep_alive_interval, Some(Duration::from_secs(30)));
     assert_eq!(p.keep_alive_timeout, Duration::from_secs(10));
     assert!(p.adaptive_window);
     assert_eq!(p.request_timeout, Duration::from_secs(300));
     assert!(!prior && !h1);
-    let (p, prior, h1) = read_settings(blob(
+    let Settings {
+        posture: p,
+        prior_knowledge: prior,
+        http1_only: h1,
+    } = read_settings(blob(
         r#"{"advanced.upstream_h2_prior_knowledge":true,"advanced.upstream_http1_only":true,
             "limits.upstream_request_timeout_secs":7,"limits.request_body_max_bytes":9}"#,
     ))
@@ -127,8 +135,8 @@ fn every_classed_claim_has_the_fault_table() {
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     let keys = |s: &'static str| {
-        let (_, prior, h1) = read_settings(blob(s)).expect("settings");
-        (prior, h1)
+        let x = read_settings(blob(s)).expect("settings");
+        (x.prior_knowledge, x.http1_only)
     };
     let offer = |secure, s| {
         let (prior, h1) = keys(s);

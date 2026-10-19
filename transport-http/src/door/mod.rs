@@ -64,7 +64,7 @@ busbar_contract::hyper_io!(::bytes::Bytes);
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
@@ -289,13 +289,28 @@ pub const STATEMENT: Statement = Statement {
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
-/// What `open` read from the settings, and the framings it holds.
-pub struct Instance {
+/// What the settings say: read by `open`, and read again, whole, by every `refresh`.
+#[derive(Clone, Copy)]
+struct Settings {
     posture: Posture,
     prior_knowledge: bool,
     http1_only: bool,
+}
+
+/// The settings in force, and the framings the instance holds.
+pub struct Instance {
+    /// Swapped whole by `refresh`; read once by each op that dials or offers, so one op never sees
+    /// half of one reload and half of the next.
+    settings: RwLock<Settings>,
     framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
     next: AtomicU64,
+}
+
+impl Instance {
+    /// The settings in force now.
+    fn settings(&self) -> Settings {
+        *self.settings.read().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// One framing the instance holds, by its token.
@@ -318,7 +333,7 @@ fn declared_count(path: &str) -> u64 {
 
 /// The settings blob's bytes, parsed; `Err` names, by its path, the first one that is not what its
 /// declaration says (the host renders the path instance-relative). An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
+fn read_settings(bytes: &[u8]) -> Result<Settings, String> {
     let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
     let v: serde_json::Value =
         serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
@@ -336,8 +351,8 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
     let h1 = flag(setting::HTTP1_ONLY).map_err(err)?;
     let secs = count(setting::REQUEST_TIMEOUT_SECS).map_err(err)?;
     let max = count(setting::BODY_MAX_BYTES).map_err(err)?;
-    Ok((
-        Posture {
+    Ok(Settings {
+        posture: Posture {
             // 1.5.5's egress client: keep-alive ping every 30s, 10s to answer, adaptive window on.
             keep_alive_interval: Some(Duration::from_secs(30)),
             keep_alive_timeout: Duration::from_secs(10),
@@ -345,9 +360,9 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
             request_timeout: Duration::from_secs(secs),
             max_body_bytes: usize::try_from(max).unwrap_or(usize::MAX),
         },
-        prior,
-        h1,
-    ))
+        prior_knowledge: prior,
+        http1_only: h1,
+    })
 }
 
 /// One slot body on the SDK's safe surface, over this framer's [`Instance`].
@@ -386,11 +401,9 @@ slot!(
     /// `open`.
     Open, OpenIn, OpenOut, |instance, i, o| {
         match read_settings(i.field(|x| &x.settings).bytes()) {
-            Ok((posture, prior_knowledge, http1_only)) => {
+            Ok(settings) => {
                 instance.open(Instance {
-                    posture,
-                    prior_knowledge,
-                    http1_only,
+                    settings: RwLock::new(settings),
                     framings: Mutex::new(HashMap::new()),
                     next: AtomicU64::new(1),
                 });
@@ -432,7 +445,24 @@ macro_rules! answer {
     };
 }
 
-answer!(Refresh, RefreshIn, OutHead, Outcome::Ready);
+slot!(
+    /// `refresh`: the reload's settings, read as `open` reads them, replace the ones in force for
+    /// every framing begun after it (a framing already begun keeps the posture it was dialled with,
+    /// as a connection 1.5.5's client had open kept its own). A blob `open` would refuse is refused
+    /// with the same words, and the settings in force stay: a reload never half-applies.
+    Refresh, RefreshIn, OutHead, |instance, i, o| {
+        let Some(inst) = instance.get() else {
+            return Outcome::Fault;
+        };
+        match read_settings(i.field(|x| &x.settings).bytes()) {
+            Ok(settings) => {
+                *inst.settings.write().unwrap_or_else(PoisonError::into_inner) = settings;
+                Outcome::Ready
+            }
+            Err(e) => o.fail(Refusal::failed(e)),
+        }
+    }
+);
 answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
 answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
@@ -540,7 +570,8 @@ impl SafeSlot for Locate {
         };
         // The offer exists only where a handshake does: on a secured connection.
         let offer = p.get().map_or(offer_for(secure, false, false), |x| {
-            offer_for(secure, x.prior_knowledge, x.http1_only)
+            let s = x.settings();
+            offer_for(secure, s.prior_knowledge, s.http1_only)
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
@@ -604,6 +635,7 @@ impl SafeSlot for Begin {
         let Some(inst) = p.get() else {
             return Outcome::Failed;
         };
+        let settings = inst.settings();
         if i.side != SIDE_DIAL {
             o.error("begin: http frames dialled connections only");
             return Outcome::Refused;
@@ -614,7 +646,7 @@ impl SafeSlot for Begin {
         let proto = match agreed {
             b"h2" => Proto::H2,
             b"http/1.1" => Proto::H1,
-            b"" if inst.prior_knowledge && !inst.http1_only => Proto::H2,
+            b"" if settings.prior_knowledge && !settings.http1_only => Proto::H2,
             b"" => Proto::H1,
             _ => {
                 o.error("begin: the agreed protocol is not http/1.1 or h2");
@@ -625,7 +657,7 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not text");
             return Outcome::Failed;
         };
-        let Ok(framing) = Framing::dial(target, proto, inst.posture, i.sink.now_monotonic_ns)
+        let Ok(framing) = Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
         else {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
