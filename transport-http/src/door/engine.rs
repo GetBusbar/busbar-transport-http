@@ -95,7 +95,7 @@ enum Stage {
 /// The most a request's head (its request line and fields) may add to its body in one emitted
 /// message: hyper's own HTTP/1 read-buffer ceiling (`8192 + 4096 * 100`), the largest head hyper
 /// would read back.
-const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
+pub(crate) const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
 
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]

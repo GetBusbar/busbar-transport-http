@@ -64,7 +64,8 @@
 //! status in `EmitIn::status` (`BUSBAR-1.6.0.md` l.4913), the later ones its body. `detach` hands
 //! the connection to the claimed upgrade framer: as the far side sent it while nothing has been
 //! answered (the upgrade framer answers the upgrade itself), or from the byte after a request the
-//! host answered `101`. `refuse`, `adopt` and every carrier op are refused.
+//! host answered `101`. `refuse` answers the host's refusal of an accepted stream or connection
+//! ([`Accepted::refuse`]); `adopt` and every carrier op are refused.
 //!
 //! THE ACCEPTED SIDE GOES THROUGH THE GUEST LIST (`BUSBAR-1.6.0.md` §6, "Auth points and guest
 //! lists", item 4, l.938-962; coordinator ruling 22). `begin` on [`SIDE_ACCEPT`] keeps the
@@ -113,10 +114,10 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
-    FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
-    STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
-    YIELD_MORE,
+    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, FAULT_CALLER,
+    FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL,
+    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
+    YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
@@ -464,9 +465,31 @@ slot!(
 );
 
 slot!(
-    /// `cancel`: no framer op pends, so nothing is ever in flight to cancel.
-    Cancel, CancelIn, CancelOut, |_, _, o| {
-        o.set(|x| &x.disposition, CANCEL_NOTHING_MOVED);
+    /// `cancel`: the one framer op in flight is one parked on a pending `auth.call` (`begin`,
+    /// `ingest` or `emit` on the accepted side; the transport contract's "a framer pends only on a
+    /// ticketed auth call"). Its bytes were taken, so its cancel is PARTIAL, and the parked call is
+    /// let go ([`Accepted::cancel`]): a later op calls afresh, under a new handle. A ticket nothing
+    /// is parked on moved nothing.
+    Cancel, CancelIn, CancelOut, |instance, i, o| {
+        let ticket = i.ticket;
+        let held: Vec<Arc<Mutex<Held>>> = instance.get().map_or_else(Vec::new, |inst| {
+            inst.framings.lock().expect("framings").values().cloned().collect()
+        });
+        let partial = held.iter().fold(false, |any, h| {
+            let cancelled = match &mut *h.lock().expect("framing") {
+                Held::Accept(a) => a.cancel(ticket),
+                Held::Dial(_) => false,
+            };
+            any | cancelled
+        });
+        o.set(
+            |x| &x.disposition,
+            if partial {
+                CANCEL_PARTIAL
+            } else {
+                CANCEL_NOTHING_MOVED
+            },
+        );
         Outcome::Ready
     }
 );
@@ -519,9 +542,55 @@ answer!(Write, WriteIn, IoOut, Outcome::Refused);
 answer!(Flush, ConnIn, OutHead, Outcome::Refused);
 answer!(Shut, ShutIn, OutHead, Outcome::Refused);
 answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
-// No refusal and no adoption: an answer is emitted like any other, and nothing switches TO http.
-answer!(Refuse, RefuseIn, FramerOut, Outcome::Refused);
+// No adoption: nothing switches TO http.
 answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
+
+/// `refuse`: THE HOST'S REFUSAL on an ACCEPTED connection (the transport ABI's `RefuseIn`; Q128
+/// reader B finding 2, ruling 22), for a stream the host was handed or the whole connection
+/// ([`Accepted::refuse`]). The kernel's refusal of a request before its hand-in stays
+/// `unit.refuse`'s, framed inside the accepted side; this op is the host's, after it. It never
+/// pends and calls no host service. A dialled connection is refused by its far end, never here.
+pub(crate) struct Refuse;
+impl SafeSlot for Refuse {
+    type In = RefuseIn;
+    type Out = FramerOut;
+    type State = Instance;
+    fn call(
+        p: sdk::Instance<'_, Instance>,
+        i: Lent<'_, RefuseIn>,
+        mut o: Out<'_, FramerOut>,
+    ) -> Outcome {
+        let dialled = p.get().and_then(|inst| {
+            let held = inst
+                .framings
+                .lock()
+                .expect("framings")
+                .get(&i.framing)
+                .cloned()?;
+            let dialled = matches!(*held.lock().expect("framing"), Held::Dial(_));
+            Some(dialled)
+        });
+        if dialled == Some(true) {
+            o.error("refuse: a dialled http connection is refused by its far end");
+            return Outcome::Refused;
+        }
+        let bytes = i.bytes();
+        let stream = (i.has_stream != 0).then_some(i.stream);
+        let (status, head_sent) = (i.status, i.head_sent != 0);
+        with(
+            &p,
+            i.head,
+            false,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |h| match h {
+                Held::Accept(a) => a.refuse(stream, bytes, status, head_sent),
+                Held::Dial(_) => Ok(()),
+            },
+        )
+    }
+}
 
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
@@ -774,13 +843,21 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.head, i.framing, i.field(|x| &x.sink), &mut o, |h| {
-            match h {
-                Held::Dial(f) => f.ingest(bytes, i.end != 0),
-                Held::Accept(a) => a.ingest(bytes, i.end != 0),
-            }
-            Ok(())
-        })
+        with(
+            &p,
+            i.head,
+            true,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |h| {
+                match h {
+                    Held::Dial(f) => f.ingest(bytes, i.end != 0),
+                    Held::Accept(a) => a.ingest(bytes, i.end != 0),
+                }
+                Ok(())
+            },
+        )
     }
 }
 
@@ -801,6 +878,7 @@ impl SafeSlot for Emit {
         let r = with(
             &p,
             i.head,
+            true,
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -837,15 +915,29 @@ impl SafeSlot for Timer {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        with(&p, i.head, i.framing, i.field(|x| &x.sink), &mut o, |_| {
-            Ok(())
-        })
+        with(
+            &p,
+            i.head,
+            false,
+            i.framing,
+            i.field(|x| &x.sink),
+            &mut o,
+            |h| {
+                // A connection the host refused whole is over: no deadline of it is owed.
+                match h {
+                    Held::Accept(a) if a.refused_whole() => {
+                        Err(engine::Failure("timer: the connection was refused".into()))
+                    }
+                    _ => Ok(()),
+                }
+            },
+        )
     }
 }
 
 /// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire bytes
 /// still owed first). A connection nothing answered yet goes AS SENT, its upgrade request first,
-/// for an upgrade framer that answers the upgrade itself (ws's `adopt`); one whose request was
+/// for an upgrade framer that answers the upgrade itself (its `adopt`); one whose request was
 /// answered `101` goes from the byte after that request. The framing has ended. A connection
 /// neither holds for, or a dialled one, has nothing to detach.
 pub(crate) struct Detach;
@@ -1000,6 +1092,7 @@ impl SafeSlot for Encode {
 fn with(
     p: &sdk::Instance<'_, Instance>,
     head: InHead,
+    admit: bool,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -1019,17 +1112,17 @@ fn with(
         ticket: head.ticket,
         conn: token,
     };
+    // GUEST-LIST ADMISSION RUNS ONLY ON THE TICKETED INPUT OPS (`ingest`, `emit`; Q128 readers A
+    // and B): it calls the host auth handle, a may-pend service callable only inside a ticketed op
+    // (THE DESIGN §11.12 l.1602-1604; Appendix A.4.6 l.3646). `timer` and `refuse` never pend and
+    // only drive what is already admitted.
+    let kernel = (admit && !head.ticket.is_none()).then_some(&mut kernel);
     let mut h = held.lock().expect("framing");
     if head.flags & FLAG_RESUME != 0 {
-        return step(&mut h, sink, o, Some(&mut kernel), |_| Ok(()));
+        return step(&mut h, sink, o, kernel, |_| Ok(()));
     }
-    step(&mut h, sink, o, Some(&mut kernel), f)
+    step(&mut h, sink, o, kernel, f)
 }
-
-/// How many admit-then-drive rounds one op runs: each round admits every request decoded so far,
-/// and the drive after it lets hyper write the answers and decode what follows. What is left waits
-/// for the next op.
-const ADMIT_ROUNDS: usize = 16;
 
 fn step(
     h: &mut Held,
@@ -1055,11 +1148,17 @@ fn step(
         Held::Accept(a) => {
             a.drive(sink.now_monotonic_ns);
             if let Some(k) = kernel {
-                for _ in 0..ADMIT_ROUNDS {
+                // Admit until nothing moves: every request decoded in this op is answered, admitted
+                // or parked in it, never left waiting for a wake no op owes it (Q128 reader B
+                // finding 1). Each round moves a request on or ends the loop, and the requests are
+                // the ones the bytes already taken hold.
+                loop {
                     let did = a.admit(k);
                     if did.parked {
-                        // A pending `auth.call` (the SDK's `Pend`: only on a ticketed op): the op
-                        // waits for the host's wake, its output held in the framing.
+                        // A pending `auth.call` (the SDK's `Pend`, on this ticketed op): the op
+                        // yields nothing until the host's wake re-issues it on the same ticket
+                        // (the transport contract's "a framer pends only on a ticketed auth call").
+                        a.park_on(Some(k.ticket));
                         return Outcome::Pending;
                     }
                     if !did.moved {
@@ -1067,6 +1166,7 @@ fn step(
                     }
                     a.drive(sink.now_monotonic_ns);
                 }
+                a.park_on(None);
             }
             fill(a, sink, o, class_of, fault_of);
         }
