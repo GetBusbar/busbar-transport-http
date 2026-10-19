@@ -383,11 +383,11 @@ fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
 #[test]
 fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
     let mut a = accepted();
-    let _ = a.ingest(H2_PREFACE, false);
+    a.ingest(H2_PREFACE, false);
     // An empty SETTINGS frame, then PINGs: frames that are answered by hyper, never by the host.
-    let _ = a.ingest(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", false);
+    a.ingest(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", false);
     for _ in 0..64 {
-        let _ = a.ingest(b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingping", false);
+        a.ingest(b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingping", false);
     }
     run(&mut a, SEC);
     assert!(a.raw.is_none(), "an h2 connection keeps no copy");
@@ -397,7 +397,7 @@ fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
 #[test]
 fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
     let mut a = accepted();
-    let _ = a.ingest(GET, false);
+    a.ingest(GET, false);
     run(&mut a, SEC);
     assert_eq!(up(&mut a).heads.len(), 1, "the request went up");
     assert!(a.raw.is_none(), "no hand-over is possible: no copy is kept");
@@ -411,7 +411,7 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     const HEAD_LIMIT: usize = 8192 + 4096 * 100;
     let mut a = accepted();
-    let _ = a.ingest(
+    a.ingest(
         b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n",
         false,
     );
@@ -419,7 +419,7 @@ fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     assert_eq!(up(&mut a).heads.len(), 1, "the upgrade request went up");
     let chunk = vec![b'x'; 64 * 1024];
     for _ in 0..8 {
-        let _ = a.ingest(&chunk, false);
+        a.ingest(&chunk, false);
         run(&mut a, SEC);
         assert!(
             a.raw.as_ref().map_or(0, Vec::len) <= HEAD_LIMIT,
@@ -504,7 +504,7 @@ fn a_connection_forgets_every_finished_request() {
         )],
     );
     for _ in 0..N {
-        let _ = a.ingest(
+        a.ingest(
             b"POST /v1/x HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello",
             false,
         );
@@ -525,7 +525,7 @@ fn a_connection_forgets_every_finished_request() {
     }
     let mut a = accepted();
     for _ in 0..N {
-        let _ = a.ingest(GET, false);
+        a.ingest(GET, false);
         run(&mut a, SEC);
         let stream = up(&mut a).heads[0].0;
         a.emit(stream, b"content-length: 0\r\n", true, 204)
@@ -545,7 +545,7 @@ fn a_connection_forgets_every_finished_request() {
 #[test]
 fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let mut a = accepted();
-    let _ = a.ingest(
+    a.ingest(
         b"POST /v1/x HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: h2c\r\ncontent-length: 600000\r\n\r\n",
         false,
     );
@@ -554,7 +554,7 @@ fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let chunk = vec![b'x'; 60_000];
     let mut carried = 0;
     for _ in 0..10 {
-        let _ = a.ingest(&chunk, false);
+        a.ingest(&chunk, false);
         run(&mut a, SEC);
         carried += up(&mut a).body.len();
     }
