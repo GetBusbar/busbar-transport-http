@@ -583,6 +583,27 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     );
 }
 
+/// RED (Q128 transport-http, the refused h1 exchange): on HTTP/1.1, where the connection carries
+/// one exchange, a request refused at emit drops its exchange and its buffered bytes and fails the
+/// framing, as `emit`'s doc states. RED on the framing that answered the refusal but kept the
+/// half-written exchange and a live connection.
+#[test]
+fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
+    for message in [
+        &b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
+    ] {
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message, true, 0, 0);
+        assert!(r.is_err(), "refused: {r:?}");
+        assert!(f.exchanges.is_empty(), "the refused exchange is dropped");
+        assert!(f.failure().is_some(), "the framing is failed");
+        f.drive(0, 0);
+        assert!(f.take_wire(usize::MAX).is_empty(), "nothing goes out");
+    }
+}
+
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
 /// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
 /// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8
