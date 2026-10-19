@@ -1271,8 +1271,9 @@ fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
     wire
 }
 
-/// The protocol offer the door answers for an ACCEPTING listener: v1.5.5's TLS listener's,
-/// `http/1.1` alone (v1.5.5 `crates/busbar/src/tls.rs`:242), not its dial offer.
+/// The protocol offer the door answers for an ACCEPTING listener: `h2, http/1.1`, the owner's
+/// signed change from v1.5.5's `http/1.1` alone (OWNER RULING Q137, BUSBAR-1.6.0.md l.5137-5138;
+/// parity binding PB-69), not its dial offer.
 fn accept_offer(ops: &'static Ops) -> Vec<u8> {
     let mut i: OpenIn = z();
     let mut o: OpenOut = z();
@@ -1320,7 +1321,7 @@ fn the_accepted_side_answers_alike_linked_and_dropped_in() {
     for (image, ops) in [("linked", linked()), ("dropped", d)] {
         let offer = accept_offer(ops);
         println!("PROOF {image}: accept offer {offer:?}");
-        assert_eq!(offer, b"\x08http/1.1", "{image}");
+        assert_eq!(offer, b"\x02h2\x08http/1.1", "{image}: Q137");
     }
 }
 
@@ -2339,7 +2340,7 @@ fn refuse_the_connection(label: &str, ops: &'static Ops) {
 /// it, the host's statement is `BeginIn::facts` ("what connection security established"): a secure
 /// layer presents the host's certificate and agrees a protocol; a cleartext connection has neither.
 fn shows_the_scheme(label: &str, ops: &'static Ops) {
-    let cases: [(&str, fn(&mut ConnFacts), u8); 3] = [
+    let cases: [SchemeCase; 3] = [
         ("cleartext", |_| {}, SCHEME_PLAIN),
         // Q128 readers A and B (r211, r212): a TLS client offering no ALPN and no certificate.
         (
@@ -2497,6 +2498,116 @@ fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// One scheme cell: its label, the facts the host states, the scheme the auth must be shown.
+type SchemeCase = (&'static str, fn(&mut ConnFacts), u8);
+
+/// One HTTP/2 frame: its type, flags, stream and payload (RFC 9113 §4.1).
+fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len())
+        .expect("a small frame")
+        .to_be_bytes();
+    let mut f = vec![len[1], len[2], len[3], ty, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// The preface, an empty SETTINGS, and one whole `GET` request per `(stream, path)` (HPACK:
+/// `:method GET`, `:scheme http` static, `:path` and `:authority` literal, not indexed).
+fn h2_requests(requests: &[(u32, &str)]) -> Vec<u8> {
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(4, 0, 0, &[]));
+    for (stream, path) in requests {
+        let mut block = vec![
+            0x82,
+            0x86,
+            0x04,
+            u8::try_from(path.len()).expect("a short path"),
+        ];
+        block.extend_from_slice(path.as_bytes());
+        block.extend_from_slice(&[0x01, 11]);
+        block.extend_from_slice(b"busbar.test");
+        wire.extend(h2_frame(1, 0x5, *stream, &block));
+    }
+    wire
+}
+
+/// ALPN agreed `h2` (the accept offer's first, Q137): the connection is served as HTTP/2 from its
+/// preface, its request admitted and gone up.
+fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_on(
+        ops,
+        vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
+        Script::default(),
+        |f| f.agreed_protocol = s("h2"),
+    );
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/v1/messages")])),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        h.words,
+        vec![(1, b"GET".to_vec(), b"/v1/messages".to_vec())],
+        "{label}: the HTTP/2 request went up"
+    );
+    assert!(
+        h.out.starts_with(&[0, 0]) && h.out.get(3) == Some(&4),
+        "{label}: the server's own SETTINGS open its side: {:?}",
+        h.out
+    );
+    h.close();
+}
+
+/// A PENDING `auth.call` PARKS ONLY ITS OWN STREAM (THE DESIGN §6 item 7, l.975-976; Q128 r231
+/// finding 3): request A, on a line whose auth pends, does not hold back request B on a `none`
+/// line on the same connection. B is admitted in the op A parked in, and its head goes up no later
+/// than the next op, a fresh one on another ticket, while A stays parked.
+fn a_pending_auth_parks_only_its_stream(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![
+            line(3, POINT_HEAD, METHOD_ANY, "/a", 0),
+            line(5, 0, METHOD_ANY, "/b", 0),
+        ],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/a"), (3, "/b")])),
+        Outcome::Pending,
+        "{label}: A's auth pends"
+    );
+    assert!(
+        h.asked()
+            .iter()
+            .any(|a| matches!(a, Asked::HandIn { line: 5, .. })),
+        "{label}: B is admitted in the op A parked in: {:?}",
+        h.asked()
+    );
+    h.ticket = Ticket {
+        slot: 2,
+        generation: 1,
+    };
+    assert_eq!(
+        h.ingest(b""),
+        Outcome::Ready,
+        "{label}: a fresh op on another ticket"
+    );
+    assert!(
+        h.words.iter().any(|(_, _, t)| t == b"/b"),
+        "{label}: B's head went up: {:?}",
+        h.words
+    );
+    assert!(
+        !h.words.iter().any(|(_, _, t)| t == b"/a"),
+        "{label}: A stays parked"
+    );
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -2633,4 +2744,14 @@ fn the_peer_point_is_called_once_per_connection_before_any_head() {
 #[test]
 fn a_peer_answer_naming_lines_is_refused_and_nothing_goes_up() {
     both(a_peer_answer_naming_lines_is_refused);
+}
+
+#[test]
+fn an_alpn_h2_connection_is_served_as_h2() {
+    both(alpn_h2_is_served_as_h2);
+}
+
+#[test]
+fn a_pending_auth_call_parks_only_its_own_stream_and_others_flow() {
+    both(a_pending_auth_parks_only_its_stream);
 }
