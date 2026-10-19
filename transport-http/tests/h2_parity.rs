@@ -206,6 +206,12 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
         name: s(n),
         value: s(v),
     }));
+    // Then the length line the host states for a fixed, non-empty body, last.
+    let len = BODY.len().to_string();
+    fields.push(Field {
+        name: s("content-length"),
+        value: s(&len),
+    });
     let mut e: EncodeIn = z();
     e.fields = fields.as_ptr();
     e.fields_len = fields.len();

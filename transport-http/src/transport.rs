@@ -39,7 +39,10 @@ fn is_token(name: &[u8]) -> bool {
 ///
 /// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
 /// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
-/// reparse): `Encode::Unrepresentable`.
+/// reparse): `Encode::Unrepresentable`. So is a length that does not frame the body: a stated
+/// `content-length` other than the body's, or a non-empty body with none stated. The length is one
+/// of the transport's own lines the host states BEFORE the auth (THE DESIGN §6 step 5): this
+/// renders it where the host put it and adds no line of its own.
 pub(crate) fn render_envelope(
     fields: &[(&str, &[u8])],
     body: &[u8],
@@ -72,6 +75,21 @@ pub(crate) fn render_envelope(
         }
     }
 
+    // THE LENGTH is a fact about the bytes below, stated in the head the auth saw: it must frame
+    // them exactly, and an empty body states none (1.5.5's client sent none for one).
+    let framed = match field("content-length") {
+        Some(v) => {
+            std::str::from_utf8(v)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(body.len())
+        }
+        None => body.is_empty(),
+    };
+    if !framed {
+        return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
+    }
+
     let mut out = Vec::with_capacity(body.len() + 128);
     out.extend_from_slice(method);
     out.push(b' ');
@@ -86,9 +104,6 @@ pub(crate) fn render_envelope(
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
     }
-    // The length is this transport's to state: it is a fact about the bytes below, not
-    // something an envelope gets to disagree with.
-    out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
     Ok(out)

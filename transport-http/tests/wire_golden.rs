@@ -319,6 +319,14 @@ impl Door {
                 }
             }
         }
+        // Then the length line the host states for a fixed, non-empty body, last.
+        if !body.is_empty()
+            && !fields
+                .iter()
+                .any(|(f, _)| f.eq_ignore_ascii_case("content-length"))
+        {
+            fields.push(("content-length".to_owned(), body.len().to_string()));
+        }
         all.extend(fields.iter().map(|(n, v)| Field {
             name: s(n),
             value: s(v),

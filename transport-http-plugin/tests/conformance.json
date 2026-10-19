@@ -37,6 +37,10 @@
           [
             "path",
             "/v1/x"
+          ],
+          [
+            "content-length",
+            "1"
           ]
         ],
         "wire": "POST /v1/x HTTP/1.1\r\ncontent-length: 1\r\n\r\nb"
