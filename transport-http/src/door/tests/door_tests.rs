@@ -363,3 +363,40 @@ fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::FACT_DIALS;
     assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
 }
+
+/// THE INBOUND CLAIM ROWS ARE WHAT THE ACCEPT SIDE MATCHES (`BUSBAR-1.6.0.md` §6 "Auth points and
+/// guest lists" item 3: "The match vocabulary is defined once in `abi/transport`"; item 4: the
+/// listener's transport "matches the route on its guest list"). Every selector form the `http`
+/// claim row declares (`claims::SELECTOR_FORMS`) is one a guest-list line's route
+/// (`abi::transport::route::RouteMatch`) carries: a `PATH_*` form or a `FIELD_*` predicate. A form
+/// with no route spelling is a claim the door could never honour. RED before the fix: the row
+/// declared `HeaderExact`, which no `FIELD_*` predicate spells.
+#[test]
+fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
+    use busbar_contract::abi::transport::route::{
+        FIELD_PRESENT, FIELD_VALUE_PREFIX, PATH_CONTAINS, PATH_EXACT, PATH_PATTERN, PATH_PREFIX,
+        PATH_SUFFIX,
+    };
+    use busbar_contract::SelectorForm;
+    let spelled = |f: SelectorForm| match f {
+        SelectorForm::ExactPath => Some(PATH_EXACT),
+        SelectorForm::PrefixOneLevel => Some(PATH_PREFIX),
+        SelectorForm::PathPattern => Some(PATH_PATTERN),
+        SelectorForm::PathSuffix => Some(PATH_SUFFIX),
+        SelectorForm::PathContains => Some(PATH_CONTAINS),
+        SelectorForm::HeaderPresent => Some(FIELD_PRESENT),
+        SelectorForm::HeaderPrefix => Some(FIELD_VALUE_PREFIX),
+        _ => None,
+    };
+    let unspelled: Vec<SelectorForm> = crate::claims::SELECTOR_FORMS
+        .iter()
+        .copied()
+        .filter(|f| spelled(*f).is_none())
+        .collect();
+    assert_eq!(
+        unspelled,
+        Vec::<SelectorForm>::new(),
+        "a declared inbound form no guest-list route spells"
+    );
+    assert!(crate::claims::SSE_SELECTOR_FORMS.is_empty());
+}
