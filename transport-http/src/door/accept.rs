@@ -90,12 +90,25 @@ struct ReplyQ {
     /// The host refused the stream after its head went (`RefuseIn::head_sent`): the answer ends
     /// failed, never as whole.
     broken: bool,
+    /// hyper let the answer's body go ([`Reply`]'s drop): as it ended, or because the far side
+    /// gave the stream up (an HTTP/2 reset) while the answer was still owed.
+    gone: bool,
 }
 
 /// An answer body fed by the host's emits. Its size is never stated here: a head that states
 /// `content-length` frames it, any other is chunked. A kernel refusal's body is whole when it is
 /// framed, so its size is stated (the second field), as v1.5.5's `Full` bodies stated theirs.
 struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
+
+/// hyper lets an answer's body go when it is whole, and when the far side gives its stream up
+/// mid-answer (an HTTP/2 reset): either way the framing is told ([`ReplyQ::gone`]).
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if let Ok(mut q) = self.0.lock() {
+            q.gone = true;
+        }
+    }
+}
 
 impl Body for Reply {
     type Data = Bytes;
@@ -165,6 +178,8 @@ struct Answer {
     parked: Option<(Ticket, u32)>,
     /// The head went up to the host.
     up: bool,
+    /// The host was told the stream ended (its failure piece went), or ended it itself.
+    told: bool,
 }
 
 /// Where a request stands on its way through the guest list (`BUSBAR-1.6.0.md` §6 item 4).
@@ -466,10 +481,17 @@ impl Accepted {
                 return Err(Failure(format!("refuse: stream {stream} sent no head")));
             };
             let mut q = q.lock().expect("reply");
+            // The answer ends failed and nothing more is owed on it: its record goes once hyper
+            // let it go (Q128 reader A: the same release as a stream the far side gave up).
             q.broken = true;
+            q.ended = true;
+            q.chunks.clear();
+            q.queued = 0;
             if let Some(w) = q.waker.take() {
                 w.wake();
             }
+            drop(q);
+            a.told = true;
             return Ok(());
         }
         if a.respond.is_none() {
@@ -617,11 +639,46 @@ impl Accepted {
             for s in open {
                 if let Some(a) = sh.streams.get_mut(&s) {
                     a.asked = true;
+                    a.told = true;
                 }
                 sh.out.push_back(Piece::failure(
                     s,
                     "the connection ended before the request was whole",
                 ));
+            }
+        }
+        // A stream the far side gave up (Q128 reader A, MEDIUM: an HTTP/2 reset, or the request
+        // dropped before or during its answer): the host is told it ended, once (its failure
+        // piece, which also ends any hold on a full stream), and the stream is over on both sides,
+        // its queued answer let go, so its record goes below and a later emit on it is refused.
+        let abandoned: Vec<u64> = sh
+            .streams
+            .iter()
+            .filter(|(_, a)| given_up(a))
+            .map(|(s, _)| *s)
+            .collect();
+        for s in abandoned {
+            let Some(a) = sh.streams.get_mut(&s) else {
+                continue;
+            };
+            let tell = a.up && !a.told;
+            a.told = true;
+            a.respond = None;
+            a.body = None;
+            a.asked = true;
+            if let Some(q) = a.reply.as_ref() {
+                let mut q = q.lock().expect("reply");
+                q.chunks.clear();
+                q.queued = 0;
+                q.ended = true;
+            }
+            if !matches!(a.gate, Gate::Admitted | Gate::Refused) {
+                a.gate = Gate::Failed;
+            }
+            let_held_go(&mut a.held);
+            if tell {
+                sh.out
+                    .push_back(Piece::failure(s, "the far side gave the stream up"));
             }
         }
         let mut writable = Vec::new();
@@ -792,6 +849,7 @@ fn serve(
                 unit: UnitRef::NONE,
                 parked: None,
                 up: false,
+                told: false,
             },
         );
         s.waiting.push(id);
@@ -846,6 +904,7 @@ fn carry_bodies(sh: &mut Shared, lines: &[Line], cx: &mut Context<'_>) {
                     out.push_back(Piece::failure(*id, &e.to_string()));
                     a.body = None;
                     a.asked = true;
+                    a.told = true;
                     break;
                 }
                 Poll::Ready(None) => {
@@ -1267,6 +1326,21 @@ fn finished(a: &Answer) -> bool {
             q.ended && q.chunks.is_empty()
         });
     request_done && answer_done && !a.switched
+}
+
+/// Whether the far side gave request `a`'s stream up while something was still owed on it: the
+/// answer's head was never taken (hyper dropped the service's receiver), or hyper let the answer's
+/// body go before it was whole. A stream the host refused after its head is the host's own end.
+fn given_up(a: &Answer) -> bool {
+    let before_head = a
+        .respond
+        .as_ref()
+        .is_some_and(futures_channel::oneshot::Sender::is_canceled);
+    let mid_answer = a.reply.as_ref().is_some_and(|q| {
+        let q = q.lock().expect("reply");
+        q.gone && !q.broken && !(q.ended && q.chunks.is_empty())
+    });
+    !a.switched && (before_head || mid_answer)
 }
 
 /// Leave request `a` unanswered: its answer's sender dropped, hyper ends the stream (HTTP/2) or
