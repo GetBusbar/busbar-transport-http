@@ -752,41 +752,29 @@ impl SafeSlot for Locate {
         };
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, u32::from(!name.is_empty()));
-        // THE FRAMER'S OWN HEAD LINES (THE DESIGN §6 step 5): stated here, added by the host
-        // before the auth signs the head, never by `encode`. An accepting listener names no far
-        // end, so it states none.
-        let defaults = if i.accept == 1 {
-            String::new()
-        } else {
-            i.field(|x| &x.target)
-                .as_str()
-                .ok()
-                .and_then(|t| t.parse::<http::Uri>().ok())
-                .map(|u| engine::client_defaults(&u))
-                .unwrap_or_default()
-        };
+        // THE FRAMER'S OWN HEAD LINES ARE ITS OWN TO WRITE (THE DESIGN §6 item 5, l.966; ruling
+        // 18; the phase-2 brief: "Only the defaults (accept/host) become the framer's own with
+        // defaults_written 0"): it states none for the host to add, and writes `accept` and
+        // `host` itself on the dialled side's head before its auth runs (`engine::Framing`).
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
-        let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(name.as_bytes());
         l.extend(offer);
-        d.extend(defaults.as_bytes());
-        // One short answer for every buffer, each at its full size. The framer's own lines are owed
-        // to every request, so a defaults buffer too small for them, an unlent one included, is a
-        // short answer, never READY with no lines (an h1 request would go out with no `host`).
-        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
+        // One short answer for every buffer, each at its full size.
+        let short = !(a.fits() && n.fits() && l.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
-        let (dw, dnd) = d.settle(short);
+        let (dw, dnd) = (0_usize, 0_usize);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
-        // THE LENGTH LINE is the host's to state, before the auth (THE DESIGN §6 step 5): for a
-        // fixed, non-empty body, last, after these lines. `encode` renders it and adds none.
+        // THE LENGTH LINE is the framer's own (`LocateOut::states_length`: "the framer writes
+        // `content-length` ... into its head itself ... The host never adds that line"): `encode`
+        // writes it for a non-empty body that states none, before the auth runs.
         o.set(|x| &x.states_length, 1u8);
         o.set(|x| &x.defaults_written, dw as u64);
         o.set(|x| &x.defaults_needed, dnd as u64);
@@ -872,6 +860,29 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
+        // THE BINDING'S AUTH (THE DESIGN §6 item 5, l.964-967; `BeginIn::auth` at
+        // `BeginIn::points`): called at the peer point here, once, and at the head point on each
+        // request's emit, on the head the framer finalised.
+        let binding = engine::Binding {
+            auth: i.auth,
+            points: i.points,
+        };
+        // The scheme the auth is shown is the one the HOST states for the dial (busbar step 2,
+        // `BeginIn::scheme`: "on `SIDE_DIAL` from the route's upstream"), never derived from the
+        // target. The host refuses a `begin` stating none.
+        let scheme = i.scheme;
+        let mut framing = framing.with_binding(binding, scheme);
+        let token = inst.next.fetch_add(1, Ordering::Relaxed);
+        let mut kernel = HostKernel {
+            services: inst.services.as_ref(),
+            ticket: i.head.ticket,
+            conn: token,
+        };
+        match framing.peer(&mut kernel) {
+            Poll::Pending => return Outcome::Pending,
+            Poll::Ready(Err(e)) => return failed(&mut o, e.0),
+            Poll::Ready(Ok(())) => {}
+        }
         // The framing joins the instance's table only once its first step is READY: a begin that
         // fails hands the host no token, so nothing would ever release an entry it left behind.
         let mut h = Held::Dial(framing);
@@ -879,7 +890,6 @@ impl SafeSlot for Begin {
         if r != Outcome::Ready {
             return r;
         }
-        let token = inst.next.fetch_add(1, Ordering::Relaxed);
         inst.framings
             .lock()
             .expect("framings")
@@ -944,6 +954,12 @@ impl SafeSlot for Emit {
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_status(&i, false).map_err(refused_status)?;
+                    // The stream's unit, carried on every auth call for its request, and the
+                    // opening body's length where the host states it (`EmitIn::body_len`).
+                    f.unit_for(i.stream, i.unit);
+                    if i.body_len_known == 1 {
+                        f.length_for(i.stream, i.body_len);
+                    }
                     f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
                 }
                 Held::Accept(a) => {
@@ -1194,6 +1210,14 @@ fn step(
     }
     match h {
         Held::Dial(framing) => {
+            // The binding's auth on every request whose head is final, before anything is sent;
+            // a pending call parks only its own stream, and the op answers PENDING (the transport
+            // contract's ticketed auth call).
+            if let Some(k) = kernel {
+                if framing.authorize(k) {
+                    return Outcome::Pending;
+                }
+            }
             framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
             let pending = framing.wire_pending() || !framing.pieces().is_empty();
             if let Some(e) = framing.failure().cloned() {
@@ -1325,6 +1349,55 @@ impl Kernel for HostKernel<'_> {
             stream,
             request,
         )
+    }
+}
+
+impl engine::Signer for HostKernel<'_> {
+    fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        point: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+        body: Option<&[u8]>,
+    ) -> Pend<engine::Signed> {
+        let Some(s) = self.services else {
+            return Poll::Ready(Err(ServiceError::Unserved));
+        };
+        let seal = Own::here();
+        s.auth_call::<Own>(
+            self.handle(seq),
+            auth,
+            unit,
+            point,
+            self.conn,
+            stream,
+            request,
+            body,
+        )
+        .map(|r| {
+            r.map(|c| engine::Signed {
+                flow: c.flow,
+                fields: c
+                    .fields
+                    .into_iter()
+                    .map(|f| {
+                        (
+                            f.name,
+                            zeroize::Zeroizing::new(f.value.expose_own(&seal).clone()),
+                            f.flags,
+                        )
+                    })
+                    .collect(),
+            })
+        })
     }
 }
 

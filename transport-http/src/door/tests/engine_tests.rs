@@ -279,27 +279,28 @@ fn h1_wire(message: &[u8]) -> String {
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
 
-/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "Nothing is added to the head after the auth has
-/// run"): the framer writes the head it is handed and adds no field line of its own at `encode`;
-/// its own lines (`accept`, `host`) are stated at `locate` and added by the host before the auth.
-/// RED on the framer that added them after the auth.
+/// THE FRAMER FINALISES ITS OWN LINES (THE DESIGN §6 item 5, l.966: "The transport finalises the
+/// head (its own lines: host, length, framing), calls the auth at its points ... Nothing is added
+/// to the head after the auth has run"; coordinator ruling 18 and the phase-2 brief: the host adds
+/// no line any more). A head that carries none gets `accept` and `host` after the plane's lines, in
+/// 1.5.5's order; a head that carries them keeps them, once, where they were. RED on the framer
+/// that wrote only what it was handed (it once relied on the host to add these lines).
 #[test]
-fn the_door_adds_no_line_to_the_head_it_is_handed() {
+fn the_door_writes_its_own_lines_once() {
     let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
-    let lower = bare.to_ascii_lowercase();
     assert!(
-        lower.starts_with("get /x http/1.1\r\nx-a: 1\r\n"),
+        bare.to_ascii_lowercase()
+            .starts_with("get /x http/1.1\r\nx-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n\r\n"),
         "{bare:?}"
     );
-    assert!(!lower.contains("accept:"), "no accept was handed: {bare:?}");
-    assert!(!lower.contains("host:"), "no host was handed: {bare:?}");
     let handed = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n\r\n");
+    let lower = handed.to_ascii_lowercase();
     assert!(
-        handed
-            .to_ascii_lowercase()
-            .contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
+        lower.contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
         "the handed head, as handed: {handed:?}"
     );
+    assert_eq!(lower.matches("accept:").count(), 1, "{handed:?}");
+    assert_eq!(lower.matches("host:").count(), 1, "{handed:?}");
 }
 
 /// What one emit of `message` on `stream` puts on the wire.
@@ -656,11 +657,13 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
 }
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
-/// 2026-10-19): the head the auth saw is the head on the wire. The host states the length before
-/// the auth (last, after the framer's own lines, as 1.5.5's goldens order it); the framer renders
-/// exactly that head, one length line and no other, and the connection sends it unchanged. A
-/// non-empty body with no stated length cannot be framed without a line the auth never saw, so it
-/// is refused. RED on the framer that appended its own length line to every request.
+/// 2026-10-19): the head the auth saw is the head on the wire, one length line and no other, last,
+/// after the framer's own lines, as 1.5.5's goldens order it, and the connection sends it unchanged.
+/// PHASE 2 (THE DESIGN §6 item 5, l.966; ruling 18; the transport ABI's
+/// `LocateOut::states_length`: "The host never adds that line"): the length line is the framer's
+/// OWN, written BEFORE its auth is called, so a non-empty body with no stated length is no longer
+/// refused: `encode` writes its one length line, and the wire head is the same head. RED on the
+/// framer that appended a length line to every request, and on the one that refused to write it.
 #[test]
 fn the_wire_head_is_the_head_the_auth_saw() {
     let seen: &[(&str, &[u8])] = &[
@@ -692,9 +695,19 @@ fn the_wire_head_is_the_head_the_auth_saw() {
         ],
         "the wire head is the head the auth saw: {wire:?}"
     );
-    assert!(
-        crate::transport::render_envelope(&seen[..5], b"hi").is_err(),
-        "a body with no stated length is refused"
+    // No stated length: the framer writes its own, one, last, before any auth, and the wire head
+    // is the same head.
+    let own = crate::transport::render_envelope(&seen[..5], b"hi").expect("render");
+    let own_text = String::from_utf8_lossy(&own).to_ascii_lowercase();
+    assert_eq!(
+        own_text.matches("content-length:").count(),
+        1,
+        "{own_text:?}"
+    );
+    assert_eq!(
+        h1_wire(&own),
+        wire,
+        "the framer's own length line frames the same head"
     );
     // An empty body states no length, and none goes out (1.5.5's client sent none).
     let get: &[(&str, &[u8])] = &[

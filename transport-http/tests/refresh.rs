@@ -252,25 +252,16 @@ fn a_refresh_with_bad_settings_is_refused_and_changes_nothing() {
     );
 }
 
-/// RED (Q128 transport-http, the empty defaults buffer): the framer's own head lines (`accept`,
-/// `host`) are owed to every request (THE DESIGN §6 step 5), so a host that lends no room for them,
-/// or too little, is answered short with the size they need, never READY with no lines (a request
-/// that would go out with no `host` on HTTP/1.1). RED on the `locate` that answered READY and wrote
-/// nothing when the host lent no defaults buffer.
+/// THE FRAMER'S OWN LINES ARE ITS OWN TO WRITE (THE DESIGN §6 item 5, l.966; the coordinator's
+/// phase-2 brief: "Only the defaults (accept/host) become the framer's own with defaults_written
+/// 0"): `locate` states no head lines for the host to add, whatever room it is lent, and still asks
+/// for the body's length (`states_length`). RED on the `locate` that asked the host to add them.
 #[test]
-fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
+fn locate_states_no_head_lines_for_the_host() {
     let door = Door::open("{}");
-    let want = "accept: */*\r\nhost: 127.0.0.1:9\r\n".len() as u64;
-    for cap in [0, 4] {
+    for cap in [0, 4, 512] {
         let (r, written, needed) = door.locate_with_defaults("http://127.0.0.1:9", cap);
-        assert_eq!(r, Outcome::Failed, "a {cap}-byte defaults buffer is short");
-        assert_eq!(written, 0, "nothing is written on a short answer");
-        assert_eq!(
-            needed, want,
-            "the short answer names the size the lines need"
-        );
+        assert_eq!(r, Outcome::Ready, "a {cap}-byte defaults buffer");
+        assert_eq!((written, needed), (0, 0), "a {cap}-byte defaults buffer");
     }
-    let (r, written, _) = door.locate_with_defaults("http://127.0.0.1:9", 512);
-    assert_eq!(r, Outcome::Ready);
-    assert_eq!(written, want);
 }
