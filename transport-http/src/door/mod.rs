@@ -765,13 +765,13 @@ impl SafeSlot for Emit {
         let r = with(&p, i.framing, i.field(|x| &x.sink), &mut o, |h| match h {
             Held::Dial(f) => {
                 // A dialled stream's emits carry a request: no answer's status rides them.
-                check_emit_status(&*i, false).map_err(refused_status)?;
+                check_emit_status(&i, false).map_err(refused_status)?;
                 f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
             }
             Held::Accept(a) => {
                 // The first emit on an accepted stream is its answer's head, with its status;
                 // every other carries none.
-                check_emit_status(&*i, a.answers_head(i.stream)).map_err(refused_status)?;
+                check_emit_status(&i, a.answers_head(i.stream)).map_err(refused_status)?;
                 full = a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?;
                 Ok(())
             }
@@ -803,7 +803,7 @@ impl SafeSlot for Timer {
 /// for an upgrade framer that answers the upgrade itself (ws's `adopt`); one whose request was
 /// answered `101` goes from the byte after that request. The framing has ended. A connection
 /// neither holds for, or a dialled one, has nothing to detach.
-pub struct Detach;
+pub(crate) struct Detach;
 impl SafeSlot for Detach {
     type In = FramingIn;
     type Out = FramerOut;

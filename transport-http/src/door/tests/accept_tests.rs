@@ -6,6 +6,7 @@
 //! hyper-util's auto builder, HTTP/1 header read bounded at 30 s) put there.
 
 use super::*;
+use http_body_util::BodyExt;
 
 const SEC: u64 = 1_000_000_000;
 
