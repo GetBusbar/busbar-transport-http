@@ -269,7 +269,13 @@ impl Framing {
                 self.out.push_back(Piece::failure(stream, &f.0));
                 Ok(())
             }
-            Err(f) => Err(f),
+            Err(f) => {
+                // HTTP/1.1: the connection carries one exchange, so its refusal is the framing's.
+                // The half-written exchange and its buffered bytes go with it.
+                self.exchanges.retain(|(s, _)| *s != stream);
+                self.failed = Some(f.clone());
+                Err(f)
+            }
         }
     }
 
