@@ -315,6 +315,12 @@ pub struct Accepted {
 impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
+        // A body held for a `HeadBody` auth when the framing is torn down mid-hold (Q128 r232).
+        if let Ok(mut sh) = self.shared.lock() {
+            for a in sh.streams.values_mut() {
+                let_held_go(&mut a.held);
+            }
+        }
     }
 }
 
@@ -1117,15 +1123,11 @@ impl Accepted {
                 continue;
             };
             let before = a.gate;
-            // A request parked on this op's ticket stops the op: it answers PENDING and yields
-            // nothing until its resume, which carries on from here (the transport contract: a
-            // pending answer parks only its own stream; the requests behind it wait for that resume
-            // or for a fresh op on another ticket).
-            if did.parked {
-                sh.streams.insert(id, a);
-                sh.waiting.push(id);
-                continue;
-            }
+            // A request parked on this op's ticket parks only its own stream (THE DESIGN §6 item
+            // 7, l.975-976; Q128 r231): every other waiting request is still matched, called and
+            // handed in here, each under its own completion sequence. The op then answers PENDING
+            // and yields nothing (the transport contract), so what the others produced goes to the
+            // host with the op's resume or the next op on another ticket.
             self.admit_one(id, &mut a, &mut sh.out, k, &mut did);
             // A request that moved on (to holding its body, say) is driven again before the op
             // answers.
