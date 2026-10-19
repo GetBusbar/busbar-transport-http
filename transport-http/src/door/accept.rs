@@ -910,6 +910,7 @@ fn head_view<'a>(
         authority,
         query: parts.uri.query(),
         fields,
+        ..HeadViewArgs::default()
     }
 }
 
