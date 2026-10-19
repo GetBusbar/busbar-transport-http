@@ -76,7 +76,9 @@ pub(crate) fn render_envelope(
     }
 
     // THE LENGTH is a fact about the bytes below, stated in the head the auth saw: it must frame
-    // them exactly, and an empty body states none (1.5.5's client sent none for one).
+    // them exactly, and an empty body states none (1.5.5's client sent none for one on HTTP/1.1;
+    // on HTTP/2 its framing added `content-length: 0` for a payload method, as this door's does:
+    // the one exception `meta::TAIL` names).
     let framed = match field("content-length") {
         Some(v) => {
             std::str::from_utf8(v)
