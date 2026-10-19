@@ -23,6 +23,20 @@
 //! A `101` answer to a request that asked to upgrade switches the connection: hyper writes the
 //! `101`, and `detach` hands the host every byte the far side sent after the request, for the
 //! claimed upgrade framer to adopt.
+//!
+//! NO REQUEST GOES UP UNADMITTED (`BUSBAR-1.6.0.md` §6, "Auth points and guest lists", item 4,
+//! l.938-962). The connection is framed under its listener's guest list ([`guest::Line`], lent at
+//! `begin`). Each decoded head waits in [`Gate`] until [`Accepted::admit`] has run it through the
+//! host auth handle ([`Kernel`]): matched against the lines in order (no line: `NO_ROUTE`; a path
+//! with no method admitted: `METHOD_MISS`); the matched line's auth called at its points (`Peer`
+//! once per connection before any request, l.953 item 7; `Head` with the head; `HeadBody` with the
+//! whole body held up to the line's `body_limit`, over which the size gate refuses BEFORE any
+//! verdict, l.940-942); what the auth names stripped (field lines ASCII case-insensitively, query
+//! keys case-sensitively, l.943-945); then handed in with the line it matched (l.951-957). Only
+//! then does its head go up, stripped. Every refusal is the KERNEL's (`unit.refuse`, l.958-961):
+//! its status, fields and body framed verbatim by hyper as any answer, and nothing goes up. A
+//! refusal the kernel cannot give leaves the stream unanswered: hyper ends it with no bytes, for
+//! this transport writes no refusal bytes of its own.
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
@@ -32,12 +46,20 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use busbar_contract::abi::auth::{POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
+use busbar_contract::abi::host::service::{
+    AuthRef, UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS,
+    REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED,
+};
+use busbar_contract::abi::sdk::services::{HeadViewArgs, Pend, Place, RefusalCopy, ServiceError};
 use busbar_contract::abi::transport::fields;
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::server::conn::auto;
+use zeroize::Zeroize;
 
 use super::engine::Failure;
+use super::guest::{self, Line, Matched};
 use super::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 
 /// v1.5.5's HTTP/1 header-read bound (`hardened_conn_builder`).
@@ -68,8 +90,9 @@ struct ReplyQ {
 }
 
 /// An answer body fed by the host's emits. Its size is never stated here: a head that states
-/// `content-length` frames it, any other is chunked.
-struct Reply(Arc<Mutex<ReplyQ>>);
+/// `content-length` frames it, any other is chunked. A kernel refusal's body is whole when it is
+/// framed, so its size is stated (the second field), as v1.5.5's `Full` bodies stated theirs.
+struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
 
 impl Body for Reply {
     type Data = Bytes;
@@ -97,7 +120,7 @@ impl Body for Reply {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
+        self.1.map_or_else(SizeHint::default, SizeHint::with_exact)
     }
 }
 
@@ -111,10 +134,45 @@ struct Answer {
     upgrade: Option<hyper::upgrade::OnUpgrade>,
     /// The answer was a `101`.
     switched: bool,
-    /// The request body, carried up as it arrives.
+    /// The request body, carried up as it arrives once admitted, or held for a `HeadBody` auth.
     body: Option<Incoming>,
     /// The request is whole (its last piece went up).
     asked: bool,
+    /// The decoded head, held until it is admitted (stripped) or refused.
+    parts: Option<http::request::Parts>,
+    /// Where the request stands on its way through the guest list.
+    gate: Gate,
+    /// The body held for a `HeadBody` auth; zeroised once handed on.
+    held: Vec<u8>,
+    /// The held body is whole.
+    held_whole: bool,
+    /// The held body passed its line's `body_limit`.
+    held_over: bool,
+    /// The request's unit, as the kernel answered it.
+    unit: UnitRef,
+    /// A pending `auth.call`'s sequence number, re-issued on the next drive.
+    parked: Option<u32>,
+    /// The head went up to the host.
+    up: bool,
+}
+
+/// Where a request stands on its way through the guest list (`BUSBAR-1.6.0.md` §6 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// Decoded, not yet matched.
+    Arrived,
+    /// Matched line `.0`, whose auth needs `HeadBody`: the body is being held.
+    Hold(usize),
+    /// Matched line `.0`: its auth is called at its head point.
+    Auth(usize),
+    /// Matched line `.0`: handed in.
+    HandIn(usize),
+    /// Admitted: its head went up, its body follows.
+    Admitted,
+    /// The kernel's refusal was framed.
+    Refused,
+    /// Neither admitted nor refused: left unanswered, for hyper to end.
+    Failed,
 }
 
 /// What the service and the framing share.
@@ -122,6 +180,63 @@ struct Shared {
     out: VecDeque<Piece>,
     next: u64,
     streams: HashMap<u64, Answer>,
+    /// The streams not yet through the guest list, in arrival order.
+    waiting: Vec<u64>,
+}
+
+/// THE HOST AUTH HANDLE as the accepted side calls it (`abi::host::service`, `op::AUTH_CALL`,
+/// `op::UNIT_HAND_IN`, `op::UNIT_REFUSE`), each call under completion sequence `seq` of the op's
+/// ticket; the door's is the SDK's `Services` (`door::HostKernel`).
+pub trait Kernel {
+    /// `auth.call`: the flow, the request's unit and the names to strip.
+    #[allow(clippy::too_many_arguments)]
+    fn auth_call(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        point: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+        body: Option<&[u8]>,
+    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)>;
+    /// `unit.hand_in`: the flow and the request's unit.
+    ///
+    /// # Errors
+    ///
+    /// The service's.
+    #[allow(clippy::too_many_arguments)]
+    fn hand_in(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        unit: UnitRef,
+        line: u32,
+        stream: u64,
+        request: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError>;
+    /// `unit.refuse`: the kernel's refusal, copied.
+    ///
+    /// # Errors
+    ///
+    /// The service's.
+    fn refuse(
+        &mut self,
+        seq: u32,
+        unit: UnitRef,
+        cause: u32,
+        line: u32,
+        stream: u64,
+    ) -> Result<RefusalCopy, ServiceError>;
+}
+
+/// What one [`Accepted::admit`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Admitted {
+    /// Some request moved (up, refused or failed), or the peer point was decided.
+    pub moved: bool,
+    /// An `auth.call` is pending: its stream is parked until the next drive.
+    pub parked: bool,
 }
 
 /// One accepted connection's HTTP machine.
@@ -135,20 +250,43 @@ pub struct Accepted {
     leftover: Option<VecDeque<u8>>,
     /// Every byte the far side sent, kept until the connection's first answer: a connection
     /// nothing answered yet is handed over AS SENT, its upgrade request first, for the upgrade
-    /// framer to answer itself (`adopt`).
+    /// framer to answer itself (`adopt`). Zeroised when it is let go (it holds credential lines).
     raw: Option<Vec<u8>>,
+    /// The listener's guest list, in match order.
+    lines: Vec<Line>,
+    /// The distinct auth handles the lines call at the peer point, in list order.
+    peer_auths: Vec<AuthRef>,
+    /// How many of them answered CONTINUE.
+    peer_done: usize,
+    /// A pending peer call's sequence number.
+    peer_parked: Option<u32>,
+    /// The last completion sequence number issued.
+    seq: u32,
+}
+
+impl Drop for Accepted {
+    fn drop(&mut self) {
+        self.let_raw_go();
+    }
 }
 
 impl Accepted {
-    /// Serve an accepted connection at host time `now_ns`.
+    /// Serve an accepted connection at host time `now_ns`, under guest list `lines`.
     #[must_use]
-    pub fn accept(now_ns: u64) -> Self {
+    pub fn accept(now_ns: u64, lines: Vec<Line>) -> Self {
         let io = HostIo::new(now_ns);
         let shared = Arc::new(Mutex::new(Shared {
             out: VecDeque::new(),
             next: 1,
             streams: HashMap::new(),
+            waiting: Vec::new(),
         }));
+        let mut peer_auths: Vec<AuthRef> = Vec::new();
+        for l in lines.iter().filter(|l| l.points & POINT_PEER != 0) {
+            if !peer_auths.contains(&l.auth) {
+                peer_auths.push(l.auth);
+            }
+        }
         let sh = shared.clone();
         let service =
             hyper::service::service_fn(move |req: http::Request<Incoming>| serve(sh.clone(), req));
@@ -168,7 +306,25 @@ impl Accepted {
             ended: false,
             leftover: None,
             raw: Some(Vec::new()),
+            lines,
+            peer_auths,
+            peer_done: 0,
+            peer_parked: None,
+            seq: 0,
         }
+    }
+
+    /// Let the bytes kept for a hand-over as sent go, zeroised.
+    fn let_raw_go(&mut self) {
+        if let Some(mut raw) = self.raw.take() {
+            raw.zeroize();
+        }
+    }
+
+    /// The next completion sequence number.
+    fn next_seq(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
     }
 
     /// The far side sent `bytes` (`end` = and then ended).
@@ -187,7 +343,7 @@ impl Accepted {
             .expect("shared")
             .streams
             .get(&stream)
-            .is_some_and(|a| a.respond.is_some())
+            .is_some_and(|a| a.up && a.respond.is_some())
     }
 
     /// Bytes for `stream`'s answer: its head (a field block, with `status`) on the first emit,
@@ -204,12 +360,15 @@ impl Accepted {
         status: u32,
     ) -> Result<bool, Failure> {
         let mut sh = self.shared.lock().expect("shared");
-        let Some(a) = sh.streams.get_mut(&stream) else {
+        // A stream the host was never handed (refused, or not yet admitted) is no request of its.
+        let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
             return Err(Failure(format!("emit: no request on stream {stream}")));
         };
         if let Some(respond) = a.respond.take() {
             // The connection answers: it is no longer one to hand over as sent.
-            self.raw = None;
+            if let Some(mut raw) = self.raw.take() {
+                raw.zeroize();
+            }
             let code = u16::try_from(status)
                 .ok()
                 .and_then(|s| http::StatusCode::from_u16(s).ok())
@@ -223,7 +382,7 @@ impl Accepted {
                 ..ReplyQ::default()
             }));
             let resp = b
-                .body(Reply(q.clone()))
+                .body(Reply(q.clone(), None))
                 .map_err(|e| Failure(format!("emit: the head is not an answer: {e}")))?;
             a.switched = code.as_u16() == SWITCHING_PROTOCOLS && a.upgrade.is_some();
             a.reply = Some(q);
@@ -265,6 +424,7 @@ impl Accepted {
         let conn = &mut self.conn;
         let ended = &mut self.ended;
         let shared = &self.shared;
+        let lines = &self.lines;
         let _ = io.rounds(|cx| {
             if let Some(c) = conn.as_mut() {
                 if let Poll::Ready(_r) = c.as_mut().poll(cx) {
@@ -275,7 +435,7 @@ impl Accepted {
                     *ended = true;
                 }
             }
-            carry_bodies(&mut shared.lock().expect("shared"), cx);
+            carry_bodies(&mut shared.lock().expect("shared"), lines, cx);
             Ok::<(), Failure>(())
         });
         let mut sh = self.shared.lock().expect("shared");
@@ -284,7 +444,7 @@ impl Accepted {
             let open: Vec<u64> = sh
                 .streams
                 .iter()
-                .filter(|(_, a)| !a.asked && !a.switched)
+                .filter(|(_, a)| a.up && !a.asked && !a.switched)
                 .map(|(s, _)| *s)
                 .collect();
             for s in open {
@@ -417,8 +577,9 @@ impl Owed for Accepted {
     }
 }
 
-/// One request, as hyper hands it to the service: its head goes up at once, its body is pumped up
-/// as it arrives, and the answer waits for the host's first emit on its stream.
+/// One request, as hyper hands it to the service: it waits for [`Accepted::admit`] (its head goes up
+/// once admitted, its body pumped up as it arrives), and the answer waits for the host's first emit
+/// on its stream, or is the kernel's refusal.
 fn serve(
     sh: Arc<Mutex<Shared>>,
     mut req: http::Request<Incoming>,
@@ -442,9 +603,17 @@ fn serve(
                 switched: false,
                 body: Some(body),
                 asked: false,
+                parts: Some(parts),
+                gate: Gate::Arrived,
+                held: Vec::new(),
+                held_whole: false,
+                held_over: false,
+                unit: UnitRef::NONE,
+                parked: None,
+                up: false,
             },
         );
-        s.out.push_back(head_piece(id, &parts));
+        s.waiting.push(id);
         id
     };
     let _ = stream;
@@ -458,11 +627,20 @@ fn serve(
     })
 }
 
-/// Carry every request body up as far as it has arrived: data pieces, then the empty piece that
-/// says the request is whole (or the failure piece of a body the far side broke off).
-fn carry_bodies(sh: &mut Shared, cx: &mut Context<'_>) {
+/// Carry every ADMITTED request body up as far as it has arrived: data pieces, then the empty
+/// piece that says the request is whole (or the failure piece of a body the far side broke off).
+/// A body a `HeadBody` auth needs is held instead, up to its line's limit
+/// ([`hold_body`]); any other waits, unread, for its request's admission.
+fn carry_bodies(sh: &mut Shared, lines: &[Line], cx: &mut Context<'_>) {
     let Shared { out, streams, .. } = sh;
     for (id, a) in streams.iter_mut() {
+        if let Gate::Hold(n) = a.gate {
+            hold_body(a, lines[n].body_limit, cx);
+            continue;
+        }
+        if a.gate != Gate::Admitted {
+            continue;
+        }
         let Some(body) = a.body.as_mut() else {
             continue;
         };
@@ -493,6 +671,382 @@ fn carry_bodies(sh: &mut Shared, cx: &mut Context<'_>) {
             }
         }
     }
+}
+
+/// Hold a `HeadBody` request's body as it arrives, up to `limit` bytes (THE DESIGN §6 item 4,
+/// l.940-942: "`HeadBody`'s bound is the size gate's limit; over it is 413, answered before the
+/// verdict"). Past the limit the body is let go (zeroised) and no more is read; whole, it waits for
+/// the auth.
+fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
+    let Some(body) = a.body.as_mut() else {
+        return;
+    };
+    loop {
+        match Pin::new(&mut *body).poll_frame(cx) {
+            Poll::Pending => return,
+            Poll::Ready(Some(Ok(f))) => {
+                if let Ok(d) = f.into_data() {
+                    a.held.extend_from_slice(&d);
+                }
+                if a.held.len() as u64 > limit {
+                    a.held.zeroize();
+                    a.held_over = true;
+                    a.body = None;
+                    return;
+                }
+            }
+            // A body the far side broke off is no request to judge: the stream is left to hyper.
+            Poll::Ready(Some(Err(_))) => {
+                a.held.zeroize();
+                a.body = None;
+                a.gate = Gate::Failed;
+                a.respond = None;
+                return;
+            }
+            Poll::Ready(None) => {
+                a.held_whole = true;
+                a.body = None;
+                return;
+            }
+        }
+    }
+}
+
+/// The request as the auth handle reads it (`HeadView`): the method, the target's path, the
+/// authority (the target's own, else the `host` line, as HTTP/1.1 states it), the query, and the
+/// head's field lines in order, as received. Borrowed from `parts` and `fields`.
+fn head_view<'a>(
+    parts: &'a http::request::Parts,
+    fields: &'a [(&'a str, &'a [u8])],
+) -> HeadViewArgs<'a> {
+    let authority = parts.uri.authority().map_or_else(
+        || {
+            parts
+                .headers
+                .get(http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("")
+        },
+        http::uri::Authority::as_str,
+    );
+    HeadViewArgs {
+        method: parts.method.as_str(),
+        target: parts.uri.path(),
+        authority,
+        query: parts.uri.query(),
+        fields,
+    }
+}
+
+/// The head's field lines as `(name, value)`, in order.
+fn field_lines(parts: &http::request::Parts) -> Vec<(&str, &[u8])> {
+    parts
+        .headers
+        .iter()
+        .map(|(n, v)| (n.as_str(), v.as_bytes()))
+        .collect()
+}
+
+/// Strip from `parts` what the auth named (THE DESIGN §6 item 4, l.943-945): every field line it
+/// names (ASCII case-insensitively) and every query key (case-sensitively), the target rewritten
+/// without those keys.
+///
+/// # Errors
+///
+/// The rewritten target is not one (it cannot be: a target with pairs taken out).
+fn strip(parts: &mut http::request::Parts, names: &[(String, Place)]) -> Result<(), Failure> {
+    let gone: Vec<http::HeaderName> = parts
+        .headers
+        .keys()
+        .filter(|n| guest::strips_field(n.as_str(), names))
+        .cloned()
+        .collect();
+    for n in gone {
+        parts.headers.remove(&n);
+    }
+    if names.iter().any(|(_, p)| *p == Place::Query) {
+        if let Some(q) = parts.uri.query() {
+            let target = match guest::stripped_query(q, names) {
+                Some(kept) => format!("{}?{kept}", parts.uri.path()),
+                None => parts.uri.path().to_owned(),
+            };
+            let mut up = parts.uri.clone().into_parts();
+            up.path_and_query = Some(
+                http::uri::PathAndQuery::try_from(target)
+                    .map_err(|e| Failure(format!("strip: {e}")))?,
+            );
+            parts.uri = http::Uri::from_parts(up).map_err(|e| Failure(format!("strip: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
+/// Frame the kernel's refusal on `a`'s stream, verbatim: its status, its fields in order, its body
+/// at its stated size. `false`: it is no answer hyper can carry (the stream is left unanswered).
+fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
+    let Some(respond) = a.respond.take() else {
+        return false;
+    };
+    let mut b = http::Response::builder().status(r.status);
+    for (name, value) in &r.fields {
+        b = b.header(name.as_str(), value.as_slice());
+    }
+    let len = r.body.len() as u64;
+    let q = Arc::new(Mutex::new(ReplyQ {
+        ended: true,
+        queued: r.body.len(),
+        chunks: if r.body.is_empty() {
+            VecDeque::new()
+        } else {
+            VecDeque::from([Bytes::from(r.body)])
+        },
+        ..ReplyQ::default()
+    }));
+    let Ok(resp) = b.body(Reply(q.clone(), Some(len))) else {
+        return false;
+    };
+    a.reply = Some(q);
+    // The far side may have gone; its stream's end says so.
+    let _ = respond.send(resp);
+    true
+}
+
+impl Accepted {
+    /// ADMIT what the guest list holds (`BUSBAR-1.6.0.md` §6 item 4, l.938-962; item 7, l.952-956):
+    /// the peer point first, once per connection, then every waiting request in arrival order, each
+    /// as far as it can go now. A pending `auth.call` parks only its own stream (or, at the peer
+    /// point, the connection's requests) until the next drive re-issues it.
+    pub fn admit(&mut self, k: &mut dyn Kernel) -> Admitted {
+        let mut did = Admitted::default();
+        if self.ended && self.conn.is_none() {
+            return did;
+        }
+        while self.peer_done < self.peer_auths.len() {
+            let seq = self.peer_parked.take().unwrap_or_else(|| self.next_seq());
+            let auth = self.peer_auths[self.peer_done];
+            match k.auth_call(
+                seq,
+                auth,
+                UnitRef::NONE,
+                POINT_PEER,
+                0,
+                &HeadViewArgs::default(),
+                None,
+            ) {
+                Poll::Pending => {
+                    self.peer_parked = Some(seq);
+                    did.parked = true;
+                    return did;
+                }
+                Poll::Ready(Ok((FLOW_CONTINUE, ..))) => {
+                    self.peer_done += 1;
+                    did.moved = true;
+                }
+                // A `Peer` refusal (or no answer) closes the connection with no response bytes
+                // (item 7, l.955-956).
+                Poll::Ready(_) => {
+                    self.conn = None;
+                    self.ended = true;
+                    did.moved = true;
+                    return did;
+                }
+            }
+        }
+        let shared = self.shared.clone();
+        let mut sh = shared.lock().expect("shared");
+        let waiting = std::mem::take(&mut sh.waiting);
+        for id in waiting {
+            let Some(mut a) = sh.streams.remove(&id) else {
+                continue;
+            };
+            let before = a.gate;
+            self.admit_one(id, &mut a, &mut sh.out, k, &mut did);
+            // A request that moved on (to holding its body, say) is driven again before the op
+            // answers.
+            did.moved |= a.gate != before;
+            let done = matches!(a.gate, Gate::Admitted | Gate::Refused | Gate::Failed);
+            if a.gate == Gate::Refused {
+                // The connection answered: it is no longer one to hand over as sent.
+                self.let_raw_go();
+            }
+            sh.streams.insert(id, a);
+            if !done {
+                sh.waiting.push(id);
+            }
+        }
+        did
+    }
+
+    /// Take request `id` as far through the guest list as it can go now.
+    fn admit_one(
+        &mut self,
+        id: u64,
+        a: &mut Answer,
+        out: &mut VecDeque<Piece>,
+        k: &mut dyn Kernel,
+        did: &mut Admitted,
+    ) {
+        loop {
+            let Some(parts) = a.parts.as_ref() else {
+                return;
+            };
+            match a.gate {
+                Gate::Arrived => {
+                    let fields = field_lines(parts);
+                    let to = match guest::matched(
+                        &self.lines,
+                        parts.method.as_str(),
+                        parts.uri.path(),
+                        &fields,
+                    ) {
+                        Matched::NoRoute => {
+                            return self.refuse(id, a, REFUSE_NO_ROUTE, LINE_NONE, k, did);
+                        }
+                        Matched::MethodMiss(n) => {
+                            let line = self.lines[n].line;
+                            return self.refuse(id, a, REFUSE_METHOD_MISS, line, k, did);
+                        }
+                        Matched::Line(n) => {
+                            let points = self.lines[n].points;
+                            if points & POINT_HEAD_BODY != 0 {
+                                Gate::Hold(n)
+                            } else if points & POINT_HEAD != 0 {
+                                Gate::Auth(n)
+                            } else {
+                                Gate::HandIn(n)
+                            }
+                        }
+                    };
+                    a.gate = to;
+                }
+                Gate::Hold(n) => {
+                    if a.held_over {
+                        // The size gate, before any verdict.
+                        let line = self.lines[n].line;
+                        return self.refuse(id, a, REFUSE_OVER_GATE, line, k, did);
+                    }
+                    if !a.held_whole {
+                        return;
+                    }
+                    a.gate = Gate::Auth(n);
+                }
+                Gate::Auth(n) => {
+                    let l = &self.lines[n];
+                    let (auth, line, body_point) =
+                        (l.auth, l.line, l.points & POINT_HEAD_BODY != 0);
+                    let seq = a.parked.take().unwrap_or_else(|| self.next_seq());
+                    let fields = field_lines(parts);
+                    let view = head_view(parts, &fields);
+                    let (point, body) = if body_point {
+                        (POINT_HEAD_BODY, Some(a.held.as_slice()))
+                    } else {
+                        (POINT_HEAD, None)
+                    };
+                    let answered = k.auth_call(seq, auth, a.unit, point, id, &view, body);
+                    drop(fields);
+                    match answered {
+                        Poll::Pending => {
+                            a.parked = Some(seq);
+                            did.parked = true;
+                            return;
+                        }
+                        Poll::Ready(Ok((flow, unit, names))) => {
+                            a.unit = unit;
+                            let stripped = a.parts.as_mut().map_or(Ok(()), |p| strip(p, &names));
+                            if stripped.is_err() {
+                                return fail(a, did);
+                            }
+                            if flow != FLOW_CONTINUE {
+                                return self.refuse(id, a, REFUSE_STOPPED, line, k, did);
+                            }
+                            a.gate = Gate::HandIn(n);
+                        }
+                        Poll::Ready(Err(_)) => return fail(a, did),
+                    }
+                }
+                Gate::HandIn(n) => {
+                    let (auth, line) = (self.lines[n].auth, self.lines[n].line);
+                    let seq = self.next_seq();
+                    let fields = field_lines(parts);
+                    let view = head_view(parts, &fields);
+                    let handed = k.hand_in(seq, auth, a.unit, line, id, &view);
+                    drop(fields);
+                    match handed {
+                        Ok((flow, unit)) => {
+                            a.unit = unit;
+                            if flow != FLOW_CONTINUE {
+                                return self.refuse(id, a, REFUSE_CHECK_FAILED, line, k, did);
+                            }
+                            go_up(id, a, out);
+                            did.moved = true;
+                        }
+                        Err(_) => return fail(a, did),
+                    }
+                }
+                Gate::Admitted | Gate::Refused | Gate::Failed => return,
+            }
+        }
+    }
+
+    /// Ask the kernel for request `id`'s refusal (`cause`, `line`) and frame it verbatim; nothing
+    /// goes up. No refusal from the kernel leaves the stream unanswered.
+    fn refuse(
+        &mut self,
+        id: u64,
+        a: &mut Answer,
+        cause: u32,
+        line: u32,
+        k: &mut dyn Kernel,
+        did: &mut Admitted,
+    ) {
+        let seq = self.next_seq();
+        a.held.zeroize();
+        // A request with no line has no unit (l.947: "A request that matches no line has no unit").
+        let unit = if line == LINE_NONE {
+            UnitRef::NONE
+        } else {
+            a.unit
+        };
+        match k.refuse(seq, unit, cause, line, id) {
+            Ok(r) if frame_refusal(a, r) => {
+                a.gate = Gate::Refused;
+                a.parts = None;
+                a.body = None;
+                did.moved = true;
+            }
+            _ => fail(a, did),
+        }
+    }
+}
+
+/// Leave request `a` unanswered: its answer's sender dropped, hyper ends the stream (HTTP/2) or
+/// the connection (HTTP/1.1) with no bytes of this transport's own.
+fn fail(a: &mut Answer, did: &mut Admitted) {
+    a.respond = None;
+    a.parts = None;
+    a.body = None;
+    a.held.zeroize();
+    a.gate = Gate::Failed;
+    did.moved = true;
+}
+
+/// Request `id` is admitted: its stripped head goes up, then any body held for its auth (whole),
+/// and the rest of its body follows as it arrives.
+fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
+    let Some(parts) = a.parts.take() else {
+        return;
+    };
+    out.push_back(head_piece(id, &parts));
+    if !a.held.is_empty() {
+        out.push_back(Piece::data(id, Bytes::copy_from_slice(&a.held)));
+        a.held.zeroize();
+    }
+    if a.held_whole {
+        out.push_back(Piece::end(id));
+        a.asked = true;
+    }
+    a.up = true;
+    a.gate = Gate::Admitted;
 }
 
 /// A request head as the frame the layer above reads: ONE field block (no pseudo-field, no
