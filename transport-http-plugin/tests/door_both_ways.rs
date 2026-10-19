@@ -951,12 +951,18 @@ impl AcceptHost {
     /// An accepted connection on a listener with guest list `lines`, the auth handle answered by
     /// `script` (`OpenIn::host`'s services table).
     fn open_with(ops: &'static Ops, lines: Vec<LineEntry>, script: Script) -> Self {
-        Self::open_on(ops, lines, script, false)
+        Self::open_on(ops, lines, script, |_| {})
     }
 
-    /// [`AcceptHost::open_with`] on a connection whose security the host states (`secured`: the
-    /// secure layer presented the host's certificate, `ConnFacts::local_certificate`) or not.
-    fn open_on(ops: &'static Ops, lines: Vec<LineEntry>, script: Script, secured: bool) -> Self {
+    /// [`AcceptHost::open_with`] on a connection whose `ConnFacts` `facts` fills, as the host's
+    /// secure layer states them.
+    fn open_on(
+        ops: &'static Ops,
+        lines: Vec<LineEntry>,
+        script: Script,
+        facts: fn(&mut ConnFacts),
+    ) -> Self {
+        let state = facts;
         let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
         SCRIPTS.lock().expect("scripts").insert(ctx, script);
         let tables = HostTables {
@@ -999,10 +1005,7 @@ impl AcceptHost {
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
-        if secured {
-            facts.local_certificate = s("the host's certificate, DER");
-            facts.agreed_protocol = s("http/1.1");
-        }
+        state(&mut facts);
         let mut i: BeginIn = z();
         i.side = SIDE_ACCEPT;
         i.facts = &facts;
@@ -2336,26 +2339,34 @@ fn refuse_the_connection(label: &str, ops: &'static Ops) {
 /// it, the host's statement is `BeginIn::facts` ("what connection security established"): a secure
 /// layer presents the host's certificate and agrees a protocol; a cleartext connection has neither.
 fn shows_the_scheme(label: &str, ops: &'static Ops) {
-    for (secured, want) in [(false, SCHEME_PLAIN), (true, SCHEME_SECURE)] {
+    let cases: [(&str, fn(&mut ConnFacts), u8); 3] = [
+        ("cleartext", |_| {}, SCHEME_PLAIN),
+        // Q128 readers A and B (r211, r212): a TLS client offering no ALPN and no certificate.
+        (
+            "TLS, SNI only",
+            |f| f.offered_name = s("busbar.test"),
+            SCHEME_SECURE,
+        ),
+        (
+            "TLS, ALPN agreed",
+            |f| f.agreed_protocol = s("http/1.1"),
+            SCHEME_SECURE,
+        ),
+    ];
+    for (secured, facts, want) in cases {
         let mut h = AcceptHost::open_on(
             ops,
             vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
             Script::default(),
-            secured,
+            facts,
         );
         assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
         let asked = h.asked();
         let [Asked::Auth { view: shown, .. }, Asked::HandIn { view, .. }] = &asked[..] else {
             panic!("{label}: an auth call, then the hand-in: {asked:?}");
         };
-        assert_eq!(
-            shown.scheme, want,
-            "{label}: secured {secured}: the auth's view"
-        );
-        assert_eq!(
-            view.scheme, want,
-            "{label}: secured {secured}: the hand-in's view"
-        );
+        assert_eq!(shown.scheme, want, "{label}: {secured}: the auth's view");
+        assert_eq!(view.scheme, want, "{label}: {secured}: the hand-in's view");
         h.close();
     }
 }
@@ -2399,6 +2410,90 @@ fn parks_on_its_own_ticket(label: &str, ops: &'static Ops) {
     assert_eq!(h.tickets(), vec![TICKET, TICKET], "{label}");
     assert!(seqs.len() == 2 && seqs[0] == seqs[1], "{label}: {seqs:?}");
     assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// THE DOOR OFFERS THE PEER POINT (Q128 reader B r212, coordinator ruling: POINT_PEER is served
+/// under the Peer rule): its Statement's offered-points record (`EXT_OFFERED_POINTS`) states Peer,
+/// Head and HeadBody, so the host boots a line whose auth needs Peer instead of refusing it.
+fn offers_the_peer_point(label: &str, door: *const Door) {
+    use busbar_contract::abi::auth::AuthPoints;
+    use busbar_contract::abi::transport::check::check_offered_points;
+    // SAFETY: the door's `'static` Statement and its `'static` extensions blob.
+    let ext = unsafe {
+        let st = &*(*door).statement;
+        if st.extensions.ptr.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(st.extensions.ptr, st.extensions.len)
+        }
+    };
+    assert_eq!(
+        check_offered_points(ext),
+        Ok(AuthPoints(POINT_PEER | POINT_HEAD | POINT_HEAD_BODY)),
+        "{label}"
+    );
+}
+
+/// THE PEER POINT, once per connection, before any request's head call (THE DESIGN §6 item 7):
+/// two requests on one connection, one peer call, made first.
+fn peer_once_per_connection(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(
+            6,
+            POINT_PEER | POINT_HEAD,
+            METHOD_POST,
+            "/v1/messages",
+            0,
+        )],
+        Script::default(),
+    );
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+    assert_eq!(
+        h.emit(1, b"content-length: 0\r\n", true, 204),
+        Outcome::Ready
+    );
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+    let points: Vec<u32> = h
+        .asked()
+        .iter()
+        .filter_map(|a| match a {
+            Asked::Auth { point, .. } => Some(*point),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(points, vec![POINT_PEER, POINT_HEAD, POINT_HEAD], "{label}");
+    assert_eq!(h.heads_up(), 2, "{label}");
+    h.close();
+}
+
+/// THE PEER RULE (busbar 9aff8cf7b7 `check_auth_call`: at the peer point "no field, no name and no
+/// byte, on either side"): the peer call carries no request, and a peer answer that names a line to
+/// strip is refused: the connection closes with no bytes and nothing goes up.
+fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(
+            6,
+            POINT_PEER | POINT_HEAD,
+            METHOD_POST,
+            "/v1/messages",
+            0,
+        )],
+        Script {
+            auth: VecDeque::from([(FLOW_CONTINUE, vec![("x-credential", FIELD_SENSITIVE)])]),
+            ..Script::default()
+        },
+    );
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+    let asked = h.asked();
+    assert!(
+        matches!(&asked[..], [Asked::Auth { point: POINT_PEER, view, body: None, .. }] if *view == View::default()),
+        "{label}: one peer call, carrying no request: {asked:?}"
+    );
+    assert_eq!(h.heads_up(), 0, "{label}: nothing went up");
+    assert!(h.out.is_empty(), "{label}: no bytes of the transport's own");
     h.close();
 }
 
@@ -2518,4 +2613,24 @@ fn the_auth_is_shown_the_scheme_the_connection_states() {
 #[test]
 fn a_pending_auth_call_parks_only_its_own_stream_on_its_own_ticket() {
     both(parks_on_its_own_ticket);
+}
+
+#[test]
+fn the_door_offers_the_peer_point_linked_and_dropped_in() {
+    let (_, lib) = dropped();
+    // SAFETY: the one exported symbol, a `DoorFn`.
+    let dropped: libloading::Symbol<'_, extern "C" fn() -> *const Door> =
+        unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
+    offers_the_peer_point("linked", busbar_transport_http_plugin::door::door());
+    offers_the_peer_point("dropped", dropped());
+}
+
+#[test]
+fn the_peer_point_is_called_once_per_connection_before_any_head() {
+    both(peer_once_per_connection);
+}
+
+#[test]
+fn a_peer_answer_naming_lines_is_refused_and_nothing_goes_up() {
+    both(a_peer_answer_naming_lines_is_refused);
 }
