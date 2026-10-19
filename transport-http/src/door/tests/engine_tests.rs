@@ -494,6 +494,67 @@ fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
     );
 }
 
+/// The HTTP/2 frame types in `wire` (no connection preface): what a connection wrote.
+fn h2_frame_types(wire: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 9 <= wire.len() {
+        let len =
+            usize::from(wire[i]) << 16 | usize::from(wire[i + 1]) << 8 | usize::from(wire[i + 2]);
+        out.push(wire[i + 3]);
+        i += 9 + len;
+    }
+    out
+}
+
+/// RED (Q128 transport-http, the refused h2 stream): a stream refused partway through its request
+/// message stays refused until the host's end of that message. The rest of the message, arriving
+/// in later emits, is never read as a fresh request on the same stream: a fresh request there
+/// would go upstream with a head the auth never saw. RED on the framing that forgot the refused
+/// stream and parsed its remaining bytes as a new message.
+#[test]
+fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    // The far end's SETTINGS: the connection is up, so a request handed to it goes out.
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    let _preface = f.take_wire(usize::MAX);
+    // Refused partway: bytes past the stated length.
+    let r = f.emit(1, b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX", 0, 0);
+    f.drive(0, 0);
+    assert!(
+        r.is_ok(),
+        "an h2 stream's refusal is a failure piece: {r:?}"
+    );
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 1 && p.failed),
+        "stream 1 is refused"
+    );
+    f.pieces().clear();
+    // The rest of the same message, shaped like a request of its own.
+    let _ = f.emit(
+        1,
+        b"GET /never-authed HTTP/1.1\r\nx-injected: 1\r\n\r\n",
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    let wire = f.take_wire(usize::MAX);
+    assert!(
+        !h2_frame_types(&wire).contains(&1),
+        "no HEADERS frame goes out for the rest of a refused message: {:?}",
+        String::from_utf8_lossy(&wire)
+    );
+    // The control: a request on a fresh stream does go out, as a HEADERS frame this reading sees.
+    f.emit(3, b"GET /ok HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+    f.drive(0, 0);
+    assert!(
+        h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
+        "a fresh stream's request goes out"
+    );
+}
+
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
 /// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
 /// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8
