@@ -166,7 +166,8 @@ struct Answer {
     parts: Option<http::request::Parts>,
     /// Where the request stands on its way through the guest list.
     gate: Gate,
-    /// The body held for a `HeadBody` auth; zeroised once handed on.
+    /// The body held for a `HeadBody` auth; zeroised once handed on, and every allocation it
+    /// outgrew zeroised as it grew ([`extend_wiped`]).
     held: Vec<u8>,
     /// The held body is whole.
     held_whole: bool,
@@ -288,7 +289,9 @@ pub struct Accepted {
     leftover: Option<VecDeque<u8>>,
     /// Every byte the far side sent, kept until the connection's first answer: a connection
     /// nothing answered yet is handed over AS SENT, its upgrade request first, for the upgrade
-    /// framer to answer itself (`adopt`). Zeroised when it is let go (it holds credential lines).
+    /// framer to answer itself (`adopt`). Zeroised when it is let go (it holds credential lines),
+    /// and every allocation it outgrew zeroised as it grew ([`extend_wiped`]). The header values the
+    /// strip removes are views into hyper's own read buffer, which is hyper's, as in v1.5.5.
     raw: Option<Vec<u8>>,
     /// The listener's guest list, in match order.
     lines: Vec<Line>,
@@ -379,7 +382,7 @@ impl Accepted {
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
         let h2 = self.raw.as_mut().is_some_and(|raw| {
-            raw.extend_from_slice(bytes);
+            extend_wiped(raw, bytes);
             raw.starts_with(H2_PREFACE)
         });
         // An HTTP/2 connection is never handed over (`detach`): it keeps no copy (Q128 reader A
@@ -931,7 +934,7 @@ fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
             Poll::Pending => return,
             Poll::Ready(Some(Ok(f))) => {
                 if let Ok(d) = f.into_data() {
-                    a.held.extend_from_slice(&d);
+                    extend_wiped(&mut a.held, &d);
                 }
                 if a.held.len() as u64 > limit {
                     let_held_go(&mut a.held);
@@ -1296,6 +1299,20 @@ impl Accepted {
         a.body = None;
         did.moved = true;
     }
+}
+
+/// Append `bytes` to `buf`, a buffer of the transport's own that may hold credential bytes: when
+/// they do not fit, the bytes move to a new allocation and the one outgrown is zeroised before it
+/// is freed, so no copy is freed unzeroised (Q128 reader B r212).
+fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
+    if buf.capacity() - buf.len() < bytes.len() {
+        let want = (buf.len() + bytes.len()).max(buf.capacity().saturating_mul(2));
+        let mut grown = Vec::with_capacity(want);
+        grown.extend_from_slice(buf);
+        buf.zeroize();
+        *buf = grown;
+    }
+    buf.extend_from_slice(bytes);
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive

@@ -96,7 +96,9 @@ use std::time::Duration;
 use std::task::Poll;
 
 use busbar_contract::abi::host::service::{AuthRef, UnitRef};
-use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
+use busbar_contract::abi::mechanism::call::{
+    AbiStr, Blob, InHead, OutHead, Outcome, BLOB_OCTETS, FLAG_RESUME,
+};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
@@ -114,10 +116,10 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, FAULT_CALLER,
-    FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL,
-    STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS,
-    YIELD_ENDED, YIELD_MORE,
+    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, EXT_OFFERED_POINTS,
+    FAULT_CALLER, FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG,
+    SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
+    STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
@@ -316,10 +318,37 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
+/// THE AUTH POINTS THIS DOOR OFFERS (THE DESIGN §6 "Auth points and guest lists" item 1: "A
+/// transport declares the points it offers"; Q128 reader B r212, coordinator ruling): `Peer` (once
+/// per connection, before any head, under the Peer rule: the call carries no request and its
+/// answer no field or name, `door::accept`), `Head` and `HeadBody`. Stated in the Statement's
+/// `extensions` under the transport ABI's offered-points key ([`EXT_OFFERED_POINTS`]); with no
+/// record the host reads `{Head, HeadBody}` and refuses at boot a line whose auth needs `Peer`.
+const OFFERED_POINTS: u32 = busbar_contract::abi::auth::POINT_PEER
+    | busbar_contract::abi::auth::POINT_HEAD
+    | busbar_contract::abi::auth::POINT_HEAD_BODY;
+
+const OFFERED_POINTS_LEN: usize = busbar_contract::abi::mechanism::extensions::entry_len(
+    EXT_OFFERED_POINTS,
+    &OFFERED_POINTS.to_le_bytes(),
+);
+
+/// The Statement's `extensions` blob: the offered-points record, its one entry.
+const EXTENSIONS: &[u8] = &busbar_contract::abi::mechanism::extensions::entry::<OFFERED_POINTS_LEN>(
+    EXT_OFFERED_POINTS,
+    &OFFERED_POINTS.to_le_bytes(),
+);
+
 pub(crate) const STATEMENT: Statement = Statement {
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
+    extensions: Blob {
+        ptr: EXTENSIONS.as_ptr(),
+        len: EXTENSIONS.len(),
+        fmt: BLOB_OCTETS,
+        flags: 0,
+    },
     ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
@@ -1196,13 +1225,18 @@ fn step(
 /// THE SCHEME OF AN ACCEPTED CONNECTION as the host states it (`HeadView::scheme`; busbar e858ecc:
 /// `SCHEME_UNDECLARED` is refused off the peer point, and a transport never derives the scheme
 /// from its own wire). Until `BeginIn` states it outright, the host's statement is
-/// `BeginIn::facts`, "what connection security established": a secure layer presents the host's
-/// certificate (`ConnFacts::local_certificate`) and agrees a protocol in its handshake
-/// (`ConnFacts::agreed_protocol`, this framer's offer being `http/1.1`, [`ACCEPT_OFFER`]); a
-/// cleartext connection states neither. Never `SCHEME_UNDECLARED`.
+/// `BeginIn::facts`, "what connection security established", and every fact in it that only a
+/// secure layer states marks the connection secured (Q128 readers A and B, r211/r212): the name
+/// the client asked for in its handshake (`offered_name`, its SNI), the protocol the handshake
+/// agreed (`agreed_protocol`; this framer's offer is `http/1.1`, [`ACCEPT_OFFER`]), or the
+/// client's certificate (`peer_fingerprint`). Never ALPN alone, and never the host's own
+/// certificate, which the connector does not state on a stream listener. A cleartext connection
+/// states none of them. Never `SCHEME_UNDECLARED`.
 fn accepted_scheme(facts: Option<busbar_contract::abi::transport::ConnFacts>) -> u8 {
     use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
-    let secured = facts.is_some_and(|f| f.local_certificate.len != 0 || f.agreed_protocol.len != 0);
+    let secured = facts.is_some_and(|f| {
+        f.offered_name.len != 0 || f.agreed_protocol.len != 0 || f.peer_fingerprint.len != 0
+    });
     if secured {
         SCHEME_SECURE
     } else {
