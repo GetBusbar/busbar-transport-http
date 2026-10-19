@@ -561,3 +561,22 @@ fn the_wire_head_is_the_head_the_auth_saw() {
         "{bare:?}"
     );
 }
+
+/// RED (THE DESIGN §6 step 5: nothing joins the head after the auth): a chunked request's trailer
+/// section is not folded into the head and sent as header fields; a request carrying trailers is
+/// refused. RED on the framing that appended the trailers to the head.
+#[test]
+fn a_request_with_trailers_is_refused_not_folded_into_its_head() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nx-late: 1\r\n\r\n",
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).to_ascii_lowercase();
+    assert!(r.is_err(), "a request with trailers is refused: {wire:?}");
+    assert!(!wire.contains("x-late"), "{wire:?}");
+}
