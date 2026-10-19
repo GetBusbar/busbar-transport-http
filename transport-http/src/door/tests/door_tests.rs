@@ -354,9 +354,12 @@ fn the_entry_claims_http_https_and_sse() {
     assert_eq!(https, http);
 }
 
-/// The tail states no fact: bit 1 is retired (spec l.3779), and the contract refuses a tail stating
-/// it. The rule it named is proven by `the_head_on_the_wire_is_every_line_the_auth_saw`.
+/// RED (coordinator ruling L1; contract `FACT_ACCEPTS`/`FACT_DIALS`/`FACT_DETACHES`/`FACT_ADOPTS`):
+/// the tail states exactly the ops this door serves. At this commit that is dialling alone; it states
+/// no retired bit (bit 1, spec l.3779; the rule it named is proven by
+/// `the_head_on_the_wire_is_every_line_the_auth_saw`). RED on the tail that declared nothing.
 #[test]
-fn the_tail_states_no_retired_fact() {
-    assert_eq!(crate::meta::TAIL.facts, 0);
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::FACT_DIALS;
+    assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
 }
