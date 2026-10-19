@@ -133,6 +133,8 @@ pub struct Framing {
     scheme: u8,
     /// Each stream's unit, as the host stated it on its emit (`EmitIn::unit`).
     units: Vec<(u64, UnitRef)>,
+    /// Each stream's opening body length, as the host stated it (`EmitIn::body_len`).
+    lengths: Vec<(u64, u64)>,
     /// The last completion sequence number issued.
     seq: u32,
 }
@@ -263,6 +265,7 @@ impl Framing {
             binding: Binding::NONE,
             scheme: SCHEME_PLAIN,
             units: Vec::new(),
+            lengths: Vec::new(),
             seq: 0,
         })
     }
@@ -285,6 +288,17 @@ impl Framing {
         match self.units.iter_mut().find(|(s, _)| *s == stream) {
             Some(u) => u.1 = unit,
             None => self.units.push((stream, unit)),
+        }
+    }
+
+    /// The opening body's length the host states for `stream`'s request (`EmitIn::body_len` with
+    /// `body_len_known`): a head that states none is framed by it, the framer's own length line
+    /// written before the auth is called (the transport ABI: "so a framer whose head states its
+    /// body's length writes that line itself").
+    pub fn length_for(&mut self, stream: u64, len: u64) {
+        match self.lengths.iter_mut().find(|(s, _)| *s == stream) {
+            Some(l) => l.1 = len,
+            None => self.lengths.push((stream, len)),
         }
     }
 
@@ -609,6 +623,20 @@ impl Framing {
             )));
         };
         buf.extend_from_slice(bytes);
+        // A head that states no length, its body's length stated by the host: the framer writes the
+        // length line into the head itself, once, before the message is read (and before the auth).
+        if let Some(i) = self.lengths.iter().position(|(s, _)| *s == stream) {
+            if let Some(end) = memchr::memmem::find(buf, b"\r\n\r\n") {
+                let head = buf[..end].to_ascii_lowercase();
+                if memchr::memmem::find(&head, b"\r\ncontent-length:").is_none() {
+                    let line = format!("content-length: {}\r\n", self.lengths[i].1);
+                    let tail = buf.split_off(end + 2);
+                    buf.extend_from_slice(line.as_bytes());
+                    buf.extend_from_slice(&tail);
+                }
+                self.lengths.swap_remove(i);
+            }
+        }
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {

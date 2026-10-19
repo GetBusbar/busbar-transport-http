@@ -862,19 +862,15 @@ impl SafeSlot for Begin {
         };
         // THE BINDING'S AUTH (THE DESIGN §6 item 5, l.964-967; `BeginIn::auth` at
         // `BeginIn::points`): called at the peer point here, once, and at the head point on each
-        // request's emit, on the head the framer finalised. The scheme it is shown is the
-        // target's (`https` = secured), the host's own statement until `BeginIn` states it.
+        // request's emit, on the head the framer finalised.
         let binding = engine::Binding {
             auth: i.auth,
             points: i.points,
         };
-        let scheme = if as_http(target.parse::<http::Uri>().unwrap_or_default()).scheme_str()
-            == Some("https")
-        {
-            busbar_contract::abi::host::service::SCHEME_SECURE
-        } else {
-            busbar_contract::abi::host::service::SCHEME_PLAIN
-        };
+        // The scheme the auth is shown is the one the HOST states for the dial (busbar step 2,
+        // `BeginIn::scheme`: "on `SIDE_DIAL` from the route's upstream"), never derived from the
+        // target. The host refuses a `begin` stating none.
+        let scheme = i.scheme;
         let mut framing = framing.with_binding(binding, scheme);
         let token = inst.next.fetch_add(1, Ordering::Relaxed);
         let mut kernel = HostKernel {
@@ -958,8 +954,12 @@ impl SafeSlot for Emit {
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_status(&i, false).map_err(refused_status)?;
-                    // The stream's unit, carried on every auth call for its request.
+                    // The stream's unit, carried on every auth call for its request, and the
+                    // opening body's length where the host states it (`EmitIn::body_len`).
                     f.unit_for(i.stream, i.unit);
+                    if i.body_len_known == 1 {
+                        f.length_for(i.stream, i.body_len);
+                    }
                     f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
                 }
                 Held::Accept(a) => {
