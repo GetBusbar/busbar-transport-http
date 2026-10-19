@@ -709,6 +709,100 @@ fn the_wire_head_is_the_head_the_auth_saw() {
     );
 }
 
+/// What an HTTP/2 far end reads off `wire`, a client connection's bytes: its first request's
+/// field lines in order, pseudo-fields aside, and its `:authority`.
+fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
+    use tokio::io::AsyncWriteExt;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client.write_all(&wire).await.expect("the wire");
+        let mut conn = h2::server::handshake(server).await.expect("handshake");
+        let (req, _answer) = conn
+            .accept()
+            .await
+            .expect("a request")
+            .expect("an HTTP/2 request");
+        let lines = req
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let authority = req.uri().authority().map(ToString::to_string);
+        drop(client);
+        (lines, authority.unwrap_or_default())
+    })
+}
+
+/// RED (ruling 23; BUSBAR-1.6.0.md l.3779, §4 item 5: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH
+/// HAS RUN): an auth that signs the whole head sees every line on the wire. The head the auth saw
+/// (its own line, the plane's fields, the framer's stated lines, the host's length line) is the
+/// head a far end reads, line for line and in order, on HTTP/1.1 and on HTTP/2 (where the `host`
+/// line is the `:authority`). The one exception, an empty payload-method body on HTTP/2, is
+/// `meta::TAIL`'s and pinned in `tests/h2_parity.rs`; this cell's body is not empty.
+#[test]
+fn the_head_on_the_wire_is_every_line_the_auth_saw() {
+    let seen: &[(&str, &[u8])] = &[
+        ("method", b"POST"),
+        ("path", b"/v1/x"),
+        ("authorization", b"Bearer signed-over-the-whole-head"),
+        ("content-type", b"application/json"),
+        ("x-plane", b"1"),
+        ("accept", b"*/*"),
+        ("host", b"127.0.0.1:9"),
+        ("content-length", b"2"),
+    ];
+    let lines: Vec<(String, String)> = seen[2..]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), String::from_utf8_lossy(v).into_owned()))
+        .collect();
+    let message = crate::transport::render_envelope(seen, b"hi").expect("render");
+
+    // HTTP/1.1: the head, line for line.
+    let wire = h1_wire(&message);
+    let head: Vec<(String, String)> = wire
+        .split("\r\n\r\n")
+        .next()
+        .expect("a head")
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.to_owned()))
+        .collect();
+    assert_eq!(
+        head, lines,
+        "h1: the wire head is every line the auth saw, and no other"
+    );
+
+    // HTTP/2: the far end's reading of the door's own frames.
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let mut wire = f.take_wire(usize::MAX);
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    f.emit(1, &message, true, 0, 0).expect("emit");
+    f.drive(0, 0);
+    wire.extend(f.take_wire(usize::MAX));
+    let (got, authority) = h2_far_end_reads(wire);
+    let want: Vec<(String, String)> = lines.iter().filter(|(k, _)| k != "host").cloned().collect();
+    assert_eq!(
+        got, want,
+        "h2: the field lines are every line the auth saw, and no other"
+    );
+    assert_eq!(
+        authority, "127.0.0.1:9",
+        "h2: the auth's host line is the :authority"
+    );
+}
+
 /// RED (THE DESIGN §6 step 5: nothing joins the head after the auth): a chunked request's trailer
 /// section is not folded into the head and sent as header fields; a request carrying trailers is
 /// refused, with the chunked framing that carries them, and no trailer reaches the wire. RED on the
