@@ -106,10 +106,21 @@ fn v155(
                 .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(srv), svc)
                 .await;
         });
+        // The request, and NO half-close: v1.5.5's builder leaves `half_close` off, so a read end
+        // before the answer is written closes the connection with nothing written (both sides of
+        // this comparison then read as empty and agree vacuously). The answer is read until the
+        // connection goes quiet.
         cli.write_all(request).await.expect("request");
-        cli.shutdown().await.expect("half-close");
         let mut wire = Vec::new();
-        cli.read_to_end(&mut wire).await.expect("answer");
+        let mut buf = [0_u8; 4096];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), cli.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            wire.extend_from_slice(&buf[..n]);
+        }
         server.abort();
         wire
     })
@@ -143,7 +154,7 @@ fn door(
         .expect("head");
     assert!(!a.answers_head(stream), "the head went");
     a.emit(stream, body, true, 0).expect("body");
-    a.ingest(&[], true);
+    // The answer goes out before any read end, as on the v1.5.5 side.
     a.drive(2 * SEC);
     a.take_wire(usize::MAX)
 }
@@ -186,6 +197,10 @@ fn a_sized_answer_is_the_bytes_v155_wrote() {
     ];
     let ours = undated(door(GET, 200, &headers, b"{\"ok\":true}", true));
     let theirs = undated(v155(GET, 200, &headers, b"{\"ok\":true}", true));
+    assert!(
+        theirs.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "v1.5.5 answered"
+    );
     assert_eq!(
         String::from_utf8_lossy(&ours),
         String::from_utf8_lossy(&theirs)
