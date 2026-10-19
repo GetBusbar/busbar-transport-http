@@ -56,7 +56,10 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // method (hyper's `method_has_defined_payload_semantics`: any but GET, HEAD, DELETE and
     // CONNECT), an EMPTY body. The host states no length for an empty body (1.5.5's HTTP/1.1 wire
     // carries none), and the h2 framing adds `content-length: 0` at send, exactly as 1.5.5's client
-    // (reqwest 0.12 over hyper 1.11) did. That line is added after the auth, and it is not one an
+    // (reqwest 0.12 over hyper 1.11.0, v1.5.5 Cargo.lock) did: hyper `src/proto/h2/client.rs`
+    // l.710-713, `set_content_length_if_missing` when the body's exact size is 0 and
+    // `method_has_defined_payload_semantics`. A 1.5.5 parity exception, recorded as the
+    // coordinator's ruling (D) on Q128 transport-http. That line is added after the auth, and it is not one an
     // auth could sign: the only fleet style handed the head (`STYLE_NEEDS_HEADERS`, sigv4) signs a
     // fixed set that never names `content-length`, and every other style is handed no head at all.
     // Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's client), and busbar-auth-sigv4's

@@ -134,7 +134,8 @@ pub(crate) fn request_target(
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
 ///
 /// The two endings are the wire's own: a declared `Content-Length` reached, or a message that
-/// declares no length and therefore carries no body at all. A message framed by a transfer coding is
+/// declares no length and therefore carries no body at all. A byte past either is refused
+/// (`Framing`). A message framed by a transfer coding is
 /// refused (`Framing`), whatever the coding: the host states the length line before the auth (THE
 /// DESIGN §6 step 5) and no host path renders a `transfer-encoding`, so such a request has no 1.5.5
 /// counterpart, and carrying it would put a framing on the wire the auth never saw.
@@ -170,7 +171,12 @@ pub(crate) fn complete_message(
     if rest.len() < declared {
         return Ok(None);
     }
-    let body = rest[..declared].to_vec();
+    // Bytes past the declared length are bytes the head does not describe: refused, never cut to
+    // the length with the rest dropped (the length is the one the host stated before the auth).
+    if rest.len() > declared {
+        return Err(TransportError::Framing);
+    }
+    let body = rest.to_vec();
 
     // Whole: the head is spent with the message it belonged to, so the next one parses its own.
     let head = cache.head.take().expect("set just above");
