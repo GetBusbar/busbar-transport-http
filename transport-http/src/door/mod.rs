@@ -57,8 +57,9 @@
 //! when configured, and the ALPN offer is the framer's. `begin` on [`SIDE_ACCEPT`] serves the
 //! connection as v1.5.5's data listener did ([`accept`]): hyper's auto server, HTTP/2 by prior
 //! knowledge when the far side opens with its preface and HTTP/1.1 otherwise, HTTP/1's header read
-//! bounded at 30 s, upgrades on (v1.5.5 `crates/busbar/src/tls.rs`:560-566, :620). v1.5.5's TLS
-//! listener offered `http/1.1` alone (`tls.rs`:242); [`ACCEPT_OFFER`] is that offer. Each request
+//! bounded at 30 s, upgrades on (v1.5.5 `crates/busbar/src/tls.rs`:560-566, :620). Its TLS offer is
+//! `h2, http/1.1` ([`ACCEPT_OFFER`]), the owner's signed change from v1.5.5's `http/1.1` alone
+//! (Q137, `BUSBAR-1.6.0.md` l.5137-5138; PB-69). Each request
 //! goes up as a stream (its head a field block with its method, target and authority in the head
 //! slots, then its body); its answer comes down through `emit`, the first emit its head with the
 //! status in `EmitIn::status` (`BUSBAR-1.6.0.md` l.4913), the later ones its body. `detach` hands
@@ -624,10 +625,14 @@ impl SafeSlot for Refuse {
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
 /// THE ACCEPTED SIDE'S PROTOCOL OFFER (ALPN) under connection security, in the handshake's
-/// ProtocolNameList encoding: `http/1.1` alone, v1.5.5's TLS listener's (`crates/busbar/src/tls.rs`
-/// :242, "http/1.1 only"). A cleartext connection has no handshake: HTTP/2 there is the far side's
-/// prior knowledge, read off its preface.
-pub const ACCEPT_OFFER: &[u8] = b"\x08http/1.1";
+/// ProtocolNameList encoding: `h2, http/1.1`, most preferred first. OWNER RULING Q137
+/// (`BUSBAR-1.6.0.md` l.5137-5138; parity binding PB-69): "a `tls:` listener offers ALPN `h2,
+/// http/1.1` (1.5.5: `http/1.1` alone), a signed customer-visible change". A client that offers
+/// `http/1.1` alone, or no ALPN, is served HTTP/1.1 exactly as v1.5.5's listener served it; one that
+/// agrees `h2` opens with the HTTP/2 preface, which hyper's auto server reads ([`accept`]). A
+/// cleartext connection has no handshake: HTTP/2 there is the far side's prior knowledge, read off
+/// its preface.
+pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
 /// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding.
 const OFFER_H2_H1: &[u8] = b"\x02h2\x08http/1.1";
@@ -1228,7 +1233,7 @@ fn step(
 /// `BeginIn::facts`, "what connection security established", and every fact in it that only a
 /// secure layer states marks the connection secured (Q128 readers A and B, r211/r212): the name
 /// the client asked for in its handshake (`offered_name`, its SNI), the protocol the handshake
-/// agreed (`agreed_protocol`; this framer's offer is `http/1.1`, [`ACCEPT_OFFER`]), or the
+/// agreed (`agreed_protocol`, from this framer's offer, [`ACCEPT_OFFER`]), or the
 /// client's certificate (`peer_fingerprint`). Never ALPN alone, and never the host's own
 /// certificate, which the connector does not state on a stream listener. A cleartext connection
 /// states none of them. Never `SCHEME_UNDECLARED`.
