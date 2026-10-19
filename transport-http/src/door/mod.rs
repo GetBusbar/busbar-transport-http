@@ -49,9 +49,11 @@
 //! `sdk::Instance<Instance>`, host-lent bytes and host buffers go through `Lent` and `HostBuf`, and
 //! this crate holds no `unsafe`.
 //!
-//! The accepted side is not this door's: an ingress request is served by the kernel's own door,
-//! so `begin` for [`SIDE_ACCEPT`] is refused, and so are `refuse`, `detach`, `adopt` and every
-//! carrier op.
+//! The accepted side is not this door's at this commit: an ingress request is served by the root's
+//! transitional listener, so `begin` for [`SIDE_ACCEPT`] is refused, and so are `refuse`, `detach`,
+//! `adopt` and every carrier op. The accepted side (THE DESIGN §3 l.475-478: "the ALPN offer is the
+//! framer's") is busbar-transport-http#24 (INBOUND-LISTEN, ARCHITECT ruling 2026-10-17: an accept
+//! side is required for 1.6.0), its own change.
 
 pub mod dest_head;
 pub mod engine;
