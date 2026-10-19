@@ -470,3 +470,30 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
         String::from_utf8_lossy(&wire)
     );
 }
+
+/// RED (1.5.5 parity, Q128 transport-http LOW): the dial's authority is the one 1.5.5's URL parser
+/// (WHATWG, reqwest 0.12) sent: the host lower-cased and the scheme's own port dropped, so
+/// `:authority` on HTTP/2 and the stated `host` line on HTTP/1.1 are one string. RED on the
+/// normalisation that only rewrote IPv4 spellings.
+#[test]
+fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
+    for (dial, authority) in [
+        ("http://API.Example.COM:80/x", "api.example.com"),
+        ("https://API.Example.COM:443/x", "api.example.com"),
+        ("https://API.Example.COM:8443/x", "api.example.com:8443"),
+        ("http://127.1:80/x", "127.0.0.1"),
+        ("http://Peer.Test:8080/x", "peer.test:8080"),
+    ] {
+        let uri = canonical_host(dial.parse().expect("a URL"));
+        assert_eq!(
+            uri.authority().map(http::uri::Authority::as_str),
+            Some(authority),
+            "{dial}"
+        );
+        assert!(
+            client_defaults(&dial.parse().expect("a URL"))
+                .contains(&format!("host: {authority}\r\n")),
+            "{dial}: the host line is the same string"
+        );
+    }
+}
