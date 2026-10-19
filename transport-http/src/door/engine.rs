@@ -408,6 +408,8 @@ impl Owed for Framing {
 /// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
 /// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
 fn canonical_host(dial: http::Uri) -> http::Uri {
+    // An `sse` target is its `http` twin (`super::as_http`).
+    let dial = super::as_http(dial);
     let Some(host) = dial.host() else {
         return dial;
     };

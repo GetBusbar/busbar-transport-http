@@ -623,6 +623,22 @@ fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static 
     }
 }
 
+/// AN `sse` TARGET AS ITS `http` TWIN (BUSBAR-1.6.0.md l.584: "http claims `http`, `https` and
+/// `sse`"; Q128 reader B, coordinator ruling: the claim kept, framed exactly as `http`). An `sse`
+/// stream is an HTTP response body read as events (`crate` docs), so its target is the `http` one
+/// with the same authority, path and query: plain, the scheme's own port 80, the same request
+/// target, `host` line and protocol offer, and on HTTP/2 an `http` `:scheme`. v1.5.5 had no `sse`
+/// target (its one `sse` reading was an `http(s)` request's `alt=sse` query), so nothing it sent
+/// moves. Any other target is returned as it is.
+pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
+    if uri.scheme_str() != Some(crate::meta::SSE_KEY) {
+        return uri;
+    }
+    let mut parts = uri.clone().into_parts();
+    parts.scheme = Some(http::uri::Scheme::HTTP);
+    http::Uri::from_parts(parts).unwrap_or(uri)
+}
+
 /// What `locate` answers for `target`: whether it is secured, the authority to dial (the host as
 /// the URL writes it, so the connector's destination guard judges the spelling the operator wrote),
 /// and the name offered to and verified against the far end ([`offered_name`]).
@@ -630,6 +646,7 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     let Some(uri) = std::str::from_utf8(target)
         .ok()
         .and_then(|t| t.parse::<http::Uri>().ok())
+        .map(as_http)
     else {
         return Err("locate: the target is not a URL");
     };
