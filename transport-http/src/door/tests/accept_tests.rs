@@ -375,3 +375,53 @@ fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
         "an HTTP/2 connection"
     );
 }
+
+/// THE COPY KEPT FOR A HAND-OVER AS SENT is bounded and kept only while a hand-over is possible
+/// (Q128 reader A finding 1; THE DESIGN §1 l.199-201, a bound on live work is a refusal at
+/// admission): an HTTP/2 connection is never handed over, so it keeps none.
+#[test]
+fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
+    let mut a = accepted();
+    let _ = a.ingest(H2_PREFACE, false);
+    // An empty SETTINGS frame, then PINGs: frames that are answered by hyper, never by the host.
+    let _ = a.ingest(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", false);
+    for _ in 0..64 {
+        let _ = a.ingest(b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingping", false);
+    }
+    run(&mut a, SEC);
+    assert!(a.raw.is_none(), "an h2 connection keeps no copy");
+}
+
+/// A request admitted without an upgrade line makes a hand-over as sent impossible: the copy goes.
+#[test]
+fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
+    let mut a = accepted();
+    let _ = a.ingest(GET, false);
+    run(&mut a, SEC);
+    assert_eq!(up(&mut a).heads.len(), 1, "the request went up");
+    assert!(a.raw.is_none(), "no hand-over is possible: no copy is kept");
+}
+
+/// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
+/// request's head is read under): past it the connection is refused, not grown.
+#[test]
+fn a_copy_past_the_head_limit_refuses_the_connection() {
+    const HEAD_LIMIT: usize = 8192 + 4096 * 100;
+    let mut a = accepted();
+    let _ = a.ingest(
+        b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    assert_eq!(up(&mut a).heads.len(), 1, "the upgrade request went up");
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..8 {
+        let _ = a.ingest(&chunk, false);
+    }
+    run(&mut a, SEC);
+    assert!(
+        a.raw.as_ref().map_or(0, Vec::len) <= HEAD_LIMIT,
+        "the copy never grows past the head limit"
+    );
+    assert!(a.ended(), "past the limit the connection is refused");
+}
