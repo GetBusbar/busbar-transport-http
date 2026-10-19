@@ -1292,9 +1292,15 @@ impl Accepted {
         } else {
             a.unit
         };
-        let framed = k
-            .refuse(seq, unit, cause, line, id, &HeadViewArgs::default())
-            .is_ok_and(|r| frame_refusal(a, r));
+        // The request being refused, as decoded (busbar step 2, `UnitRefuseIn::request`), with the
+        // connection's scheme: for every cause, the no-route one included.
+        let fields = a.parts.as_ref().map(field_lines).unwrap_or_default();
+        let view = a.parts.as_ref().map_or_else(HeadViewArgs::default, |p| {
+            head_view(p, &fields, self.scheme)
+        });
+        let answered = k.refuse(seq, unit, cause, line, id, &view);
+        drop(fields);
+        let framed = answered.is_ok_and(|r| frame_refusal(a, r));
         if !framed {
             return fail(a, did);
         }

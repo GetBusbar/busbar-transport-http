@@ -826,7 +826,12 @@ impl SafeSlot for Begin {
             // READY, so a failed begin leaves no entry the host holds no token for. Nothing is
             // admitted at `begin` (no request is decoded yet); the peer point is called on the
             // connection's first drive with bytes, before any request is admitted.
-            let scheme = accepted_scheme(i.facts().map(|f| *f.get()));
+            // The listener's scheme, as the HOST states it (busbar step 2, `BeginIn::scheme`: "on
+            // `SIDE_ACCEPT` ... from the listener (whether the connector terminated connection
+            // security on it)"): copied into every request view the auth is shown, never inferred
+            // from the handshake's facts (Q128 r232 LOW 2). The host refuses a `begin` stating
+            // none.
+            let scheme = i.scheme;
             let mut h =
                 Held::Accept(Accepted::accept(i.sink.now_monotonic_ns, lines).with_scheme(scheme));
             let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
@@ -1225,28 +1230,6 @@ fn step(
         }
     }
     Outcome::Ready
-}
-
-/// THE SCHEME OF AN ACCEPTED CONNECTION as the host states it (`HeadView::scheme`; busbar e858ecc:
-/// `SCHEME_UNDECLARED` is refused off the peer point, and a transport never derives the scheme
-/// from its own wire). Until `BeginIn` states it outright, the host's statement is
-/// `BeginIn::facts`, "what connection security established", and every fact in it that only a
-/// secure layer states marks the connection secured (Q128 readers A and B, r211/r212): the name
-/// the client asked for in its handshake (`offered_name`, its SNI), the protocol the handshake
-/// agreed (`agreed_protocol`, from this framer's offer, [`ACCEPT_OFFER`]), or the
-/// client's certificate (`peer_fingerprint`). Never ALPN alone, and never the host's own
-/// certificate, which the connector does not state on a stream listener. A cleartext connection
-/// states none of them. Never `SCHEME_UNDECLARED`.
-fn accepted_scheme(facts: Option<busbar_contract::abi::transport::ConnFacts>) -> u8 {
-    use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
-    let secured = facts.is_some_and(|f| {
-        f.offered_name.len != 0 || f.agreed_protocol.len != 0 || f.peer_fingerprint.len != 0
-    });
-    if secured {
-        SCHEME_SECURE
-    } else {
-        SCHEME_PLAIN
-    }
 }
 
 /// THE HOST AUTH HANDLE as the accepted side calls it: the SDK's `Services` wrappers, each call
