@@ -66,7 +66,10 @@ pub(crate) fn render_envelope(
     // The check is before the first byte is written, so nothing half-built ever reaches the
     // arena.
     let clean = |v: &[u8]| !v.iter().any(|b| matches!(b, b'\r' | b'\n' | 0));
-    if !clean(method) || !clean(path) {
+    // The request line is `METHOD SP target SP version`: a method that is not an RFC 9110 token, or
+    // a target with a space in it, is a line the framing's own reading of it refuses, so it is
+    // refused here, before anything is rendered, not answered READY and refused at `emit`.
+    if !is_token(method) || !clean(path) || path.contains(&b' ') {
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
     for (name, value) in fields {
