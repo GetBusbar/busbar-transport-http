@@ -775,7 +775,9 @@ impl SafeSlot for Begin {
             // READY, so a failed begin leaves no entry the host holds no token for. Nothing is
             // admitted at `begin` (no request is decoded yet); the peer point is called on the
             // connection's first drive with bytes, before any request is admitted.
-            let mut h = Held::Accept(Accepted::accept(i.sink.now_monotonic_ns, lines));
+            let scheme = accepted_scheme(i.facts().map(|f| *f.get()));
+            let mut h =
+                Held::Accept(Accepted::accept(i.sink.now_monotonic_ns, lines).with_scheme(scheme));
             let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
             if r != Outcome::Ready {
                 return r;
@@ -1158,7 +1160,8 @@ fn step(
                         // A pending `auth.call` (the SDK's `Pend`, on this ticketed op): the op
                         // yields nothing until the host's wake re-issues it on the same ticket
                         // (the transport contract's "a framer pends only on a ticketed auth call").
-                        a.park_on(Some(k.ticket));
+                        // The parked call holds its own `(ticket, seq)`: only that ticket's resume
+                        // re-issues it, and a fresh op on another ticket flows past it.
                         return Outcome::Pending;
                     }
                     if !did.moved {
@@ -1166,12 +1169,28 @@ fn step(
                     }
                     a.drive(sink.now_monotonic_ns);
                 }
-                a.park_on(None);
             }
             fill(a, sink, o, class_of, fault_of);
         }
     }
     Outcome::Ready
+}
+
+/// THE SCHEME OF AN ACCEPTED CONNECTION as the host states it (`HeadView::scheme`; busbar e858ecc:
+/// `SCHEME_UNDECLARED` is refused off the peer point, and a transport never derives the scheme
+/// from its own wire). Until `BeginIn` states it outright, the host's statement is
+/// `BeginIn::facts`, "what connection security established": a secure layer presents the host's
+/// certificate (`ConnFacts::local_certificate`) and agrees a protocol in its handshake
+/// (`ConnFacts::agreed_protocol`, this framer's offer being `http/1.1`, [`ACCEPT_OFFER`]); a
+/// cleartext connection states neither. Never `SCHEME_UNDECLARED`.
+fn accepted_scheme(facts: Option<busbar_contract::abi::transport::ConnFacts>) -> u8 {
+    use busbar_contract::abi::host::service::{SCHEME_PLAIN, SCHEME_SECURE};
+    let secured = facts.is_some_and(|f| f.local_certificate.len != 0 || f.agreed_protocol.len != 0);
+    if secured {
+        SCHEME_SECURE
+    } else {
+        SCHEME_PLAIN
+    }
 }
 
 /// THE HOST AUTH HANDLE as the accepted side calls it: the SDK's `Services` wrappers, each call
@@ -1194,6 +1213,10 @@ impl HostKernel<'_> {
 }
 
 impl Kernel for HostKernel<'_> {
+    fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
         &mut self,
