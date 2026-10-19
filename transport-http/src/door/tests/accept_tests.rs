@@ -25,7 +25,7 @@ impl Kernel for Open {
         _: u64,
         _: &HeadViewArgs<'_>,
         _: Option<&[u8]>,
-    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)> {
+    ) -> Pend<AuthCalled> {
         Poll::Ready(Err(ServiceError::Unserved))
     }
     fn hand_in(
