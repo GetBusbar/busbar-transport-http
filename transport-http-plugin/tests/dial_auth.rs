@@ -24,7 +24,7 @@ use std::sync::{LazyLock, Mutex};
 use busbar_contract::abi::auth::{FieldSpan, FIELD_QUERY, FIELD_SENSITIVE, POINT_HEAD, POINT_PEER};
 use busbar_contract::abi::host::service::{
     AuthAnswer, AuthCallIn, AuthRef, HeadView, HostSlots, ServiceOut, UnitRef, FLOW_CONTINUE,
-    SERVICES,
+    SCHEME_PLAIN, SCHEME_SECURE, SERVICES,
 };
 use busbar_contract::abi::mechanism::call::{
     AbiStr, Field, InHead, Op, OutHead, Outcome, RawOutcome, Span,
@@ -75,6 +75,7 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
 struct Shown {
     point: u32,
     unit: u64,
+    scheme: u8,
     method: String,
     target: String,
     authority: String,
@@ -162,6 +163,7 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
         script.shown.push(Shown {
             point: i.point,
             unit: i.unit.id,
+            scheme: i.request.scheme,
             method,
             target,
             authority,
@@ -312,6 +314,11 @@ impl Host {
     /// `begin` on the dial side to `target`, its agreed protocol `agreed`, with the binding's
     /// `points` (and its handle, when there are any).
     fn begin(&mut self, target: &str, agreed: &str, points: u32) -> Outcome {
+        self.begin_stating(target, agreed, points, SCHEME_PLAIN)
+    }
+
+    /// [`Host::begin`], the host stating `scheme` for the route's upstream (`BeginIn::scheme`).
+    fn begin_stating(&mut self, target: &str, agreed: &str, points: u32, scheme: u8) -> Outcome {
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
         if !agreed.is_empty() {
@@ -320,6 +327,7 @@ impl Host {
         let mut i: BeginIn = z();
         i.head.ticket = TICKET;
         i.side = SIDE_DIAL;
+        i.scheme = scheme;
         i.target = s(target);
         i.facts = &facts;
         i.points = points;
@@ -356,13 +364,23 @@ impl Host {
 
     /// `emit` `message` on stream 1 with the stream's unit, as the host emits a dialled request.
     fn emit(&mut self, message: &[u8]) -> Outcome {
+        self.emit_part(message, true, None)
+    }
+
+    /// `emit` one part of stream 1's request (`end`: the last), the host stating the opening body's
+    /// length when it knows it (`EmitIn::body_len`, `body_len_known`).
+    fn emit_part(&mut self, message: &[u8], end: bool, body_len: Option<u64>) -> Outcome {
         let mut i: EmitIn = z();
+        if let Some(n) = body_len {
+            i.body_len = n;
+            i.body_len_known = 1;
+        }
         i.head.ticket = TICKET;
         i.framing = self.framing;
         i.stream = 1;
         i.bytes = message.as_ptr();
         i.len = message.len();
-        i.end_of_frame = 1;
+        i.end_of_frame = u32::from(end);
         i.unit = UNIT;
         i.sink = self.sink();
         let mut o: FramerOut = z();
@@ -687,6 +705,69 @@ fn no_binding_calls_no_auth(label: &str, ops: &'static Ops) {
     );
 }
 
+/// THE SCHEME THE AUTH IS SHOWN is the one the HOST states for the dial (busbar step 2,
+/// `BeginIn::scheme`: "on `SIDE_DIAL` from the route's upstream (whether the dial runs the
+/// connector's connection security)"), never one the framer derives from its own target.
+fn shows_the_stated_scheme(label: &str, ops: &'static Ops) {
+    for (stated, want) in [(SCHEME_PLAIN, SCHEME_PLAIN), (SCHEME_SECURE, SCHEME_SECURE)] {
+        let mut h = Host::open(ops, script());
+        assert_eq!(
+            h.begin_stating(TARGET, "http/1.1", POINT_HEAD, stated),
+            Outcome::Ready,
+            "{label}"
+        );
+        let message = h.encode(&plane(), b"hi").expect("encode");
+        assert_eq!(h.emit(&message), Outcome::Ready, "{label}");
+        let shown = h.shown();
+        assert_eq!(
+            shown.iter().map(|s| s.scheme).collect::<Vec<_>>(),
+            vec![want],
+            "{label}: the host stated {stated} for an http target"
+        );
+    }
+}
+
+/// THE OPENING BODY'S LENGTH, as the host states it (`EmitIn::body_len`, `body_len_known`; the
+/// transport ABI: "so a framer whose head states its body's length writes that line itself"): a
+/// request whose head goes out ahead of its streamed body is framed by the framer's own length
+/// line, written before the auth is called, and the auth is shown it.
+fn frames_a_streamed_body_by_its_stated_length(label: &str, ops: &'static Ops) {
+    let mut h = Host::open(ops, script());
+    assert_eq!(
+        h.begin(TARGET, "http/1.1", POINT_HEAD),
+        Outcome::Ready,
+        "{label}"
+    );
+    let head = h.encode(&plane(), b"").expect("the head alone");
+    assert_eq!(
+        h.emit_part(&head, false, Some(2)),
+        Outcome::Ready,
+        "{label}: the head"
+    );
+    assert_eq!(
+        h.emit_part(b"hi", true, Some(2)),
+        Outcome::Ready,
+        "{label}: the body"
+    );
+    let shown = h.shown();
+    let [Shown { fields, .. }] = &shown[..] else {
+        panic!("{label}: one head call: {shown:?}");
+    };
+    assert!(
+        fields
+            .iter()
+            .any(|(k, v)| k == "content-length" && v == "2"),
+        "{label}: the auth is shown the length: {fields:?}"
+    );
+    let (_, wire) = h1_head(&h.out);
+    auth_then_shown(&wire, AUTH, fields, &[]).unwrap_or_else(|e| panic!("{label}: {e}"));
+    assert!(
+        h.out.ends_with(b"\r\n\r\nhi"),
+        "{label}: {:?}",
+        String::from_utf8_lossy(&h.out)
+    );
+}
+
 fn linked() -> &'static Ops {
     let d = busbar_transport_http_plugin::door::door();
     // SAFETY: the door's `'static` table.
@@ -771,4 +852,14 @@ fn a_peer_binding_is_called_once_at_begin() {
 #[test]
 fn with_no_binding_no_auth_is_called_and_the_framer_writes_its_own_lines() {
     both(no_binding_calls_no_auth);
+}
+
+#[test]
+fn the_auth_is_shown_the_scheme_the_host_states_for_the_dial() {
+    both(shows_the_stated_scheme);
+}
+
+#[test]
+fn a_streamed_body_is_framed_by_its_stated_length() {
+    both(frames_a_streamed_body_by_its_stated_length);
 }
