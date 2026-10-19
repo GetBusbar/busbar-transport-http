@@ -1007,15 +1007,16 @@ impl Accepted {
         } else {
             a.unit
         };
-        match k.refuse(seq, unit, cause, line, id) {
-            Ok(r) if frame_refusal(a, r) => {
-                a.gate = Gate::Refused;
-                a.parts = None;
-                a.body = None;
-                did.moved = true;
-            }
-            _ => fail(a, did),
+        let framed = k
+            .refuse(seq, unit, cause, line, id)
+            .is_ok_and(|r| frame_refusal(a, r));
+        if !framed {
+            return fail(a, did);
         }
+        a.gate = Gate::Refused;
+        a.parts = None;
+        a.body = None;
+        did.moved = true;
     }
 }
 
