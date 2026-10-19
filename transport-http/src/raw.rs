@@ -122,15 +122,6 @@ fn is_http1(version: &str) -> bool {
     matches!(version, "1.0" | "1.1")
 }
 
-/// Find a header's value, case-insensitively, as the wire allows any casing.
-#[must_use]
-pub fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_slice())
-}
-
 /// A field's WHOLE value: every line carrying that name, joined with `", "`, or `None` when no
 /// line carries it.
 ///
