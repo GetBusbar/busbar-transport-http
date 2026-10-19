@@ -184,6 +184,10 @@ struct Shared {
     waiting: Vec<u64>,
 }
 
+/// What an inbound `auth.call` answers the accepted side: the flow (`FLOW_*`), the request's unit,
+/// and the names to strip, each with its place.
+pub type AuthCalled = (u32, UnitRef, Vec<(String, Place)>);
+
 /// THE HOST AUTH HANDLE as the accepted side calls it (`abi::host::service`, `op::AUTH_CALL`,
 /// `op::UNIT_HAND_IN`, `op::UNIT_REFUSE`), each call under completion sequence `seq` of the op's
 /// ticket; the door's is the SDK's `Services` (`door::HostKernel`).
@@ -199,7 +203,7 @@ pub trait Kernel {
         stream: u64,
         request: &HeadViewArgs<'_>,
         body: Option<&[u8]>,
-    ) -> Pend<(u32, UnitRef, Vec<(String, Place)>)>;
+    ) -> Pend<AuthCalled>;
     /// `unit.hand_in`: the flow and the request's unit.
     ///
     /// # Errors
