@@ -773,29 +773,38 @@ fn an_h2_request_over_a_secured_connection_says_scheme_https() {
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "The transport finalises the head (its own lines: host,
 /// length, framing), calls the auth at its points, adds the lines the auth returns ... Nothing is
-/// added to the head after the auth has run"): `locate` states the framer's own head lines for a
-/// target, 1.5.5's client defaults in 1.5.5's order, so the host adds them BEFORE the auth signs
-/// the head: `accept: */*`, then `host` (its port only when it is not the scheme's own). RED on
-/// the framer that stated none and added them at `encode`, after the auth.
+/// added to the head after the auth has run"): the framer's own head lines are 1.5.5's client
+/// defaults in 1.5.5's order, `accept: */*`, then `host` (its port only when it is not the scheme's
+/// own), in the head BEFORE the auth runs. PHASE 2 (ruling 18; the phase-2 brief: "Only the defaults
+/// (accept/host) become the framer's own with defaults_written 0"): `locate` states none for the host
+/// to add, and the framer writes them itself on the dialled head it finalises before its auth call.
+/// RED on the framer that stated none and added them at `encode`, after the auth, and on the one that
+/// left them to the host.
 #[test]
-fn locate_states_the_framers_own_head_lines() {
-    let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");
-    assert_eq!(
-        door.defaults("http://127.0.0.1:9"),
-        "accept: */*\r\nhost: 127.0.0.1:9\r\n"
-    );
-    assert_eq!(
-        door.defaults("https://api.example.com/v1"),
-        "accept: */*\r\nhost: api.example.com\r\n"
-    );
-    assert_eq!(
-        door.defaults("https://api.example.com:8443/v1"),
-        "accept: */*\r\nhost: api.example.com:8443\r\n"
-    );
-    assert_eq!(
-        door.defaults("http://[::1]:80/"),
-        "accept: */*\r\nhost: [::1]\r\n"
-    );
+fn the_framer_writes_its_own_head_lines() {
+    for (target, host) in [
+        ("http://127.0.0.1:9", "127.0.0.1:9"),
+        ("https://api.example.com/v1", "api.example.com"),
+        ("https://api.example.com:8443/v1", "api.example.com:8443"),
+        ("http://[::1]:80/", "[::1]"),
+    ] {
+        let mut door = Door::open_at("{}", "http/1.1", target);
+        assert_eq!(
+            door.defaults(target),
+            "",
+            "{target}: none stated for the host"
+        );
+        door.request(
+            1,
+            "GET",
+            "/v1",
+            &[("x-plane".to_owned(), "1".to_owned())],
+            b"",
+        );
+        let sent = String::from_utf8_lossy(&door.sent).into_owned();
+        let want = format!("GET /v1 HTTP/1.1\r\nx-plane: 1\r\naccept: */*\r\nhost: {host}\r\n\r\n");
+        assert!(sent.starts_with(&want), "{target}: {sent:?}");
+    }
 }
 
 /// RED (THE DESIGN §6 step 5, ruling (A) 2026-10-19): `locate` asks the host to state the request's
