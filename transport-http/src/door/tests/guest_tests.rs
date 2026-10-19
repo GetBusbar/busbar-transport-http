@@ -80,3 +80,21 @@ fn the_strip_reads_each_place_by_its_own_rule() {
         Some("x-api-key=1")
     );
 }
+
+/// A query key is compared as the key it percent-decodes to, as v1.5.5 read every inbound query
+/// key (`crates/busbar/src/auth/token.rs`:996-1003 `parse_query`, :1012-1035 `pct_decode`: `%XX`
+/// and `+` decoded, a malformed `%` kept as written): `%6Bey` and `k%65y` are `key`; `ke+y` is
+/// `ke y`; the comparison after decoding stays case-sensitive.
+#[test]
+fn a_query_key_is_compared_as_it_decodes() {
+    let names = vec![("key".to_owned(), Place::Query)];
+    assert_eq!(
+        stripped_query("a=1&%6Bey=s&k%65y&Key=k&ke+y=x&%zzkey=y", &names).as_deref(),
+        Some("a=1&Key=k&ke+y=x&%zzkey=y")
+    );
+    let spaced = vec![("a b".to_owned(), Place::Query)];
+    assert_eq!(
+        stripped_query("a+b=1&a%20b=2&c=3", &spaced).as_deref(),
+        Some("c=3")
+    );
+}
