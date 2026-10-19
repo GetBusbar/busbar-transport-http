@@ -400,3 +400,25 @@ fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
     );
     assert!(crate::claims::SSE_SELECTOR_FORMS.is_empty());
 }
+
+/// THE `sse` CLAIM IS SERVED, FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584: "http claims
+/// `http`, `https` and `sse`"; Q128 reader B, coordinator ruling: plain, port 80, the same target,
+/// host line and protocol offer as `http`). `locate` on an `sse` target answers what it answers for
+/// the `http` one, and the framer's own head lines are the same. RED before the fix: `locate`
+/// refused every `sse` target.
+#[test]
+fn an_sse_target_locates_as_its_http_twin() {
+    for (sse, http) in [
+        ("sse://peer.test/x", "http://peer.test/x"),
+        (
+            "sse://peer.test:8080/x?alt=sse",
+            "http://peer.test:8080/x?alt=sse",
+        ),
+        ("sse://127.1/x", "http://127.1/x"),
+    ] {
+        assert_eq!(located(sse.as_bytes()), located(http.as_bytes()), "{sse}");
+        assert!(located(sse.as_bytes()).is_ok(), "{sse}");
+        let defaults = |t: &str| engine::client_defaults(&t.parse::<http::Uri>().expect("a URI"));
+        assert_eq!(defaults(sse), defaults(http), "{sse}");
+    }
+}
