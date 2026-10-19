@@ -10,8 +10,10 @@
 //!
 //! This test reads every such cell and drives the door with the same logical request, as a plane
 //! hands it over: the verb, the target, the plane's own header fields in their order, and the body.
-//! What the door adds itself is taken OUT of the fields first (`host` and `content-length`), so
-//! the door must put each back exactly where 1.5.5 did. A trailing `accept: */*` (1.5.5's client
+//! What the http connection adds itself is taken OUT of the fields first (`host` and
+//! `content-length`), so it must be put back exactly where 1.5.5 put it: `host` and the default
+//! `accept` by the host's merge of the lines the framer's `locate` states (THE DESIGN §6 step 5),
+//! `content-length` by the framing. A trailing `accept: */*` (1.5.5's client
 //! default) is taken out too: when the caller sets none, the http door adds it (THE DESIGN §5: "the
 //! http transport owns the client defaults"). Then the door's bytes are compared with the recording:
 //!
@@ -218,6 +220,8 @@ struct Door {
     now_ns: u64,
     /// Every byte the door handed the host for the far end, in order.
     sent: Vec<u8>,
+    /// The target the connection was dialled to.
+    target: String,
 }
 
 impl Door {
@@ -249,6 +253,7 @@ impl Door {
             pieces: vec![z(); 64],
             now_ns: 5_000_000_000,
             sent: Vec::new(),
+            target: target.to_owned(),
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
@@ -304,6 +309,16 @@ impl Door {
                 value: s(path),
             },
         ];
+        // THE HOST'S MERGE (THE DESIGN §6 step 5): each line the framer's `locate` states that the
+        // request does not carry is added to the head before the auth, after the caller's fields.
+        let mut fields = fields.to_vec();
+        for line in self.defaults(&self.target.clone()).split("\r\n") {
+            if let Some((n, v)) = line.split_once(": ") {
+                if !fields.iter().any(|(f, _)| f.eq_ignore_ascii_case(n)) {
+                    fields.push((n.to_owned(), v.to_owned()));
+                }
+            }
+        }
         all.extend(fields.iter().map(|(n, v)| Field {
             name: s(n),
             value: s(v),

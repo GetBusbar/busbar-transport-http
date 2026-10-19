@@ -542,21 +542,35 @@ impl SafeSlot for Locate {
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
+        // THE FRAMER'S OWN HEAD LINES (THE DESIGN §6 step 5): stated here, added by the host
+        // before the auth signs the head, never by `encode`.
+        let defaults = i
+            .field(|x| &x.target)
+            .as_str()
+            .ok()
+            .and_then(|t| t.parse::<http::Uri>().ok())
+            .map(|u| engine::client_defaults(&u))
+            .unwrap_or_default();
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(name.as_bytes());
         l.extend(offer);
-        // One short answer for all three buffers, each at its full size.
-        let short = !(a.fits() && n.fits() && l.fits());
+        d.extend(defaults.as_bytes());
+        // One short answer for every buffer, each at its full size.
+        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
+        let (dw, dnd) = d.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
+        o.set(|x| &x.defaults_written, dw as u64);
+        o.set(|x| &x.defaults_needed, dnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;

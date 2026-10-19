@@ -47,7 +47,9 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    facts: 0,
+    // The framer adds no field line after the kernel's auth call: its own lines are stated at
+    // `locate` and added by the host before the auth signs the head (THE DESIGN §6 step 5).
+    facts: busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
