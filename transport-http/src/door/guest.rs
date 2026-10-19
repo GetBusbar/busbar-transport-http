@@ -75,6 +75,18 @@ impl Line {
         }
     }
 
+    /// [`Line::any`] whose auth needs `points`, holding a body to `body_limit` at the body point,
+    /// for the accepted side's own cells.
+    #[cfg(test)]
+    #[must_use]
+    pub fn any_needing(line: u32, points: u32, body_limit: u64) -> Self {
+        Self {
+            points,
+            body_limit,
+            ..Self::any(line)
+        }
+    }
+
     /// The line's route in the contract's vocabulary.
     fn view(&self) -> RouteView<'_> {
         RouteView {
