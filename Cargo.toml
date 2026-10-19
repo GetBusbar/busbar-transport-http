@@ -23,5 +23,5 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-transport-http"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "ef5190e288e6c2183db532562bd7829f212a843a" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "ef5190e288e6c2183db532562bd7829f212a843a" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "478b2288eda28a8bc7ffc20214bb3b47e4bfd8d0" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "478b2288eda28a8bc7ffc20214bb3b47e4bfd8d0" }
