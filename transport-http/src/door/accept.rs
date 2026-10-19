@@ -259,6 +259,7 @@ pub trait Kernel {
     /// # Errors
     ///
     /// The service's.
+    #[allow(clippy::too_many_arguments)]
     fn refuse(
         &mut self,
         seq: u32,
@@ -266,6 +267,7 @@ pub trait Kernel {
         cause: u32,
         line: u32,
         stream: u64,
+        request: &HeadViewArgs<'_>,
     ) -> Result<RefusalCopy, ServiceError>;
 }
 
@@ -1291,7 +1293,7 @@ impl Accepted {
             a.unit
         };
         let framed = k
-            .refuse(seq, unit, cause, line, id)
+            .refuse(seq, unit, cause, line, id, &HeadViewArgs::default())
             .is_ok_and(|r| frame_refusal(a, r));
         if !framed {
             return fail(a, did);
