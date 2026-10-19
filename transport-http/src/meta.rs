@@ -47,8 +47,20 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // The framer adds no field line after the kernel's auth call: its own lines are stated at
-    // `locate` and added by the host before the auth signs the head (THE DESIGN §6 step 5).
+    // THE FACT, PRECISELY: nothing an auth could sign is added after the auth (THE DESIGN §6 step
+    // 5). The framer's own lines (`accept`, `host`) are stated at `locate` and the length line for
+    // a non-empty body is stated by the host, all before the auth runs; the framer renders exactly
+    // that head and adds no line at `encode` or `emit`.
+    //
+    // THE ONE EXCEPTION, scoped exactly (Q128 transport-http, ruling (D)): HTTP/2, a payload
+    // method (hyper's `method_has_defined_payload_semantics`: any but GET, HEAD, DELETE and
+    // CONNECT), an EMPTY body. The host states no length for an empty body (1.5.5's HTTP/1.1 wire
+    // carries none), and the h2 framing adds `content-length: 0` at send, exactly as 1.5.5's client
+    // (reqwest 0.12 over hyper 1.11) did. That line is added after the auth, and it is not one an
+    // auth could sign: the only fleet style handed the head (`STYLE_NEEDS_HEADERS`, sigv4) signs a
+    // fixed set that never names `content-length`, and every other style is handed no head at all.
+    // Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's client), and busbar-auth-sigv4's
+    // `no_length_line_is_ever_signed`.
     facts: busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
