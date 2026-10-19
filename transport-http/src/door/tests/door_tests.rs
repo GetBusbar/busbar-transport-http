@@ -354,12 +354,9 @@ fn the_entry_claims_http_https_and_sse() {
     assert_eq!(https, http);
 }
 
-/// RED (THE DESIGN §6 step 5): the tail states that nothing an auth could sign is added after the
-/// kernel's auth call (`FACT_SIGNS_NOTHING_AFTER_AUTH`), which the kernel holds it to. The one line
-/// added after it, h2's `content-length: 0` for an empty payload-method body, is named in
-/// `meta::TAIL` and pinned in `tests/h2_parity.rs`.
+/// The tail states no fact: bit 1 is retired (spec l.3779), and the contract refuses a tail stating
+/// it. The rule it named is proven by `the_head_on_the_wire_is_every_line_the_auth_saw`.
 #[test]
-fn the_tail_states_it_signs_nothing_after_auth() {
-    let fact = busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH;
-    assert_eq!(crate::meta::TAIL.facts & fact, fact);
+fn the_tail_states_no_retired_fact() {
+    assert_eq!(crate::meta::TAIL.facts, 0);
 }

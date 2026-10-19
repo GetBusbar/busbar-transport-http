@@ -15,10 +15,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 busbar-transport-http = { path = "../transport-http" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "eb7d2e1108328c124ce94386b28aebd0492ae460" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "cfd941341e6ad1096c907ab3f3d26a7a61144bc9" }
 
 [dev-dependencies]
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "eb7d2e1108328c124ce94386b28aebd0492ae460", features = ["conformance"] }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "cfd941341e6ad1096c907ab3f3d26a7a61144bc9", features = ["conformance"] }
 # door_both_ways.rs: a real hyper server on the far side of the framer, the cdylib dlopen'd.
 libloading = "0.9"
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }

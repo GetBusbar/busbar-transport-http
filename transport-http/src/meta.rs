@@ -44,13 +44,15 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // THE FACT, PRECISELY: nothing an auth could sign is added after the auth (THE DESIGN §6 step
-    // 5). The framer's own lines (`accept`, `host`) are stated at `locate` and the length line for
-    // a non-empty body is stated by the host, all before the auth runs; the framer renders exactly
-    // that head and adds no line at `encode` or `emit`.
+    // No fact is stated. NOTHING IS ADDED TO THE HEAD AFTER THE AUTH HAS RUN (BUSBAR-1.6.0.md
+    // l.3779, §4 item 5; ruling 23) is a rule this transport keeps and proves in its own suite
+    // (`the_head_on_the_wire_is_every_line_the_auth_saw`), not a fact a tail states. The framer's
+    // own lines (`accept`, `host`) are stated at `locate` and the length line for a non-empty body
+    // is stated by the host, all before the auth runs; the framer renders exactly that head and
+    // adds no line at `encode` or `emit`.
     //
-    // THE ONE EXCEPTION, scoped exactly (Q128 transport-http, ruling (D)): HTTP/2, a payload
-    // method (hyper's `method_has_defined_payload_semantics`: any but GET, HEAD, DELETE and
+    // THE ONE EXCEPTION to that rule, scoped exactly (Q128 transport-http, ruling (D)): HTTP/2, a
+    // payload method (hyper's `method_has_defined_payload_semantics`: any but GET, HEAD, DELETE and
     // CONNECT), an EMPTY body. The host states no length for an empty body (1.5.5's HTTP/1.1 wire
     // carries none), and the h2 framing adds `content-length: 0` at send, exactly as 1.5.5's client
     // (reqwest 0.12 over hyper 1.11.0, v1.5.5 Cargo.lock) did: hyper `src/proto/h2/client.rs`
@@ -61,7 +63,7 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // `STYLE_NEEDS_HEADERS`) signs a fixed set that never names `content-length`, and every other
     // style is handed no head at all. Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's
     // client), and the header-signing style's own no-length-signed cell.
-    facts: busbar_contract::abi::transport::FACT_SIGNS_NOTHING_AFTER_AUTH,
+    facts: 0,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
