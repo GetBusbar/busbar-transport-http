@@ -46,8 +46,11 @@
         "wire": "POST /v1/x HTTP/1.1\r\ncontent-length: 1\r\n\r\nb"
       }
     ],
-    "refuse": "refused",
-    "detach": "refused",
+    "refuse": { "bytes": "HTTP/1.1 403 Forbidden\r\n\r\n", "wire": "", "refused": true, "begin": "" },
+    "detach": {
+      "ingest": "GET /chat HTTP/1.1\r\nhost: peer.test\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n",
+      "detached": "GET /chat HTTP/1.1\r\nhost: peer.test\r\nupgrade: websocket\r\nconnection: upgrade\r\n\r\n"
+    },
     "adopt": "refused"
   }
 }
