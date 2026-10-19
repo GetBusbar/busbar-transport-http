@@ -84,6 +84,10 @@ enum Stage {
     ),
     /// The response body.
     Body(Incoming, Pin<Box<dyn Sleep>>),
+    /// Refused partway through its request message (HTTP/2): the failure piece is out, and every
+    /// later byte of THAT message is dropped until the host's end of it, so the rest is never read
+    /// as a fresh request on the same stream (a head the auth never saw).
+    Refused,
     /// Answered in full.
     Done,
 }
@@ -188,7 +192,9 @@ impl Framing {
         self.io.ingest(bytes, end);
     }
 
-    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`.
+    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`; `end` is the
+    /// host's end of that message (`EmitIn::end_of_frame`). A message still short of what its head
+    /// declares at its end is refused.
     ///
     /// A message that cannot be sent fails its STREAM on HTTP/2 (a failure piece, its siblings
     /// untouched), and the framing on HTTP/1.1, where the connection carries one exchange.
@@ -204,11 +210,24 @@ impl Framing {
         &mut self,
         stream: u64,
         bytes: &[u8],
+        end: bool,
         now_ns: u64,
         deadline_ns: u64,
     ) -> Result<(), Failure> {
+        // The rest of a refused message is dropped, never read; the host's end of it frees the
+        // stream.
+        if let Some(i) = self
+            .exchanges
+            .iter()
+            .position(|(s, st)| *s == stream && matches!(st, Stage::Refused))
+        {
+            if end {
+                self.exchanges.remove(i);
+            }
+            return Ok(());
+        }
         // A re-call after `YIELD_MORE` carries no new bytes: nothing to add to any message.
-        if bytes.is_empty() {
+        if bytes.is_empty() && !end {
             return Ok(());
         }
         let deadline = if deadline_ns != 0 {
@@ -218,11 +237,33 @@ impl Framing {
                 u64::try_from(self.posture.request_timeout.as_nanos()).unwrap_or(u64::MAX),
             )
         };
-        match self.message(stream, bytes, deadline) {
+        let read = if bytes.is_empty() {
+            Ok(())
+        } else {
+            self.message(stream, bytes, deadline)
+        };
+        // The host's end of a message still arriving: it ended short of what its head declared.
+        let read = read.and_then(|()| {
+            let short = self
+                .exchanges
+                .iter()
+                .any(|(s, st)| *s == stream && matches!(st, Stage::Writing(..)));
+            if end && short {
+                Err(Failure(
+                    "request message: it ended short of its stated length".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        match read {
             Ok(()) => Ok(()),
             Err(f) if self.proto == Proto::H2 => {
-                if let Some(slot) = self.exchanges.iter_mut().find(|(s, _)| *s == stream) {
-                    slot.1 = Stage::Done;
+                // Refused partway: the stream stays refused until the host's end of the message.
+                let after = if end { Stage::Done } else { Stage::Refused };
+                match self.exchanges.iter_mut().find(|(s, _)| *s == stream) {
+                    Some(slot) => slot.1 = after,
+                    None => self.exchanges.push((stream, after)),
                 }
                 self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
                 self.out.push_back(Piece::failure(stream, &f.0));
@@ -295,7 +336,11 @@ impl Framing {
         }
         let err = self.conn_err.lock().expect("err").clone();
         if let Some(e) = err {
-            if !self.exchanges.is_empty() {
+            if self
+                .exchanges
+                .iter()
+                .any(|(_, s)| !matches!(s, Stage::Refused))
+            {
                 self.failed = Some(Failure(e));
             }
         }
@@ -453,7 +498,7 @@ fn advance(
     let own = |e: hyper::Error| (Failure(e.to_string()), false);
     loop {
         match stage {
-            Stage::Writing(..) | Stage::Done => return Ok(()),
+            Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(()),
             Stage::Queued(_, wait) => {
                 if wait.as_mut().poll(cx).is_ready() {
                     return Err(timed_out());
