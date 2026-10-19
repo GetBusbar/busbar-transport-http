@@ -577,6 +577,9 @@ impl SafeSlot for Locate {
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
+        // THE LENGTH LINE is the host's to state, before the auth (THE DESIGN §6 step 5): for a
+        // fixed, non-empty body, last, after these lines. `encode` renders it and adds none.
+        o.set(|x| &x.states_length, 1u8);
         o.set(|x| &x.defaults_written, dw as u64);
         o.set(|x| &x.defaults_needed, dnd as u64);
         if short {
