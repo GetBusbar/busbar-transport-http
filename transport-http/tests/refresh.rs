@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
+//! Door-table cells, driven through the door's own table as the host drives it.
+//!
 //! RED (Q128 transport-http, the refresh LOW): a reload's settings are applied by `refresh`, read
 //! as `open` reads them, or refused with `open`'s words while the settings in force stay. Driven
 //! through the door's own table, as the host drives it. RED on the door that answered every
@@ -133,6 +135,24 @@ impl Door {
         l
     }
 
+    /// `locate` on `target` with a defaults buffer of `cap` bytes: its outcome, and the bytes it
+    /// says it wrote and needs.
+    fn locate_with_defaults(&self, target: &str, cap: usize) -> (Outcome, u64, u64) {
+        let (mut a, mut n, mut l) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
+        let mut d = vec![0_u8; cap];
+        let mut i: LocateIn = z();
+        i.target = s(target);
+        (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
+        (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
+        (i.alpn_buf, i.alpn_cap) = (l.as_mut_ptr(), l.len());
+        if cap > 0 {
+            (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), cap);
+        }
+        let mut o: LocateOut = z();
+        let (r, _) = call(self.ops.locate, self.inst, &mut i, &mut o, slot::LOCATE);
+        (r, o.defaults_written, o.defaults_needed)
+    }
+
     /// Whether a framing begun now carries a 5-byte request body: `emit`'s outcome.
     fn carries_five_bytes(&self) -> Outcome {
         let mut wire = vec![0_u8; 64 * 1024];
@@ -230,4 +250,27 @@ fn a_refresh_with_bad_settings_is_refused_and_changes_nothing() {
         H1,
         "the settings in force before the refused reloads stay"
     );
+}
+
+/// RED (Q128 transport-http, the empty defaults buffer): the framer's own head lines (`accept`,
+/// `host`) are owed to every request (THE DESIGN §6 step 5), so a host that lends no room for them,
+/// or too little, is answered short with the size they need, never READY with no lines (a request
+/// that would go out with no `host` on HTTP/1.1). RED on the `locate` that answered READY and wrote
+/// nothing when the host lent no defaults buffer.
+#[test]
+fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
+    let door = Door::open("{}");
+    let want = "accept: */*\r\nhost: 127.0.0.1:9\r\n".len() as u64;
+    for cap in [0, 4] {
+        let (r, written, needed) = door.locate_with_defaults("http://127.0.0.1:9", cap);
+        assert_eq!(r, Outcome::Failed, "a {cap}-byte defaults buffer is short");
+        assert_eq!(written, 0, "nothing is written on a short answer");
+        assert_eq!(
+            needed, want,
+            "the short answer names the size the lines need"
+        );
+    }
+    let (r, written, _) = door.locate_with_defaults("http://127.0.0.1:9", 512);
+    assert_eq!(r, Outcome::Ready);
+    assert_eq!(written, want);
 }
