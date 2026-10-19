@@ -184,7 +184,7 @@ const HTTP_ROW: Claim = Claim {
     session_bound: 0,
     unit0_trigger: 0,
     status_at: STATUS_AT_FIRST_FRAME,
-    _reserved: 0,
+    ..Claim::ZERO
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
@@ -202,7 +202,7 @@ pub(crate) const CLAIMS: &[Claim] = &[
         session_bound: 0,
         unit0_trigger: 0,
         status_at: STATUS_AT_FIRST_FRAME,
-        _reserved: 0,
+        ..Claim::ZERO
     },
     HTTP_ROW,
 ];
