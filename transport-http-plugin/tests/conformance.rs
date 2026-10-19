@@ -131,6 +131,11 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
             name: s("content-type"),
             value: s("application/json"),
         },
+        // The length line the host states before the auth (THE DESIGN §6 step 5).
+        Field {
+            name: s("content-length"),
+            value: s("7"),
+        },
     ];
     let body = b"{\"a\":1}";
     let mut e: EncodeIn = z();
