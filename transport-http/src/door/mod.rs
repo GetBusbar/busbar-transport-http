@@ -707,7 +707,7 @@ impl SafeSlot for Emit {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
         with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.emit(i.stream, bytes, now, deadline)
+            f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
         })
     }
 }

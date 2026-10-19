@@ -23,7 +23,8 @@ fn asked(proto: Proto, timeout_secs: u64) -> Framing {
     let mut f = Framing::dial("http://127.0.0.1:9", proto, posture(timeout_secs), 0).expect("dial");
     // `begin` drives the handshake in its own op, before any request exists (as the door does).
     f.drive(0, 0);
-    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
     f.drive(0, 0);
     let sent = f.take_wire(usize::MAX);
     assert!(!sent.is_empty(), "the request went out");
@@ -250,7 +251,7 @@ fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
     let mut f =
         Framing::dial("http://127.0.0.1:9", Proto::H1, posture(300), connected).expect("dial");
     f.drive(connected, 0);
-    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", connected, 300 * SEC)
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, connected, 300 * SEC)
         .expect("emit");
     f.drive(connected, 0);
     assert!(!f.take_wire(usize::MAX).is_empty(), "the request went out");
@@ -273,7 +274,7 @@ fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
 fn h1_wire(message: &[u8]) -> String {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
     f.drive(0, 0);
-    f.emit(1, message, 0, 0).expect("emit");
+    f.emit(1, message, true, 0, 0).expect("emit");
     f.drive(0, 0);
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
@@ -303,7 +304,7 @@ fn the_door_adds_no_line_to_the_head_it_is_handed() {
 
 /// What one emit of `message` on `stream` puts on the wire.
 fn sent(f: &mut Framing, stream: u64, message: &[u8]) -> String {
-    f.emit(stream, message, 0, 0).expect("emit");
+    f.emit(stream, message, true, 0, 0).expect("emit");
     f.drive(0, 0);
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
@@ -399,7 +400,7 @@ fn rendered_and_sent(
         stated.push(("content-length", len.as_bytes()));
     }
     let message = crate::transport::render_envelope(&stated, body).expect("render");
-    let r = f.emit(1, &message, 0, 0);
+    let r = f.emit(1, &message, true, 0, 0);
     f.drive(0, 0);
     (r, f.take_wire(usize::MAX))
 }
@@ -453,7 +454,7 @@ fn a_chunked_request_message_is_refused_and_nothing_goes_out() {
         };
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
         f.drive(0, 0);
-        let r = f.emit(1, &chunked(coding, n), 0, 0);
+        let r = f.emit(1, &chunked(coding, n), true, 0, 0);
         f.drive(0, 0);
         assert!(
             r.is_err(),
@@ -478,6 +479,7 @@ fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
     let r = f.emit(
         1,
         b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
+        true,
         0,
         0,
     );
@@ -521,7 +523,13 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     f.drive(0, 0);
     let _preface = f.take_wire(usize::MAX);
     // Refused partway: bytes past the stated length.
-    let r = f.emit(1, b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX", 0, 0);
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
+        false,
+        0,
+        0,
+    );
     f.drive(0, 0);
     assert!(
         r.is_ok(),
@@ -536,6 +544,7 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     let _ = f.emit(
         1,
         b"GET /never-authed HTTP/1.1\r\nx-injected: 1\r\n\r\n",
+        true,
         0,
         0,
     );
@@ -546,8 +555,27 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
         "no HEADERS frame goes out for the rest of a refused message: {:?}",
         String::from_utf8_lossy(&wire)
     );
+    // The host's end of a message still short of its stated length refuses it.
+    let r = f.emit(
+        5,
+        b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\nhi",
+        true,
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 5 && p.failed),
+        "a message that ends short of its stated length is refused"
+    );
+    assert!(
+        !h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
+        "and nothing of it goes out"
+    );
     // The control: a request on a fresh stream does go out, as a HEADERS frame this reading sees.
-    f.emit(3, b"GET /ok HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+    f.emit(3, b"GET /ok HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
     f.drive(0, 0);
     assert!(
         h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
@@ -671,6 +699,7 @@ fn a_request_with_trailers_is_refused_not_folded_into_its_head() {
     let r = f.emit(
         1,
         b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nx-late: 1\r\n\r\n",
+        true,
         0,
         0,
     );
