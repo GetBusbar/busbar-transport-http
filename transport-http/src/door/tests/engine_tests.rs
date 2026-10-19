@@ -575,7 +575,8 @@ fn the_wire_head_is_the_head_the_auth_saw() {
 
 /// RED (THE DESIGN §6 step 5: nothing joins the head after the auth): a chunked request's trailer
 /// section is not folded into the head and sent as header fields; a request carrying trailers is
-/// refused. RED on the framing that appended the trailers to the head.
+/// refused, with the chunked framing that carries them, and no trailer reaches the wire. RED on the
+/// framing that appended the trailers to the head.
 #[test]
 fn a_request_with_trailers_is_refused_not_folded_into_its_head() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");

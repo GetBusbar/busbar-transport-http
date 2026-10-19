@@ -133,10 +133,11 @@ pub(crate) fn request_target(
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
 ///
-/// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
-/// a chunked body seen, or a message that declares neither coding and therefore carries no body at
-/// all. A chunked message is decoded here, so what comes back always carries the body itself rather
-/// than a framing of it.
+/// The two endings are the wire's own: a declared `Content-Length` reached, or a message that
+/// declares no length and therefore carries no body at all. A message framed by a transfer coding is
+/// refused (`Framing`), whatever the coding: the host states the length line before the auth (THE
+/// DESIGN §6 step 5) and no host path renders a `transfer-encoding`, so such a request has no 1.5.5
+/// counterpart, and carrying it would put a framing on the wire the auth never saw.
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
@@ -149,18 +150,7 @@ pub(crate) fn complete_message(
         let message = raw::parse_message(&buffered[..header_end]).ok_or(TransportError::Framing)?;
         cache.parses += 1;
         if raw::has_transfer_encoding(&message.headers) {
-            if !raw::is_chunked(&message.headers) {
-                // A declared coding this transport cannot frame. Falling through to
-                // `Content-Length` would be answering a question the sender did not ask.
-                return Err(TransportError::Framing);
-            }
-            if raw::header(&message.headers, "content-length").is_some() {
-                // Two headers describing two framings of the same bytes. The coding wins the
-                // reading, but forwarding the pair on — as this used to do — hands the next hop a
-                // length the bytes do not have, the smuggling shape itself. Refused rather than
-                // silently disambiguated, mirroring the ingress reader's identical refusal.
-                return Err(TransportError::Framing);
-            }
+            return Err(TransportError::Framing);
         }
         cache.head = Some(CachedHead {
             end: header_end,
@@ -168,62 +158,22 @@ pub(crate) fn complete_message(
             headers: message.headers,
         });
     }
-    // Read what the head says before touching the cache again: the decoder lives beside it, and
-    // feeding it is a mutation of the same cell this borrow reads.
-    let (head_end, chunked, declared) = {
+    let (head_end, declared) = {
         let head = cache.head.as_ref().expect("set just above");
-        (
-            head.end,
-            raw::is_chunked(&head.headers),
-            raw::content_length(&head.headers),
-        )
+        (head.end, raw::content_length(&head.headers))
     };
     let rest = &buffered[head_end..];
-
-    let (body, trailers) = if chunked {
-        // ONE decoder across the calls, fed only what arrived with this one. A fresh decoder per
-        // call re-decodes every byte received so far and re-allocates the decoded chunks each
-        // time — quadratic in the body, which for the megabyte bodies this path exists to carry is
-        // the difference between a transport and a stall. The ingress reader already reads this
-        // way; this is the same reading on the side that accumulates.
-        let decoder = cache
-            .decoder
-            .get_or_insert_with(|| Box::new(raw::ChunkedDecoder::default()));
-        let fresh = &rest[cache.fed.min(rest.len())..];
-        cache.feeds += fresh.len();
-        decoder.feed(fresh).map_err(|_| TransportError::Framing)?;
-        // The cap is the BODY's, chunked or declared: past it the message is refused as the
-        // Content-Length branch below refuses a declared length past it.
-        if decoder.decoded_len() > max_body_bytes {
-            return Err(TransportError::Framing);
-        }
-        cache.fed = rest.len();
-        if !decoder.is_done() {
-            return Ok(None);
-        }
-        let (chunks, trailers) = cache.decoder.take().expect("set just above").take();
-        (chunks.concat(), trailers)
-    } else {
-        let declared = declared.map_err(|()| TransportError::Framing)?.unwrap_or(0);
-        if declared > max_body_bytes {
-            return Err(TransportError::Framing);
-        }
-        if rest.len() < declared {
-            return Ok(None);
-        }
-        (rest[..declared].to_vec(), Vec::new())
-    };
-
-    // Whole: the head is spent with the message it belonged to, so the next one parses its own,
-    // and the decoder that read this body is spent with it too.
-    let head = cache.head.take().expect("set just above");
-    cache.decoder = None;
-    cache.fed = 0;
-    // A trailer is a line after the head, and after the auth: it never joins the head (THE
-    // DESIGN §6 step 5), so a request carrying one is refused.
-    if !trailers.is_empty() {
+    let declared = declared.map_err(|()| TransportError::Framing)?.unwrap_or(0);
+    if declared > max_body_bytes {
         return Err(TransportError::Framing);
     }
+    if rest.len() < declared {
+        return Ok(None);
+    }
+    let body = rest[..declared].to_vec();
+
+    // Whole: the head is spent with the message it belonged to, so the next one parses its own.
+    let head = cache.head.take().expect("set just above");
     Ok(Some(raw::RawMessage {
         start: head.start,
         headers: head.headers,
@@ -235,8 +185,8 @@ pub(crate) fn complete_message(
 ///
 /// `emit` asks whether the message is whole on EVERY chunk, and the header prefix does not change
 /// between those asks. Parsing it each time allocates a fresh vector and two strings per header and
-/// throws them away — the same waste the chunked decoder was written incrementally to avoid. Held
-/// beside the pending bytes, and taken when the message completes so it can never outlive it.
+/// throws them away. Held beside the pending bytes, and taken when the message completes so it can
+/// never outlive it.
 pub(crate) struct CachedHead {
     pub(crate) end: usize,
     pub(crate) start: raw::RawStartLine,
@@ -251,16 +201,6 @@ pub(crate) struct CachedHead {
 pub(crate) struct EgressHead {
     pub(crate) head: Option<CachedHead>,
     pub(crate) parses: usize,
-    /// The chunked decoder this message is being decoded by, kept across `emit` calls so each
-    /// call feeds only the bytes that arrived with it — the same discipline the ingress reader
-    /// keeps across reads. Behind a box because it is a per-message working set that most
-    /// connections never allocate, and inline it would be carried by every connection ever dialled.
-    pub(crate) decoder: Option<Box<raw::ChunkedDecoder>>,
-    /// How many bytes past the header block have already been fed to `decoder`.
-    pub(crate) fed: usize,
-    /// This connection's own tally of bytes fed to a decoder, per instance for the same reason
-    /// `parses` is: a test reading it back sees only its own connection's work.
-    pub(crate) feeds: usize,
 }
 
 /// The offset just past the blank line that ends a header block, searching from `start`, alongside

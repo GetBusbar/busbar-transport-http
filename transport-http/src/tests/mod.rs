@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The crate's own battery: the HTTP/1.1 message an `emit` accumulates (one parse and one chunked
-//! decode per message, the smuggling pair refused), the request envelope `encode` renders, the
+//! The crate's own battery: the HTTP/1.1 message an `emit` accumulates (one parse per message, a
+//! transfer coding refused at its head, the smuggling pair with it), the request envelope `encode` renders, the
 //! start-line check, and the `Retry-After` reading a response head carries. The framer's own ops
 //! are proven in `door/tests` and the crate's integration tests.
 
@@ -52,8 +52,7 @@ fn retry_after_parses_both_normative_forms() {
 ///
 /// `write` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
 /// used to re-run the whole header parse over the same unchanged prefix each time — a fresh Vec and
-/// two Strings per header, allocated and dropped, for every chunk of the body. Same standard the
-/// crate holds its chunked decoding to, now applied here.
+/// two Strings per header, allocated and dropped, for every chunk of the body.
 #[test]
 fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".to_vec();
@@ -80,73 +79,37 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     );
 }
 
-/// The egress chunked body is decoded once, not once per `write` call.
+/// A request framed by a transfer coding is refused at its head, before a byte of its body is read
+/// (Q128 transport-http, ruling (b)).
 ///
-/// The sibling of the header-parse cell above, and the same standard: `write` accumulates and asks
-/// "is this message whole yet?" on every chunk, and answering that with a FRESH decoder re-decoded
-/// every byte received so far — quadratic in the body, with a full re-allocation of the decoded
-/// chunks each time. The ingress reader already keeps one decoder across reads. This drives the
-/// production `complete_message` and counts the bytes it actually feeds a decoder.
+/// The host states the length line before the auth (THE DESIGN §6 step 5) and no host path renders
+/// a `transfer-encoding`, so a chunked request has no 1.5.5 counterpart. The refusal comes from the
+/// head alone: a message whose body has not arrived is refused as one whose body has, so no body
+/// is buffered for a request that will never go out, and no head is left cached for the next.
 #[test]
-fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
-    let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+fn egress_refuses_a_chunked_request_at_its_head() {
+    let head = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
     let mut cache = EgressHead::default();
-    assert!(complete_message(&buffered, &mut cache, usize::MAX)
-        .unwrap()
-        .is_none());
-
-    const CALLS: usize = 200;
-    const PIECE: &[u8] = b"10\r\naaaaaaaaaaaaaaaa\r\n";
-    let mut wire_bytes = 0_usize;
-    for _ in 0..CALLS {
-        buffered.extend_from_slice(PIECE);
-        wire_bytes += PIECE.len();
-        assert!(
-            complete_message(&buffered, &mut cache, usize::MAX)
-                .unwrap()
-                .is_none(),
-            "no terminal chunk yet, so the message is not whole"
-        );
-    }
-    buffered.extend_from_slice(b"0\r\n\r\n");
-    wire_bytes += 5;
-    let done = complete_message(&buffered, &mut cache, usize::MAX)
-        .unwrap()
-        .expect("the terminal chunk completes the message");
     assert_eq!(
-        done.body.len(),
-        CALLS * 16,
-        "the body is decoded byte-exact"
+        complete_message(head, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a chunked head is refused before its body arrives"
     );
+    assert!(cache.head.is_none(), "a refused head is never cached");
 
-    let fed = cache.feeds;
-    assert!(
-        fed <= 2 * wire_bytes,
-        "a {wire_bytes}-byte chunked body arriving in {CALLS} calls cost {fed} bytes of decoding; \
-         one decoder across the calls makes that O(n), a fresh one per call makes it O(n^2)"
-    );
-
-    // And the decoder is spent with the message: the next one decodes its own body.
-    assert!(
-        cache.head.is_none() && cache.decoder.is_none(),
-        "a completed message leaves no stale decoder"
+    let whole =
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(whole, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a whole chunked message is refused, never decoded and carried"
     );
 }
 
-/// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
-/// the ingress reader's own refusal.
-///
-/// Two headers naming two different lengths for one body is the canonical request-smuggling
-/// primitive. Before this was wired, `complete_message` only refused a `Transfer-Encoding` it
-/// could not read at all (anything but `chunked`); a body that was validly `chunked` AND carried a
-/// `Content-Length` fell through to the chunked branch, was decoded, and was handed back as a
-/// message with both framing headers stripped — a quiet disambiguation forwarded to the next hop,
-/// which may resolve the same ambiguity the other way. This refuses the pair outright, mirroring
-/// the ingress reader's identical check and identical error.
-///
-/// The second half proves this is not an over-refusal: a normal chunked body with no
-/// `Content-Length` beside it — the exact shape every other egress chunked cell in this file
-/// exercises — still completes.
+/// The egress smuggling pair: a `Transfer-Encoding` beside a `Content-Length` is refused, as any
+/// transfer coding is, and the `Content-Length` alone still completes. The second half proves the
+/// refusal is the coding's, not the length's.
 #[test]
 fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let smuggled = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
@@ -158,19 +121,12 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
          than silently disambiguated and forwarded"
     );
 
-    let clean =
-        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    let clean = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
     let mut clean_cache = EgressHead::default();
     let done = complete_message(clean, &mut clean_cache, usize::MAX)
         .unwrap()
-        .expect(
-            "a normal chunked body with no Content-Length still completes — this refuses the \
-                 smuggling PAIR, not chunked encoding on its own",
-        );
-    assert_eq!(
-        done.body, b"abc",
-        "the clean chunked body still decodes byte-exact"
-    );
+        .expect("a stated length with no coding beside it completes");
+    assert_eq!(done.body, b"abc", "the stated body goes out byte-exact");
 }
 
 /// Every request line names its version. Without the check any two words followed by a space parse
