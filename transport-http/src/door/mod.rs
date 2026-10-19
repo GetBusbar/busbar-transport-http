@@ -557,12 +557,18 @@ impl SafeSlot for Locate {
         n.extend(name.as_bytes());
         l.extend(offer);
         d.extend(defaults.as_bytes());
-        // One short answer for every buffer, each at its full size.
-        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
+        // One short answer for every buffer, each at its full size. A host that lends no defaults
+        // buffer takes no lines here (a host that predates it).
+        let lent_defaults = i.defaults_cap > 0;
+        let short = !(a.fits() && n.fits() && l.fits() && (d.fits() || !lent_defaults));
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
-        let (dw, dnd) = d.settle(short);
+        let (dw, dnd) = if lent_defaults {
+            d.settle(short)
+        } else {
+            (0, 0)
+        };
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);

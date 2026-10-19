@@ -392,6 +392,8 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
 /// `name: value` CRLF each. On HTTP/2 the `host` line is the target's `:authority`, as there.
 pub(crate) fn client_defaults(target: &http::Uri) -> String {
     let mut lines = String::from("accept: */*\r\n");
+    // The host 1.5.5's client sent: an IPv4 spelling as the address it names.
+    let target = canonical_host(target.clone());
     if let Some(host) = target.host() {
         let secure = matches!(target.scheme_str(), Some("https"));
         let value = match target.port_u16() {
