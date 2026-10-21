@@ -818,8 +818,16 @@ impl SafeSlot for Begin {
             // from the handshake's facts (Q128 r232 LOW 2). The host refuses a `begin` stating
             // none.
             let scheme = i.scheme;
-            let mut h =
-                Held::Accept(Accepted::accept(i.sink.now_monotonic_ns, lines).with_scheme(scheme));
+            // The protocol the secure layer's handshake agreed (ALPN), when it ran one: the one
+            // the connection speaks until its first bytes show hyper's own choice.
+            let alpn = i
+                .facts()
+                .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
+            let mut h = Held::Accept(
+                Accepted::accept(i.sink.now_monotonic_ns, lines)
+                    .with_scheme(scheme)
+                    .with_alpn(alpn),
+            );
             let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
             if r != Outcome::Ready {
                 return r;
@@ -1009,6 +1017,7 @@ impl SafeSlot for Detach {
         };
         let sink = i.field(|x| &x.sink);
         a.drive(sink.now_monotonic_ns);
+        let agreed = a.agreed();
         let mut wire_buf = sink.wire();
         let wire = a.take_wire(wire_buf.cap());
         wire_buf.extend(&wire);
@@ -1028,6 +1037,7 @@ impl SafeSlot for Detach {
         let mut y = o.get().yielded;
         y.wire_len = wire_buf.written() as u64;
         y.frame_len = frame.written() as u64;
+        y.agreed = agreed;
         y.flags = if wire_pending || !rest.is_empty() {
             YIELD_MORE
         } else {
@@ -1211,6 +1221,9 @@ fn step(
                 }
             }
             fill(a, sink, o, class_of, fault_of);
+            // The protocol this accepted connection speaks, as its position in the accepting offer
+            // (`FramerYield::agreed`, busbar #1446), on every accepting yield.
+            o.set(|x| &x.yielded.agreed, a.agreed());
         }
     }
     Outcome::Ready
