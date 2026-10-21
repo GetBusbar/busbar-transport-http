@@ -7,7 +7,7 @@
 //! ARCHITECT correction 2026-09-27: "ONE ENTRY PER PLUGIN"). This crate's entry is its memory-ABI
 //! [`door`], a sans-IO framer: no socket, no waker, no clock of its own. The connector owns the
 //! socket and connection security and chooses the carrier from the target's scheme, so the framer
-//! composes over nothing (`COMPOSES_OVER` is empty: no transport names another). An `sse` stream is
+//! composes over nothing (its tail composes over nothing: no transport names another). An `sse` stream is
 //! an HTTP response body, so the `sse` claim is framed exactly as `http` is; a plane reads the event
 //! boundaries in the body it is handed.
 //! gRPC is its own transport plugin (OWNER 2026-09-29), not a claim of this one.
