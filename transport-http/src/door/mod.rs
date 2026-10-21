@@ -3,8 +3,9 @@
 
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
 //! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
-//! crate's ONE entry and claims two schemes, `http` and `sse` (an event stream is an HTTP response
-//! body, framed alike); it composes over nothing, the carrier being the connector's choice.
+//! crate's ONE entry and claims three schemes, `http`, `https` (an `http` target the connector
+//! secures) and `sse` (an event stream is an HTTP response body), all framed alike; it composes
+//! over nothing, the carrier being the connector's choice.
 //!
 //! A framer frames; it does not dial. The connector owns the socket and connection security; the
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
@@ -54,14 +55,12 @@
 
 pub mod dest_head;
 pub mod engine;
+mod framings;
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK,
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
@@ -82,11 +81,10 @@ use busbar_contract::abi::transport::{
     FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
     STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
 };
-use busbar_contract::transport::registry::{
-    facts as tfacts, status_ns, DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
-};
+use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
 use engine::{Framing, Posture, Proto};
+use framings::{Framings, Held};
 #[cfg(test)]
 use hyper_io::field_cut;
 use hyper_io::{fill, Owed};
@@ -245,31 +243,13 @@ const fn fault_rows() -> [FaultRow; FAULT_CLAIMS * HTTP_FAULTS.len()] {
     out
 }
 
-pub(crate) const SETTINGS: &[SettingDecl] = &[
-    SettingDecl {
-        path: abi_str(setting::H2_PRIOR_KNOWLEDGE),
-        kind: SETTING_FLAG,
-        _reserved: 0,
-        default: abi_str("false"),
-    },
-    SettingDecl {
-        path: abi_str(setting::HTTP1_ONLY),
-        kind: SETTING_FLAG,
-        _reserved: 0,
-        default: abi_str("false"),
-    },
-    SettingDecl {
-        path: abi_str(setting::REQUEST_TIMEOUT_SECS),
-        kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str("300"),
-    },
-    SettingDecl {
-        path: abi_str(setting::BODY_MAX_BYTES),
-        kind: SETTING_COUNT,
-        _reserved: 0,
-        default: abi_str("33554432"),
-    },
+/// Each setting this framer reads: its path, its kind and the default it declares. The ONE source
+/// of each default: the declarations below render from it and `read_settings` applies it.
+const SETTING_ROWS: [(&str, u32, &str); 4] = [
+    (setting::H2_PRIOR_KNOWLEDGE, SETTING_FLAG, "false"),
+    (setting::HTTP1_ONLY, SETTING_FLAG, "false"),
+    (setting::REQUEST_TIMEOUT_SECS, SETTING_COUNT, "300"),
+    (setting::BODY_MAX_BYTES, SETTING_COUNT, "33554432"),
 ];
 
 busbar_contract::statement_extensions!(
@@ -279,6 +259,30 @@ busbar_contract::statement_extensions!(
         include_bytes!("../../declares.json")
     )]
 );
+
+/// [`SETTING_ROWS`] as the Statement's setting declarations.
+const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
+    let mut out = [SettingDecl {
+        path: abi_str(""),
+        kind: 0,
+        _reserved: 0,
+        default: abi_str(""),
+    }; SETTING_ROWS.len()];
+    let mut i = 0;
+    while i < SETTING_ROWS.len() {
+        let (path, kind, default) = SETTING_ROWS[i];
+        out[i] = SettingDecl {
+            path: abi_str(path),
+            kind,
+            _reserved: 0,
+            default: abi_str(default),
+        };
+        i += 1;
+    }
+    out
+}
+
+pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
 pub const STATEMENT: Statement = Statement {
@@ -296,37 +300,42 @@ pub struct Instance {
     posture: Posture,
     prior_knowledge: bool,
     http1_only: bool,
-    framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
-    next: AtomicU64,
+    framings: Framings,
 }
 
-/// One framing the instance holds, by its token.
-struct Held {
-    framing: Framing,
+/// The default the count setting `path` declares ([`SETTING_ROWS`]).
+///
+/// # Panics
+/// When `path` is not a declared count with a numeric default: a fault in this file, which the
+/// settings tests reach on every count.
+fn declared_count(path: &str) -> u64 {
+    SETTING_ROWS
+        .iter()
+        .find(|(p, kind, _)| *p == path && *kind == SETTING_COUNT)
+        .and_then(|(_, _, default)| default.parse().ok())
+        .expect("a declared count setting with a numeric default")
 }
 
-/// The settings blob's bytes, parsed; `Err` names the first one that is not what its declaration
-/// says. An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), &'static str> {
+/// The settings blob's bytes, parsed; `Err` names, by its path, the first one that is not what its
+/// declaration says (the host renders the path instance-relative). An absent blob reads as `{}`.
+fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
     let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
-    let v: serde_json::Value = serde_json::from_slice(text).map_err(|_| "settings: not JSON")?;
+    let v: serde_json::Value =
+        serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
         Some(x) => x.as_bool().ok_or(k),
     };
-    let count = |k: &'static str, d: u64| match v.get(k) {
-        None => Ok(d),
+    // An absent count reads as the default its declaration states (`SETTINGS`): one source.
+    let count = |k: &'static str| match v.get(k) {
+        None => Ok(declared_count(k)),
         Some(x) => x.as_u64().ok_or(k),
     };
-    let err = |_| "settings: a value is not of its declared kind";
+    let err = |k: &str| format!("{k}: not of its declared kind");
     let prior = flag(setting::H2_PRIOR_KNOWLEDGE).map_err(err)?;
     let h1 = flag(setting::HTTP1_ONLY).map_err(err)?;
-    let secs = count(setting::REQUEST_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS).map_err(err)?;
-    let max = count(
-        setting::BODY_MAX_BYTES,
-        DEFAULT_REQUEST_BODY_MAX_BYTES as u64,
-    )
-    .map_err(err)?;
+    let secs = count(setting::REQUEST_TIMEOUT_SECS).map_err(err)?;
+    let max = count(setting::BODY_MAX_BYTES).map_err(err)?;
     Ok((
         Posture {
             // 1.5.5's egress client: keep-alive ping every 30s, 10s to answer, adaptive window on.
@@ -367,10 +376,8 @@ slot!(
     Validate, ValidateIn, OutHead, |_, i, o| {
         match read_settings(i.field(|x| &x.settings).bytes()) {
             Ok(_) => Outcome::Ready,
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
+            // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
         }
     }
 );
@@ -384,15 +391,12 @@ slot!(
                     posture,
                     prior_knowledge,
                     http1_only,
-                    framings: Mutex::new(HashMap::new()),
-                    next: AtomicU64::new(1),
+                    framings: Framings::default(),
                 });
                 Outcome::Ready
             }
-            Err(e) => {
-                o.error(e);
-                Outcome::Failed
-            }
+            // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
         }
     }
 );
@@ -509,10 +513,12 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// offered as written.
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
-    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
-        return v4.to_string();
+    // The contract's literal reader (`net::host_ip`): a dotted quad and every alternate spelling
+    // read as the IPv4 address they name; a DNS name or an IPv6 literal is offered as written.
+    match sdk::net::host_ip(bare) {
+        Some(ip) if ip.is_ipv4() && !bare.contains(':') => ip.to_string(),
+        _ => host.to_owned(),
     }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
 }
 
 /// `locate`.
@@ -602,15 +608,16 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
-        let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        let held = Arc::new(Mutex::new(Held { framing }));
-        inst.framings
-            .lock()
-            .expect("framings")
-            .insert(token, held.clone());
+        let Some(token) = inst.framings.insert(framing) else {
+            o.error("begin: every framing slot is in use");
+            return Outcome::Failed;
+        };
         o.set(|x| &x.framing, token);
-        let mut h = held.lock().expect("framing");
-        step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        let mut slot = match inst.framings.reach(token) {
+            Ok(s) => s,
+            Err(why) => return failed(&mut o, why.why().into()),
+        };
+        step(slot.held(), i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }
 }
 
@@ -678,16 +685,15 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p
-            .get()
-            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing));
-        o.set(|x| &x.yielded.flags, YIELD_ENDED);
-        if removed.is_some() {
-            Outcome::Ready
-        } else {
-            o.set(|x| &x.yielded.flags, 0);
-            o.error("finish: no such framing");
-            Outcome::Failed
+        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
+            inst.framings.remove(i.framing)
+        });
+        match removed {
+            Ok(()) => {
+                o.set(|x| &x.yielded.flags, YIELD_ENDED);
+                Outcome::Ready
+            }
+            Err(why) => failed(&mut o, format!("finish: {}", why.why())),
         }
     }
 }
@@ -764,15 +770,17 @@ fn with(
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
-    let held = p
-        .get()
-        .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
-    let Some(held) = held else {
+    let Some(inst) = p.get() else {
         o.error("no such framing");
         return Outcome::Failed;
     };
-    let mut h = held.lock().expect("framing");
-    step(&mut h, sink, o, f)
+    match inst.framings.reach(token) {
+        Ok(mut slot) => step(slot.held(), sink, o, f),
+        Err(why) => {
+            o.error(why.why());
+            Outcome::Failed
+        }
+    }
 }
 
 fn step(
@@ -799,13 +807,15 @@ fn failed(o: &mut Out<'_, FramerOut>, text: String) -> Outcome {
     o.fail(Refusal::failed(text))
 }
 
+/// The status class of `code`, from the classes the status rows state ([`HTTP_CLASSES`]);
+/// `STATUS_OTHER` off them.
 fn class_of(code: u16) -> u8 {
-    match code {
-        200..=299 => STATUS_SUCCESS,
-        400..=499 => STATUS_CALLER_FAULT,
-        500..=599 => STATUS_FAR_END_FAULT,
-        _ => STATUS_OTHER,
-    }
+    let code = u32::from(code);
+    HTTP_CLASSES
+        .iter()
+        .find(|(lo, hi, _)| (*lo..=*hi).contains(&code))
+        .and_then(|(_, _, class)| u8::try_from(*class).ok())
+        .unwrap_or(STATUS_OTHER)
 }
 
 /// The breaker's reading of `code`, from the fault table (`FAULT_NONE` off it).

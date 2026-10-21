@@ -27,11 +27,33 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
         (p.request_timeout, p.max_body_bytes),
         (Duration::from_secs(7), 9)
     );
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
     assert_eq!(
-        read_settings(blob(r#"{"advanced.upstream_http1_only":"yes"}"#)).err(),
-        Some("settings: a value is not of its declared kind")
+        refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
+        Some("advanced.upstream_http1_only: not of its declared kind")
     );
-    assert_eq!(read_settings(blob("[")).err(), Some("settings: not JSON"));
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
+        Some("limits.request_body_max_bytes: not of its declared kind")
+    );
+    assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
+}
+
+/// The defaults the settings declare are the host's own (`transport::registry`), so the door and
+/// the host read one figure for each.
+#[test]
+fn the_declared_defaults_are_the_hosts() {
+    use busbar_contract::transport::registry::{
+        DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
+    };
+    assert_eq!(
+        declared_count(setting::REQUEST_TIMEOUT_SECS),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        declared_count(setting::BODY_MAX_BYTES),
+        DEFAULT_REQUEST_BODY_MAX_BYTES as u64
+    );
 }
 
 /// Each status band lands in its class; anything outside the three bands is other.
@@ -322,4 +344,28 @@ fn the_entry_claims_http_https_and_sse() {
         .map(|r| (r.lo, r.hi, r.class))
         .collect();
     assert_eq!(https, http);
+}
+
+/// RED (audit A1 F6; THE DESIGN Appendix A.8: "zero contended atomics per chunk", request-path ops
+/// "return READY or PENDING in bounded CPU"; A.4.2: conn ops "never block"): the instance holds no
+/// lock that every framing's op takes, and no op waits on a framing's lock. A framing is reached
+/// by its own token alone (`framings::Framings`), and a framing another op holds is answered at
+/// once, never waited for. RED on the instance-wide `Mutex<HashMap>` every `ingest`, `emit`,
+/// `timer`, `begin` and `finish` locked, and the blocking `lock()` on the framing it found.
+#[test]
+fn no_op_takes_an_instance_wide_lock_or_waits_on_a_framing() {
+    let door = include_str!("../mod.rs");
+    let code: String = door
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("Mutex<HashMap"),
+        "an instance-wide map lock is taken per op"
+    );
+    assert!(
+        !code.contains(".lock().expect(\"framing\")"),
+        "an op waits on a framing's lock"
+    );
 }
