@@ -3100,6 +3100,75 @@ fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// The door's accepting offer as `locate` answers it on instance `inst` (`LocateIn::accept`).
+fn accepting_offer_on(ops: &'static Ops, inst: *mut c_void) -> Vec<u8> {
+    let (mut auth, mut name, mut alpn) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 256]);
+    let mut li: LocateIn = z();
+    li.accept = 1;
+    li.authority_buf = auth.as_mut_ptr();
+    li.authority_cap = auth.len();
+    li.name_buf = name.as_mut_ptr();
+    li.name_cap = name.len();
+    li.alpn_buf = alpn.as_mut_ptr();
+    li.alpn_cap = alpn.len();
+    let mut lo: LocateOut = z();
+    assert_eq!(
+        call(ops.locate, inst, &mut li, &mut lo, slot::LOCATE),
+        Outcome::Ready
+    );
+    alpn[..lo.alpn_written as usize].to_vec()
+}
+
+/// A NON-EMPTY ACCEPTING OFFER ON A CLEARTEXT LISTENER (busbar's framed worker asks the door for
+/// its accepting offer on every listener, TLS or not; in the clear the host uses the list only to
+/// resolve the position the door states, never in a handshake) changes nothing else on the
+/// accepted side: a cleartext `begin` after it states no protocol before the first bytes, expects
+/// no handshake, refuses nothing, and serves HTTP/1.1 as v1.5.5's listener did, stating only the
+/// position of `http/1.1` in that list.
+fn a_cleartext_offer_changes_nothing_else(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open(ops);
+    let offer = alpn_names(&accepting_offer_on(ops, h.inst));
+    assert!(
+        !offer.is_empty(),
+        "{label}: the accepting offer is not empty"
+    );
+    assert_eq!(h.agreed, 0, "{label}: no protocol before the first bytes");
+    assert!(
+        h.out.is_empty(),
+        "{label}: no handshake bytes and no refusal"
+    );
+    assert!(!h.ended, "{label}: the connection is served");
+    assert_eq!(
+        h.ingest(
+            b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello"
+        ),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: the request went up, not refused");
+    let http1 = offer
+        .iter()
+        .position(|n| n == b"http/1.1")
+        .map(|i| u32::try_from(i + 1).expect("a short offer"));
+    assert_eq!(Some(h.agreed), http1, "{label}: http/1.1's position");
+    assert_eq!(
+        h.emit(
+            1,
+            b"content-type: text/plain\r\ncontent-length: 2\r\n",
+            false,
+            201
+        ),
+        Outcome::Ready
+    );
+    assert_eq!(h.emit(1, b"ok", true, 0), Outcome::Ready);
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        "HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 2\r\n\r\nok",
+        "{label}: plain HTTP/1.1, as v1.5.5's listener answered"
+    );
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -3286,4 +3355,9 @@ fn an_answer_ending_with_the_body_unread_ends_the_stream_as_hyper_did_linked_and
 #[test]
 fn the_accepted_side_states_the_protocol_it_agreed_linked_and_dropped_in() {
     both(states_the_protocol_it_agreed);
+}
+
+#[test]
+fn a_cleartext_accepting_offer_changes_nothing_else_linked_and_dropped_in() {
+    both(a_cleartext_offer_changes_nothing_else);
 }
