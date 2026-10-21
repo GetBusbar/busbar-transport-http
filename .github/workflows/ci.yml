@@ -1,21 +1,35 @@
-# RENDERED by `cargo xtask fleet render busbar-transport-http` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. The CI itself is
-# busbar's plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref).
+# RENDERED by `busbar-release plugin heal busbar-transport-http` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. THIS REPO TESTS ITSELF AGAINST BUSBAR with the fleet's ONE
+# harness: busbar's reusable plugin-ci.yml, taken at the busbar commit this repo pins (.busbar-ref), so
+# the CI logic, the gates (busbar scripts/fleet/plugin-gates.py), the dependency policy
+# (.github/fleet/deps.toml) and the contract move together (OWNER 2026-10-02). No CI logic lives here.
 name: ci
 
 on:
+  # A tree is tested once: on its pull request into dev and on the push that lands it on dev. qa and
+  # main take dev's commits by pull request whose head is that tested commit: the checks it carries
+  # from dev's run satisfy the ruleset, and nothing re-tests it. Any other head: run this by hand
+  # (workflow_dispatch) on its branch.
   push:
-    branches: [dev, qa, main]
+    branches: [dev]
   pull_request:
-    branches: [dev, qa, main]
+    branches: [dev]
   workflow_dispatch: {}
+  # release.yml runs this file on the tagged commit before it publishes.
+  workflow_call: {}
+
+# A newer push to a pull request cancels its older run (only the newest commit can merge); a push to
+# dev, a dispatch and release.yml's call run to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@8f0e4c0da15b6fdf6a0f49dcc96e36e837fdd8ad
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@fee4a1ec4d31045a6fe46fa1317a710a0b0688a7
     with:
       service: none
       busbar_checkout: false
