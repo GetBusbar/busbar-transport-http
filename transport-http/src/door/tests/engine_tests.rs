@@ -23,7 +23,8 @@ fn asked(proto: Proto, timeout_secs: u64) -> Framing {
     let mut f = Framing::dial("http://127.0.0.1:9", proto, posture(timeout_secs), 0).expect("dial");
     // `begin` drives the handshake in its own op, before any request exists (as the door does).
     f.drive(0, 0);
-    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
     f.drive(0, 0);
     let sent = f.take_wire(usize::MAX);
     assert!(!sent.is_empty(), "the request went out");
@@ -250,7 +251,7 @@ fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
     let mut f =
         Framing::dial("http://127.0.0.1:9", Proto::H1, posture(300), connected).expect("dial");
     f.drive(connected, 0);
-    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", connected, 300 * SEC)
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, connected, 300 * SEC)
         .expect("emit");
     f.drive(connected, 0);
     assert!(!f.take_wire(usize::MAX).is_empty(), "the request went out");
@@ -273,34 +274,37 @@ fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
 fn h1_wire(message: &[u8]) -> String {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
     f.drive(0, 0);
-    f.emit(1, message, 0, 0).expect("emit");
+    f.emit(1, message, true, 0, 0).expect("emit");
     f.drive(0, 0);
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
 
-/// RED (THE DESIGN §5 l.722: "When the caller sets none, the http door adds `accept: */*`, and on
-/// h1 the host header and origin-form target: the http transport owns the client defaults
-/// (owner-agreed 2026-09-28)"): a request naming no `accept` leaves with 1.5.5's client default,
-/// after the caller's fields and before `host`, as reqwest wrote it; a request naming one leaves
-/// with exactly that one.
+/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "Nothing is added to the head after the auth has
+/// run"): the framer writes the head it is handed and adds no field line of its own at `encode`;
+/// its own lines (`accept`, `host`) are stated at `locate` and added by the host before the auth.
+/// RED on the framer that added them after the auth.
 #[test]
-fn the_door_adds_accept_when_the_caller_sets_none() {
+fn the_door_adds_no_line_to_the_head_it_is_handed() {
     let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
-    assert!(bare.starts_with("GET /x HTTP/1.1\r\n"), "{bare:?}");
+    let lower = bare.to_ascii_lowercase();
     assert!(
-        bare.to_ascii_lowercase()
-            .contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
+        lower.starts_with("get /x http/1.1\r\nx-a: 1\r\n"),
         "{bare:?}"
     );
-    let named = h1_wire(b"GET /x HTTP/1.1\r\naccept: application/json\r\n\r\n");
-    let lower = named.to_ascii_lowercase();
-    assert_eq!(lower.matches("accept:").count(), 1, "{named:?}");
-    assert!(lower.contains("accept: application/json\r\n"), "{named:?}");
+    assert!(!lower.contains("accept:"), "no accept was handed: {bare:?}");
+    assert!(!lower.contains("host:"), "no host was handed: {bare:?}");
+    let handed = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n\r\n");
+    assert!(
+        handed
+            .to_ascii_lowercase()
+            .contains("x-a: 1\r\naccept: */*\r\nhost: 127.0.0.1:9\r\n"),
+        "the handed head, as handed: {handed:?}"
+    );
 }
 
 /// What one emit of `message` on `stream` puts on the wire.
 fn sent(f: &mut Framing, stream: u64, message: &[u8]) -> String {
-    f.emit(stream, message, 0, 0).expect("emit");
+    f.emit(stream, message, true, 0, 0).expect("emit");
     f.drive(0, 0);
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
@@ -330,7 +334,11 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
     );
     answered(&mut f);
     let root = crate::transport::render_envelope(
-        &[("method", b"POST".as_slice()), ("path", b"/".as_slice())],
+        &[
+            ("method", b"POST".as_slice()),
+            ("path", b"/".as_slice()),
+            ("content-length", b"2".as_slice()),
+        ],
         b"{}",
     )
     .unwrap();
@@ -351,7 +359,8 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
 /// spelling goes out naming the address it spells, as 1.5.5's client sent it (its URL parser
 /// canonicalized the host before the request was built): `host: 127.0.0.1:9` for `127.1`,
 /// `2130706433` and `0x7f000001`, `host: 1.2.3.4:9` for `16909060`. A name and a dotted quad go out
-/// as written. RED on the framing that wrote the spelling into the `host` field.
+/// as written. RED on the framing that wrote the spelling into the `host` field. The `host` line is
+/// the one the framer states at `locate` ([`client_defaults`]).
 #[test]
 fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
     for (dial, host) in [
@@ -362,14 +371,11 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
         ("http://localhost:9", "localhost:9"),
         ("http://127.0.0.1:9", "127.0.0.1:9"),
     ] {
-        let mut f = Framing::dial(dial, Proto::H1, posture(30), 0).expect("dial");
-        f.drive(0, 0);
-        f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
-        f.drive(0, 0);
-        let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).to_ascii_lowercase();
+        // The `host` line is the framer's own, stated at `locate` (THE DESIGN §6 step 5).
+        let stated = client_defaults(&dial.parse().expect("a URL"));
         assert!(
-            wire.contains(&format!("host: {host}\r\n")),
-            "{dial}: {wire:?}"
+            stated.contains(&format!("host: {host}\r\n")),
+            "{dial}: {stated:?}"
         );
     }
 }
@@ -387,8 +393,14 @@ fn rendered_and_sent(
     };
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
     f.drive(0, 0);
-    let message = crate::transport::render_envelope(fields, body).expect("render");
-    let r = f.emit(1, &message, 0, 0);
+    // The length line the host states before the auth.
+    let len = body.len().to_string();
+    let mut stated = fields.to_vec();
+    if !body.is_empty() {
+        stated.push(("content-length", len.as_bytes()));
+    }
+    let message = crate::transport::render_envelope(&stated, body).expect("render");
+    let r = f.emit(1, &message, true, 0, 0);
     f.drive(0, 0);
     (r, f.take_wire(usize::MAX))
 }
@@ -416,7 +428,10 @@ fn a_request_body_at_the_cap_goes_out_with_its_head() {
 /// RED (THE DESIGN §2 l.393-397; `limits.request_body_max_bytes` is "the largest request body
 /// carried"): a CHUNKED request body is held to the cap as a declared one is. Its decoded body at
 /// the cap is carried; one byte over is refused, never carried for being inside the head allowance.
-/// RED on the framing that compared only a Content-Length against the cap.
+/// RED on the framing that compared only a Content-Length against the cap. The decoded body leaves
+/// as 1.5.5's client sent one: framed by its length, with no transfer coding (1.5.5's handlers took
+/// the decoded body as `Bytes`, `crates/busbar/src/proxy/engine/mod.rs:600`, and its client sent
+/// it with `.body(payload)`, `proxy/engine/walk.rs:592`).
 #[test]
 fn a_chunked_request_body_is_held_to_the_cap() {
     let chunked = |n: usize| {
@@ -433,17 +448,160 @@ fn a_chunked_request_body_is_held_to_the_cap() {
         };
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
         f.drive(0, 0);
-        let r = f.emit(1, message, 0, 0);
+        let r = f.emit(1, message, true, 0, 0);
         f.drive(0, 0);
-        r
+        let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).to_ascii_lowercase();
+        (r, wire)
     };
-    let at = send(&chunked(16));
+    let (at, wire) = send(&chunked(16));
     assert!(at.is_ok(), "a chunked body at the cap is carried: {at:?}");
-    let over = send(&chunked(17));
+    assert!(wire.starts_with("post /v1/x http/1.1\r\n"), "{wire:?}");
+    assert!(wire.contains("content-length: 16\r\n"), "{wire:?}");
+    assert!(!wire.contains("transfer-encoding"), "{wire:?}");
+    assert!(wire.ends_with("\r\n\r\nxxxxxxxxxxxxxxxx"), "{wire:?}");
+    let (over, _) = send(&chunked(17));
     assert!(
         over.is_err(),
         "a chunked body one byte over the cap is refused"
     );
+}
+
+/// RED (Q128 transport-http, bytes past the declared length): an emitted message whose bytes run
+/// past its stated `content-length` is refused at emit and nothing of it reaches the wire. RED on
+/// the framing that sent the declared prefix and dropped the rest.
+#[test]
+fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
+        true,
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    let wire = f.take_wire(usize::MAX);
+    assert!(
+        r.is_err(),
+        "bytes past the stated length are refused: {r:?}"
+    );
+    assert!(
+        wire.is_empty(),
+        "nothing of the refused message reaches the wire: {:?}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
+/// The HTTP/2 frame types in `wire` (no connection preface): what a connection wrote.
+fn h2_frame_types(wire: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 9 <= wire.len() {
+        let len =
+            usize::from(wire[i]) << 16 | usize::from(wire[i + 1]) << 8 | usize::from(wire[i + 2]);
+        out.push(wire[i + 3]);
+        i += 9 + len;
+    }
+    out
+}
+
+/// RED (Q128 transport-http, the refused h2 stream): a stream refused partway through its request
+/// message stays refused until the host's end of that message. The rest of the message, arriving
+/// in later emits, is never read as a fresh request on the same stream: a fresh request there
+/// would go upstream with a head the auth never saw. RED on the framing that forgot the refused
+/// stream and parsed its remaining bytes as a new message.
+#[test]
+fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    // The far end's SETTINGS: the connection is up, so a request handed to it goes out.
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    let _preface = f.take_wire(usize::MAX);
+    // Refused partway: bytes past the stated length.
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
+        false,
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    assert!(
+        r.is_ok(),
+        "an h2 stream's refusal is a failure piece: {r:?}"
+    );
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 1 && p.failed),
+        "stream 1 is refused"
+    );
+    f.pieces().clear();
+    // The rest of the same message, shaped like a request of its own.
+    let _ = f.emit(
+        1,
+        b"GET /never-authed HTTP/1.1\r\nx-injected: 1\r\n\r\n",
+        true,
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    let wire = f.take_wire(usize::MAX);
+    assert!(
+        !h2_frame_types(&wire).contains(&1),
+        "no HEADERS frame goes out for the rest of a refused message: {:?}",
+        String::from_utf8_lossy(&wire)
+    );
+    // The host's end of a message still short of its stated length refuses it.
+    let r = f.emit(
+        5,
+        b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\nhi",
+        true,
+        0,
+        0,
+    );
+    f.drive(0, 0);
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 5 && p.failed),
+        "a message that ends short of its stated length is refused"
+    );
+    assert!(
+        !h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
+        "and nothing of it goes out"
+    );
+    // The control: a request on a fresh stream does go out, as a HEADERS frame this reading sees.
+    f.emit(3, b"GET /ok HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
+    f.drive(0, 0);
+    assert!(
+        h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
+        "a fresh stream's request goes out"
+    );
+}
+
+/// RED (Q128 transport-http, the refused h1 exchange): on HTTP/1.1, where the connection carries
+/// one exchange, a request refused at emit drops its exchange and its buffered bytes and fails the
+/// framing, as `emit`'s doc states. RED on the framing that answered the refusal but kept the
+/// half-written exchange and a live connection.
+#[test]
+fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
+    // A chunked body alone is decoded and carried, as 1.5.5 carried one (rule 1, row 192:
+    // `a_chunked_request_body_is_held_to_the_cap`); beside a `content-length` it is the smuggling
+    // shape, refused.
+    for message in [
+        &b"POST /x HTTP/1.1\r\ncontent-length: 7\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
+    ] {
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message, true, 0, 0);
+        assert!(r.is_err(), "refused: {r:?}");
+        assert!(f.exchanges.is_empty(), "the refused exchange is dropped");
+        assert!(f.failure().is_some(), "the framing is failed");
+        f.drive(0, 0);
+        assert!(f.take_wire(usize::MAX).is_empty(), "nothing goes out");
+    }
 }
 
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
@@ -470,6 +628,181 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
     );
 }
 
+/// RED (1.5.5 parity, Q128 transport-http LOW): the dial's authority is the one 1.5.5's URL parser
+/// (WHATWG, reqwest 0.12) sent: the host lower-cased and the scheme's own port dropped, so
+/// `:authority` on HTTP/2 and the stated `host` line on HTTP/1.1 are one string. RED on the
+/// normalisation that only rewrote IPv4 spellings.
+#[test]
+fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
+    for (dial, authority) in [
+        ("http://API.Example.COM:80/x", "api.example.com"),
+        ("https://API.Example.COM:443/x", "api.example.com"),
+        ("https://API.Example.COM:8443/x", "api.example.com:8443"),
+        ("http://127.1:80/x", "127.0.0.1"),
+        ("http://Peer.Test:8080/x", "peer.test:8080"),
+    ] {
+        let uri = canonical_host(dial.parse().expect("a URL"));
+        assert_eq!(
+            uri.authority().map(http::uri::Authority::as_str),
+            Some(authority),
+            "{dial}"
+        );
+        assert!(
+            client_defaults(&dial.parse().expect("a URL"))
+                .contains(&format!("host: {authority}\r\n")),
+            "{dial}: the host line is the same string"
+        );
+    }
+}
+
+/// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
+/// 2026-10-19): the head the auth saw is the head on the wire. The host states the length before
+/// the auth (last, after the framer's own lines, as 1.5.5's goldens order it); the framer renders
+/// exactly that head, one length line and no other, and the connection sends it unchanged. A
+/// non-empty body with no stated length cannot be framed without a line the auth never saw, so it
+/// is refused. RED on the framer that appended its own length line to every request.
+#[test]
+fn the_wire_head_is_the_head_the_auth_saw() {
+    let seen: &[(&str, &[u8])] = &[
+        ("method", b"POST"),
+        ("path", b"/v1/x"),
+        ("content-type", b"application/json"),
+        ("accept", b"*/*"),
+        ("host", b"127.0.0.1:9"),
+        ("content-length", b"2"),
+    ];
+    let message = crate::transport::render_envelope(seen, b"hi").expect("render");
+    let text = String::from_utf8_lossy(&message).to_ascii_lowercase();
+    assert_eq!(text.matches("content-length:").count(), 1, "{text:?}");
+    let wire = h1_wire(&message);
+    let head: Vec<&str> = wire
+        .split("\r\n\r\n")
+        .next()
+        .expect("a head")
+        .split("\r\n")
+        .skip(1)
+        .collect();
+    assert_eq!(
+        head,
+        [
+            "content-type: application/json",
+            "accept: */*",
+            "host: 127.0.0.1:9",
+            "content-length: 2"
+        ],
+        "the wire head is the head the auth saw: {wire:?}"
+    );
+    assert!(
+        crate::transport::render_envelope(&seen[..5], b"hi").is_err(),
+        "a body with no stated length is refused"
+    );
+    // An empty body states no length, and none goes out (1.5.5's client sent none).
+    let get: &[(&str, &[u8])] = &[
+        ("method", b"GET"),
+        ("path", b"/x"),
+        ("host", b"127.0.0.1:9"),
+    ];
+    let bare = h1_wire(&crate::transport::render_envelope(get, b"").expect("render"));
+    assert!(
+        !bare.to_ascii_lowercase().contains("content-length"),
+        "{bare:?}"
+    );
+}
+
+/// What an HTTP/2 far end reads off `wire`, a client connection's bytes: its first request's
+/// field lines in order, pseudo-fields aside, and its `:authority`.
+fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
+    use tokio::io::AsyncWriteExt;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async move {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client.write_all(&wire).await.expect("the wire");
+        let mut conn = h2::server::handshake(server).await.expect("handshake");
+        let (req, _answer) = conn
+            .accept()
+            .await
+            .expect("a request")
+            .expect("an HTTP/2 request");
+        let lines = req
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let authority = req.uri().authority().map(ToString::to_string);
+        drop(client);
+        (lines, authority.unwrap_or_default())
+    })
+}
+
+/// RED (ruling 23; BUSBAR-1.6.0.md l.3779, §4 item 5: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH
+/// HAS RUN): an auth that signs the whole head sees every line on the wire. The head the auth saw
+/// (its own line, the plane's fields, the framer's stated lines, the host's length line) is the
+/// head a far end reads, line for line and in order, on HTTP/1.1 and on HTTP/2 (where the `host`
+/// line is the `:authority`). The one exception, an empty payload-method body on HTTP/2, is
+/// `meta::TAIL`'s and pinned in `tests/h2_parity.rs`; this cell's body is not empty.
+#[test]
+fn the_head_on_the_wire_is_every_line_the_auth_saw() {
+    let seen: &[(&str, &[u8])] = &[
+        ("method", b"POST"),
+        ("path", b"/v1/x"),
+        ("authorization", b"Bearer signed-over-the-whole-head"),
+        ("content-type", b"application/json"),
+        ("x-plane", b"1"),
+        ("accept", b"*/*"),
+        ("host", b"127.0.0.1:9"),
+        ("content-length", b"2"),
+    ];
+    let lines: Vec<(String, String)> = seen[2..]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), String::from_utf8_lossy(v).into_owned()))
+        .collect();
+    let message = crate::transport::render_envelope(seen, b"hi").expect("render");
+
+    // HTTP/1.1: the head, line for line.
+    let wire = h1_wire(&message);
+    let head: Vec<(String, String)> = wire
+        .split("\r\n\r\n")
+        .next()
+        .expect("a head")
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|l| l.split_once(": "))
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.to_owned()))
+        .collect();
+    assert_eq!(
+        head, lines,
+        "h1: the wire head is every line the auth saw, and no other"
+    );
+
+    // HTTP/2: the far end's reading of the door's own frames.
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let mut wire = f.take_wire(usize::MAX);
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    f.emit(1, &message, true, 0, 0).expect("emit");
+    f.drive(0, 0);
+    wire.extend(f.take_wire(usize::MAX));
+    let (got, authority) = h2_far_end_reads(wire);
+    let want: Vec<(String, String)> = lines.iter().filter(|(k, _)| k != "host").cloned().collect();
+    assert_eq!(
+        got, want,
+        "h2: the field lines are every line the auth saw, and no other"
+    );
+    assert_eq!(
+        authority, "127.0.0.1:9",
+        "h2: the auth's host line is the :authority"
+    );
+}
+
 /// RED (audit A1 F3; this method's own contract: a message that cannot be sent fails "the framing
 /// on HTTP/1.1, where the connection carries one exchange"): an HTTP/1.1 `emit` that is refused
 /// (here, a body over the cap) fails the FRAMING, so the next op answers FAILED, and keeps nothing
@@ -486,6 +819,7 @@ fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
     let r = f.emit(
         1,
         b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\n123456789",
+        true,
         0,
         0,
     );
@@ -509,7 +843,7 @@ fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
 #[test]
 fn a_request_trailer_never_joins_the_header_section() {
     let wire = h1_wire(
-        b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n\
+        b"POST /x HTTP/1.1\r\nhost: 127.0.0.1:9\r\ntransfer-encoding: chunked\r\n\r\n\
           3\r\nabc\r\n0\r\nhost: elsewhere\r\nconnection: close\r\nx-t: 1\r\n\r\n",
     );
     let lower = wire.to_ascii_lowercase();
@@ -534,7 +868,7 @@ fn a_target_not_in_origin_form_is_refused_not_rewritten() {
         let message = format!("GET {target} HTTP/1.1\r\n\r\n");
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
         f.drive(0, 0);
-        let r = f.emit(1, message.as_bytes(), 0, 0);
+        let r = f.emit(1, message.as_bytes(), true, 0, 0);
         f.drive(0, 0);
         let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned();
         assert!(r.is_err(), "h1 {target}: refused: {wire:?}");
@@ -545,7 +879,7 @@ fn a_target_not_in_origin_form_is_refused_not_rewritten() {
 
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
         f.drive(0, 0);
-        f.emit(1, message.as_bytes(), 0, 0)
+        f.emit(1, message.as_bytes(), true, 0, 0)
             .expect("h2 answers per stream");
         assert!(
             f.pieces().iter().any(|p| p.stream == 1 && p.failed),

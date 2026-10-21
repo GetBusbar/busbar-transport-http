@@ -143,7 +143,10 @@ pub(crate) fn request_target(
 /// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
 /// a chunked body seen, or a message that declares neither coding and therefore carries no body at
 /// all. A chunked message is decoded here, so what comes back always carries the body itself rather
-/// than a framing of it.
+/// than a framing of it, as 1.5.5 carried one: its server decoded a chunked request body into the
+/// buffered `Bytes` its proxy handler took (`crates/busbar/src/proxy/engine/mod.rs:600`, capped by
+/// `DefaultBodyLimit`, `main.rs:3877`), and its client sent that body on with its length
+/// (`proxy/engine/walk.rs:592`), never chunked. A byte past either ending is refused (`Framing`).
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,

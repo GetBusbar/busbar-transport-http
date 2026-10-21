@@ -85,6 +85,10 @@ enum Stage {
     /// The response body, and where its last queued byte stands in the framing's queue
     /// (`Queue::pushed` just after it was queued).
     Body(Incoming, Pin<Box<dyn Sleep>>, u64),
+    /// Refused partway through its request message (HTTP/2): the failure piece is out, and every
+    /// later byte of THAT message is dropped until the host's end of it, so the rest is never read
+    /// as a fresh request on the same stream (a head the auth never saw).
+    Refused,
     /// Answered in full.
     Done,
 }
@@ -224,7 +228,9 @@ impl Framing {
         self.io.ingest(bytes, end);
     }
 
-    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`.
+    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`; `end` is the
+    /// host's end of that message (`EmitIn::end_of_frame`). A message still short of what its head
+    /// declares at its end is refused.
     ///
     /// A message that cannot be sent fails its STREAM on HTTP/2 (a failure piece, its siblings
     /// untouched), and the framing on HTTP/1.1, where the connection carries one exchange.
@@ -240,11 +246,24 @@ impl Framing {
         &mut self,
         stream: u64,
         bytes: &[u8],
+        end: bool,
         now_ns: u64,
         deadline_ns: u64,
     ) -> Result<(), Failure> {
+        // The rest of a refused message is dropped, never read; the host's end of it frees the
+        // stream.
+        if let Some(i) = self
+            .exchanges
+            .iter()
+            .position(|(s, st)| *s == stream && matches!(st, Stage::Refused))
+        {
+            if end {
+                self.exchanges.remove(i);
+            }
+            return Ok(());
+        }
         // A re-call after `YIELD_MORE` carries no new bytes: nothing to add to any message.
-        if bytes.is_empty() {
+        if bytes.is_empty() && !end {
             return Ok(());
         }
         let deadline = if deadline_ns != 0 {
@@ -254,20 +273,46 @@ impl Framing {
                 u64::try_from(self.posture.request_timeout.as_nanos()).unwrap_or(u64::MAX),
             )
         };
-        let Err(f) = self.message(stream, bytes, deadline) else {
-            return Ok(());
+        let read = if bytes.is_empty() {
+            Ok(())
+        } else {
+            self.message(stream, bytes, deadline)
         };
-        // Whatever the refused message had buffered goes with it, on either HTTP.
-        if let Some(slot) = self.exchanges.iter_mut().find(|(s, _)| *s == stream) {
-            slot.1 = Stage::Done;
+        // The host's end of a message still arriving: it ended short of what its head declared.
+        let read = read.and_then(|()| {
+            let short = self
+                .exchanges
+                .iter()
+                .any(|(s, st)| *s == stream && matches!(st, Stage::Writing(..)));
+            if end && short {
+                Err(Failure(
+                    "request message: it ended short of its stated length".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        match read {
+            Ok(()) => Ok(()),
+            Err(f) if self.proto == Proto::H2 => {
+                // Refused partway: the stream stays refused until the host's end of the message.
+                let after = if end { Stage::Done } else { Stage::Refused };
+                match self.exchanges.iter_mut().find(|(s, _)| *s == stream) {
+                    Some(slot) => slot.1 = after,
+                    None => self.exchanges.push((stream, after)),
+                }
+                self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
+                self.out.push(Piece::failure(stream, &f.0));
+                Ok(())
+            }
+            Err(f) => {
+                // HTTP/1.1: the connection carries one exchange, so its refusal is the framing's.
+                // The half-written exchange and its buffered bytes go with it.
+                self.exchanges.retain(|(s, _)| *s != stream);
+                self.failed = Some(f.clone());
+                Err(f)
+            }
         }
-        self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
-        if self.proto == Proto::H2 {
-            self.out.push(Piece::failure(stream, &f.0));
-            return Ok(());
-        }
-        self.failed = Some(f.clone());
-        Err(f)
     }
 
     fn message(&mut self, stream: u64, bytes: &[u8], deadline: u64) -> Result<(), Failure> {
@@ -296,27 +341,26 @@ impl Framing {
         let raw = complete_message(buf, head, max)
             .map_err(|e| Failure(format!("request message: {e:?}")))?;
         let Some(raw) = raw else { return Ok(()) };
-        let RawStartLine::Request { method, path } = &raw.start else {
-            return Err(Failure("a status line is not a request".into()));
-        };
+        let RawStartLine { method, path } = &raw.start;
         let target = request_target(&self.dial, path.as_deref(), !self.carried)
             .map_err(|e| Failure(format!("{e:?}")))?;
         self.carried = true;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
-            // hyper frames the body below; a length or coding the message carried describes the
-            // wire it was written for, not the one going out.
-            if k.eq_ignore_ascii_case("transfer-encoding")
-                || k.eq_ignore_ascii_case("content-length")
-            {
+            // A chunked body was decoded by `complete_message`, so its coding describes the wire
+            // it was written for, not the one going out: hyper frames the body by its length, as
+            // 1.5.5's client sent a decoded body on (`crates/busbar/src/proxy/engine/walk.rs:592`).
+            if k.eq_ignore_ascii_case("transfer-encoding") {
                 continue;
             }
+            // Every other line goes out as stated. The length line is the one the auth saw (THE
+            // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
             b = b.header(k.as_str(), v.as_slice());
         }
         let mut req = b
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
-        client_posture(&mut req, self.proto)?;
+        target_form(&mut req, self.proto)?;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
@@ -338,7 +382,11 @@ impl Framing {
         }
         let err = self.conn_err.lock().expect("err").clone();
         if let Some(e) = err {
-            if !self.exchanges.is_empty() {
+            if self
+                .exchanges
+                .iter()
+                .any(|(_, s)| !matches!(s, Stage::Refused))
+            {
                 self.failed = Some(Failure(e));
             }
         }
@@ -405,23 +453,29 @@ impl Owed for Framing {
     }
 }
 
-/// The dial target with an IPv4 spelling in its host written as the dotted quad it names
-/// ([`super::offered_name`]), so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2)
-/// carry the address 1.5.5's client sent: its URL parser canonicalized the host before the
-/// request was built (`https://127.1:4318/` went out as `host: 127.0.0.1:4318`). Any other host is
-/// kept as written.
+/// The dial target with its authority as 1.5.5's client sent it (its URL parser, WHATWG in
+/// reqwest 0.12, normalised the host before the request was built): the host lower-cased, an IPv4
+/// spelling written as the dotted quad it names ([`super::offered_name`]; `https://127.1:4318/`
+/// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
+/// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
 fn canonical_host(dial: http::Uri) -> http::Uri {
     let Some(host) = dial.host() else {
         return dial;
     };
-    let name = super::offered_name(host);
-    if name == host {
-        return dial;
-    }
-    let authority = match dial.port_u16() {
+    let name = super::offered_name(&host.to_ascii_lowercase());
+    let default_port = match dial.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    };
+    let port = dial.port_u16().filter(|p| Some(*p) != default_port);
+    let authority = match port {
         Some(p) => format!("{name}:{p}"),
         None => name,
     };
+    if dial.authority().map(http::uri::Authority::as_str) == Some(authority.as_str()) {
+        return dial;
+    }
     let Ok(authority) = authority.parse::<http::uri::Authority>() else {
         return dial;
     };
@@ -430,34 +484,45 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
     http::Uri::from_parts(parts).unwrap_or(dial)
 }
 
-/// The client defaults the http transport owns (THE DESIGN §5: "When the caller sets none, the
-/// http door adds `accept: */*`, and on h1 the host header and origin-form target: the http
-/// transport owns the client defaults"), so the bytes on the wire are the bytes 1.5.5 sent:
-/// `accept: */*` after the caller's fields where it set none, as reqwest added its default; on
-/// HTTP/1.1, hyper-util's `host` field (the port only when it is not the scheme's own) with the
-/// target rewritten to origin form. On HTTP/2 the target stays absolute: it becomes `:scheme`,
-/// `:authority` and `:path`. The target's path is origin form already (`request_target` refuses
-/// any other); one that is not fails the request rather than going somewhere else.
-fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
-    req.headers_mut()
-        .entry(http::header::ACCEPT)
-        .or_insert(http::HeaderValue::from_static("*/*"));
-    if proto == Proto::H2 {
-        return Ok(());
-    }
-    let uri = req.uri().clone();
-    if let Some(host) = uri.host() {
-        let secure = matches!(uri.scheme_str(), Some("https"));
-        let value = match uri.port_u16() {
+/// THE FRAMER'S OWN HEAD LINES for a request to `target`: the client defaults the http transport
+/// owns (THE DESIGN §5: "When the caller sets none, the http door adds `accept: */*`, and on h1 the
+/// host header and origin-form target: the http transport owns the client defaults"), in 1.5.5's
+/// order: `accept: */*`, as reqwest added its default after the caller's fields, then hyper-util's
+/// `host` (the port only when it is not the scheme's own). `locate` states them and the host adds
+/// each the request does not carry BEFORE the auth signs the head (THE DESIGN §6 step 5, OWNER-
+/// LOCKED: "Nothing is added to the head after the auth has run"); `encode` adds none. Field lines,
+/// `name: value` CRLF each. On HTTP/2 the `host` line is the target's `:authority`, as there.
+pub(crate) fn client_defaults(target: &http::Uri) -> String {
+    let mut lines = String::from("accept: */*\r\n");
+    // The host 1.5.5's client sent: an IPv4 spelling as the address it names.
+    let target = canonical_host(target.clone());
+    if let Some(host) = target.host() {
+        let secure = matches!(target.scheme_str(), Some("https"));
+        let value = match target.port_u16() {
             Some(443) if secure => host.to_owned(),
             Some(80) if !secure => host.to_owned(),
             Some(p) => format!("{host}:{p}"),
             None => host.to_owned(),
         };
-        if let Ok(v) = http::HeaderValue::from_str(&value) {
-            req.headers_mut().entry(http::header::HOST).or_insert(v);
-        }
+        lines.push_str("host: ");
+        lines.push_str(&value);
+        lines.push_str("\r\n");
     }
+    lines
+}
+
+/// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
+/// to origin form (the `host` line the host added carries the authority); on HTTP/2 it stays
+/// absolute, becoming `:scheme`, `:authority` and `:path`, and a `host` line is that `:authority`,
+/// not a field of its own (1.5.5's HTTP/2 requests carried none). The target's path is origin form
+/// already (`request_target` refuses any other); one that is not fails the request rather than
+/// going somewhere else (audit A1 F5).
+fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
+    if proto == Proto::H2 {
+        req.headers_mut().remove(http::header::HOST);
+        return Ok(());
+    }
+    let uri = req.uri().clone();
     *req.uri_mut() = match uri.path_and_query() {
         Some(p) if p.as_str() != "/" => p
             .as_str()
@@ -499,7 +564,7 @@ fn advance(
     let own = |e: hyper::Error| (Failure(e.to_string()), false);
     loop {
         match stage {
-            Stage::Writing(..) | Stage::Done => return Ok(false),
+            Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(false),
             Stage::Queued(_, wait) => {
                 if wait.as_mut().poll(cx).is_ready() {
                     return Err(timed_out());

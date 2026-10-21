@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The crate's own battery: the HTTP/1.1 message an `emit` accumulates (one parse and one chunked
-//! decode per message, the smuggling pair refused), the request envelope `encode` renders, the
+//! The crate's own battery: the HTTP/1.1 message an `emit` accumulates (one parse per message, a
+//! transfer coding refused at its head, the smuggling pair with it), the request envelope `encode` renders, the
 //! start-line check, and the `Retry-After` reading a response head carries. The framer's own ops
 //! are proven in `door/tests` and the crate's integration tests.
 
@@ -52,8 +52,7 @@ fn retry_after_parses_both_normative_forms() {
 ///
 /// `write` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
 /// used to re-run the whole header parse over the same unchanged prefix each time — a fresh Vec and
-/// two Strings per header, allocated and dropped, for every chunk of the body. Same standard the
-/// crate holds its chunked decoding to, now applied here.
+/// two Strings per header, allocated and dropped, for every chunk of the body.
 #[test]
 fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".to_vec();
@@ -196,7 +195,10 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
     );
     assert!(raw::parse_message(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_some());
     assert!(raw::parse_message(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_some());
-    assert!(raw::parse_message(b"HTTP/1.1 200 OK\r\n\r\n").is_some());
+    assert!(
+        raw::parse_message(b"HTTP/1.1 200 OK\r\n\r\n").is_none(),
+        "a status line is not a request: the envelope `emit` reads always is one"
+    );
 }
 
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
@@ -212,6 +214,7 @@ fn the_envelope_encodes_as_an_http_message() {
             ("method", b"POST".as_slice()),
             ("path", b"/v1/messages".as_slice()),
             ("authorization", b"Token substituted".as_slice()),
+            ("content-length", b"13".as_slice()),
         ],
         b"{\"model\":\"m\"}",
     )
@@ -225,7 +228,7 @@ fn the_envelope_encodes_as_an_http_message() {
     assert!(text.contains("authorization: Token substituted\r\n"));
     assert!(
         text.contains("content-length: 13\r\n"),
-        "the length is a fact about the bytes below, stated by the transport"
+        "the length the head states, rendered where it was stated"
     );
     assert!(text.ends_with("\r\n\r\n{\"model\":\"m\"}"));
 
@@ -233,7 +236,7 @@ fn the_envelope_encodes_as_an_http_message() {
     let parsed = raw::parse_message(&bytes).expect("a message it can read");
     assert_eq!(
         parsed.start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "POST".to_string(),
             path: Some("/v1/messages".to_string())
         }
@@ -250,7 +253,7 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
     assert!(unnamed.starts_with(b"GET  HTTP/1.1\r\n"), "{unnamed:?}");
     assert_eq!(
         raw::parse_message(&unnamed).expect("readable").start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "GET".to_string(),
             path: None
         }
@@ -262,7 +265,7 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
     .unwrap();
     assert_eq!(
         raw::parse_message(&root).expect("readable").start,
-        raw::RawStartLine::Request {
+        raw::RawStartLine {
             method: "GET".to_string(),
             path: Some("/".to_string())
         }
@@ -285,7 +288,7 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
         ("path", b"/a\r\nHost: elsewhere".as_slice()),
     ];
     for field in poisoned {
-        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"body")
+        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"")
             .expect_err("a field carrying a line ending is not encodable");
         assert_eq!(
             err,
@@ -296,8 +299,14 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     }
     // And an ordinary envelope beside them still encodes, so the check refuses injection rather
     // than refusing headers.
-    crate::transport::render_envelope(&[("x-note", b"ok".as_slice())], b"body")
-        .expect("a clean field still encodes");
+    crate::transport::render_envelope(
+        &[
+            ("x-note", b"ok".as_slice()),
+            ("content-length", b"4".as_slice()),
+        ],
+        b"body",
+    )
+    .expect("a clean field still encodes");
 }
 
 /// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
@@ -333,6 +342,54 @@ fn a_field_name_that_is_not_a_token_is_refused() {
     .expect("token names still encode");
     let text = String::from_utf8(ok).unwrap();
     assert_eq!(text.matches("authorization").count(), 1);
+}
+
+/// RED (Q128 transport-http, bytes past the declared length): a message whose bytes run past the
+/// `Content-Length` its head declares is refused (`Framing`), never cut to the length and the rest
+/// silently dropped. The length is the one the host stated before the auth; bytes past it are
+/// bytes the head does not describe. RED on the reader that sent the declared prefix and threw the
+/// remainder away.
+#[test]
+fn egress_refuses_bytes_past_the_declared_length() {
+    let over = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabcEXTRA";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(over, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "bytes past the declared length are refused, not dropped"
+    );
+    let empty_over = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(empty_over, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a head that declares no length carries no body byte"
+    );
+    let exact = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    let mut cache = EgressHead::default();
+    let done = complete_message(exact, &mut cache, usize::MAX)
+        .unwrap()
+        .expect("exactly the declared length completes");
+    assert_eq!(done.body, b"abc");
+}
+
+/// RED (Q128 transport-http, the non-token method): `encode` refuses a method that is not an RFC 9110
+/// token, and a target carrying a space, as `Unrepresentable`, never answering READY with a request
+/// line its own `emit` then refuses. RED on the encode that checked only for line-ending bytes.
+#[test]
+fn encode_refuses_a_request_line_its_emit_could_not_read() {
+    let refused = |method: &[u8], path: &[u8]| {
+        crate::transport::render_envelope(&[("method", method), ("path", path)], b"").is_err()
+    };
+    assert!(refused(b"GE T", b"/x"), "a space in the method");
+    assert!(refused(b"G(T", b"/x"), "a separator in the method");
+    assert!(refused(b"", b"/x"), "an empty method");
+    assert!(refused(b"GET", b"/a b"), "a space in the target");
+    assert!(
+        !refused(b"GET", b"/x"),
+        "a token method and a clean target render"
+    );
+    assert!(!refused(b"M-SEARCH", b"/x"), "any token method renders");
 }
 
 /// RED (audit A1 F10; `limits.request_body_max_bytes` is the BODY's cap, held to a `Content-Length`

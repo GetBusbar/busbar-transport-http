@@ -11,13 +11,21 @@ fn blob(s: &'static str) -> &'static [u8] {
 /// The settings default to 1.5.5's posture, and a value of the wrong kind is refused by name.
 #[test]
 fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
-    let (p, prior, h1) = read_settings(blob("{}")).expect("defaults");
+    let Settings {
+        posture: p,
+        prior_knowledge: prior,
+        http1_only: h1,
+    } = read_settings(blob("{}")).expect("defaults");
     assert_eq!(p.keep_alive_interval, Some(Duration::from_secs(30)));
     assert_eq!(p.keep_alive_timeout, Duration::from_secs(10));
     assert!(p.adaptive_window);
     assert_eq!(p.request_timeout, Duration::from_secs(300));
     assert!(!prior && !h1);
-    let (p, prior, h1) = read_settings(blob(
+    let Settings {
+        posture: p,
+        prior_knowledge: prior,
+        http1_only: h1,
+    } = read_settings(blob(
         r#"{"advanced.upstream_h2_prior_knowledge":true,"advanced.upstream_http1_only":true,
             "limits.upstream_request_timeout_secs":7,"limits.request_body_max_bytes":9}"#,
     ))
@@ -127,8 +135,8 @@ fn every_classed_claim_has_the_fault_table() {
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     let keys = |s: &'static str| {
-        let (_, prior, h1) = read_settings(blob(s)).expect("settings");
-        (prior, h1)
+        let x = read_settings(blob(s)).expect("settings");
+        (x.prior_knowledge, x.http1_only)
     };
     let offer = |secure, s| {
         let (prior, h1) = keys(s);
@@ -344,6 +352,16 @@ fn the_entry_claims_http_https_and_sse() {
         .map(|r| (r.lo, r.hi, r.class))
         .collect();
     assert_eq!(https, http);
+}
+
+/// RED (coordinator ruling L1; contract `FACT_ACCEPTS`/`FACT_DIALS`/`FACT_DETACHES`/`FACT_ADOPTS`):
+/// the tail states exactly the ops this door serves. At this commit that is dialling alone; it states
+/// no retired bit (bit 1, spec l.3779; the rule it named is proven by
+/// `the_head_on_the_wire_is_every_line_the_auth_saw`). RED on the tail that declared nothing.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::FACT_DIALS;
+    assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
 }
 
 /// RED (audit A1 F6; THE DESIGN Appendix A.8: "zero contended atomics per chunk", request-path ops
