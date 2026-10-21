@@ -323,3 +323,27 @@ fn the_entry_claims_http_https_and_sse() {
         .collect();
     assert_eq!(https, http);
 }
+
+/// RED (audit A1 F6; THE DESIGN Appendix A.8: "zero contended atomics per chunk", request-path ops
+/// "return READY or PENDING in bounded CPU"; A.4.2: conn ops "never block"): the instance holds no
+/// lock that every framing's op takes, and no op waits on a framing's lock. A framing is reached
+/// by its own token alone (`framings::Framings`), and a framing another op holds is answered at
+/// once, never waited for. RED on the instance-wide `Mutex<HashMap>` every `ingest`, `emit`,
+/// `timer`, `begin` and `finish` locked, and the blocking `lock()` on the framing it found.
+#[test]
+fn no_op_takes_an_instance_wide_lock_or_waits_on_a_framing() {
+    let door = include_str!("../mod.rs");
+    let code: String = door
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("Mutex<HashMap"),
+        "an instance-wide map lock is taken per op"
+    );
+    assert!(
+        !code.contains(".lock().expect(\"framing\")"),
+        "an op waits on a framing's lock"
+    );
+}
