@@ -313,4 +313,3 @@ pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> (Option<usize>, 
     };
     (found, scanned)
 }
-

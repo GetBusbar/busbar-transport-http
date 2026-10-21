@@ -543,7 +543,9 @@ fn advance(
             Stage::Body(b, wait, last) => {
                 // Held: the host has not yet taken enough of what this stream already queued.
                 // The body stays unpolled (its credit unreturned) under the same one clock.
-                if k.hold.is_some_and(|taken| last.saturating_sub(taken) >= BODY_HOLD) {
+                if k.hold
+                    .is_some_and(|taken| last.saturating_sub(taken) >= BODY_HOLD)
+                {
                     if wait.as_mut().poll(cx).is_ready() {
                         return Err(timed_out());
                     }
