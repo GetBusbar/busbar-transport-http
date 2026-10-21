@@ -4,8 +4,8 @@
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
 //! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
 //! crate's ONE entry and claims three schemes, `http`, `https` (an `http` target the connector
-//! secures) and `sse` (an event stream is an HTTP response body, framed alike); it composes over
-//! nothing, the carrier being the connector's choice.
+//! secures) and `sse` (an event stream is an HTTP response body), all framed alike; it composes
+//! over nothing, the carrier being the connector's choice.
 //!
 //! A framer frames; it does not dial. The connector owns the socket and connection security; the
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
@@ -79,6 +79,7 @@
 pub(crate) mod accept;
 pub(crate) mod dest_head;
 pub(crate) mod engine;
+mod framings;
 pub(crate) mod guest;
 
 // This crate's own seal over what the auth handle answers (`Services::auth_call`): an accepting
@@ -89,9 +90,7 @@ busbar_contract::own_seal!(Own);
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use std::task::Poll;
@@ -127,6 +126,7 @@ use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 use accept::{Accepted, AuthCalled, Kernel};
 use busbar_contract::abi::transport::check::check_emit_status;
 use engine::{Framing, Posture, Proto};
+use framings::{Framings, Held};
 #[cfg(test)]
 use hyper_io::field_cut;
 use hyper_io::{fill, mark_stream_full, Owed};
@@ -368,8 +368,8 @@ pub(crate) struct Instance {
     /// Swapped whole by `refresh`; read once by each op that dials or offers, so one op never sees
     /// half of one reload and half of the next.
     settings: RwLock<Settings>,
-    framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
-    next: AtomicU64,
+    /// Reached by token alone, with no instance-wide lock (audit A1 F6, `framings`).
+    framings: Framings,
     /// The host services `open` was handed (`OpenIn::host`): the auth handle an accepted side
     /// admits its requests through. `None`: the host offers none, and no request is admitted.
     services: Option<Services>,
@@ -380,14 +380,6 @@ impl Instance {
     fn settings(&self) -> Settings {
         *self.settings.read().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// One framing: a dialled connection's client, or an accepted connection's server.
-enum Held {
-    /// A dialled connection ([`SIDE_DIAL`]).
-    Dial(Framing),
-    /// An accepted connection ([`SIDE_ACCEPT`]).
-    Accept(Accepted),
 }
 
 /// The default the count setting `path` declares ([`SETTING_ROWS`]).
@@ -477,8 +469,7 @@ slot!(
                 let services = i.host().and_then(|h| Services::of(h.get()));
                 instance.open(Instance {
                     settings: RwLock::new(settings),
-                    framings: Mutex::new(HashMap::new()),
-                    next: AtomicU64::new(1),
+                    framings: Framings::default(),
                     services,
                 });
                 Outcome::Ready
@@ -502,16 +493,16 @@ slot!(
     /// is parked on moved nothing.
     Cancel, CancelIn, CancelOut, |instance, i, o| {
         let ticket = i.ticket;
-        let held: Vec<Arc<Mutex<Held>>> = instance.get().map_or_else(Vec::new, |inst| {
-            inst.framings.lock().expect("framings").values().cloned().collect()
-        });
-        let partial = held.iter().fold(false, |any, h| {
-            let cancelled = match &mut *h.lock().expect("framing") {
-                Held::Accept(a) => a.cancel(ticket),
-                Held::Dial(_) => false,
-            };
-            any | cancelled
-        });
+        // The parked op answered PENDING and holds no framing, so every framing a parked call
+        // sits on is visited ([`framings::Framings::each`]); none is waited for.
+        let mut partial = false;
+        if let Some(inst) = instance.get() {
+            inst.framings.each(|h| {
+                if let Held::Accept(a) = h {
+                    partial |= a.cancel(ticket);
+                }
+            });
+        }
         o.set(
             |x| &x.disposition,
             if partial {
@@ -590,15 +581,10 @@ impl SafeSlot for Refuse {
         i: Lent<'_, RefuseIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
+        // The framing's own slot, let go before `with` reaches it again.
         let dialled = p.get().and_then(|inst| {
-            let held = inst
-                .framings
-                .lock()
-                .expect("framings")
-                .get(&i.framing)
-                .cloned()?;
-            let dialled = matches!(*held.lock().expect("framing"), Held::Dial(_));
-            Some(dialled)
+            let mut slot = inst.framings.reach(i.framing).ok()?;
+            Some(matches!(slot.held(), Held::Dial(_)))
         });
         if dialled == Some(true) {
             o.error("refuse: a dialled http connection is refused by its far end");
@@ -838,11 +824,10 @@ impl SafeSlot for Begin {
             if r != Outcome::Ready {
                 return r;
             }
-            let token = inst.next.fetch_add(1, Ordering::Relaxed);
-            inst.framings
-                .lock()
-                .expect("framings")
-                .insert(token, Arc::new(Mutex::new(h)));
+            let Some(token) = inst.framings.insert_held(h) else {
+                o.error("begin: every framing slot is in use");
+                return Outcome::Failed;
+            };
             o.set(|x| &x.framing, token);
             return r;
         }
@@ -879,11 +864,10 @@ impl SafeSlot for Begin {
         if r != Outcome::Ready {
             return r;
         }
-        let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        inst.framings
-            .lock()
-            .expect("framings")
-            .insert(token, Arc::new(Mutex::new(h)));
+        let Some(token) = inst.framings.insert_held(h) else {
+            o.error("begin: every framing slot is in use");
+            return Outcome::Failed;
+        };
         o.set(|x| &x.framing, token);
         r
     }
@@ -1008,19 +992,18 @@ impl SafeSlot for Detach {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let held = p.get().and_then(|inst| {
-            inst.framings
-                .lock()
-                .expect("framings")
-                .get(&i.framing)
-                .cloned()
-        });
-        let Some(held) = held else {
+        let Some(inst) = p.get() else {
             o.error("detach: no such framing");
             return Outcome::Failed;
         };
-        let mut h = held.lock().expect("framing");
-        let Held::Accept(a) = &mut *h else {
+        let mut slot = match inst.framings.reach(i.framing) {
+            Ok(slot) => slot,
+            Err(why) => {
+                o.error(why.why());
+                return Outcome::Failed;
+            }
+        };
+        let Held::Accept(a) = slot.held() else {
             o.error("detach: a dialled http connection does not switch");
             return Outcome::Refused;
         };
@@ -1066,16 +1049,15 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p
-            .get()
-            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing));
-        o.set(|x| &x.yielded.flags, YIELD_ENDED);
-        if removed.is_some() {
-            Outcome::Ready
-        } else {
-            o.set(|x| &x.yielded.flags, 0);
-            o.error("finish: no such framing");
-            Outcome::Failed
+        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
+            inst.framings.remove(i.framing)
+        });
+        match removed {
+            Ok(()) => {
+                o.set(|x| &x.yielded.flags, YIELD_ENDED);
+                Outcome::Ready
+            }
+            Err(why) => failed(&mut o, format!("finish: {}", why.why())),
         }
     }
 }
@@ -1160,11 +1142,6 @@ fn with(
         o.error("no such framing");
         return Outcome::Failed;
     };
-    let held = inst.framings.lock().expect("framings").get(&token).cloned();
-    let Some(held) = held else {
-        o.error("no such framing");
-        return Outcome::Failed;
-    };
     let mut kernel = HostKernel {
         services: inst.services.as_ref(),
         ticket: head.ticket,
@@ -1175,11 +1152,18 @@ fn with(
     // (THE DESIGN §11.12 l.1602-1604; Appendix A.4.6 l.3646). `timer` and `refuse` never pend and
     // only drive what is already admitted.
     let kernel = (admit && !head.ticket.is_none()).then_some(&mut kernel);
-    let mut h = held.lock().expect("framing");
+    // Reached by its token alone; a framing another op holds is answered at once (audit A1 F6).
+    let mut slot = match inst.framings.reach(token) {
+        Ok(slot) => slot,
+        Err(why) => {
+            o.error(why.why());
+            return Outcome::Failed;
+        }
+    };
     if head.flags & FLAG_RESUME != 0 {
-        return step(&mut h, sink, o, kernel, |_| Ok(()));
+        return step(slot.held(), sink, o, kernel, |_| Ok(()));
     }
-    step(&mut h, sink, o, kernel, f)
+    step(slot.held(), sink, o, kernel, f)
 }
 
 fn step(

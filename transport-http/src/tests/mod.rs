@@ -79,37 +79,73 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     );
 }
 
-/// A request framed by a transfer coding is refused at its head, before a byte of its body is read
-/// (Q128 transport-http, ruling (b)).
+/// The egress chunked body is decoded once, not once per `write` call.
 ///
-/// The host states the length line before the auth (THE DESIGN §6 step 5) and no host path renders
-/// a `transfer-encoding`, so a chunked request has no 1.5.5 counterpart. The refusal comes from the
-/// head alone: a message whose body has not arrived is refused as one whose body has, so no body
-/// is buffered for a request that will never go out, and no head is left cached for the next.
+/// The sibling of the header-parse cell above, and the same standard: `write` accumulates and asks
+/// "is this message whole yet?" on every chunk, and answering that with a FRESH decoder re-decoded
+/// every byte received so far — quadratic in the body, with a full re-allocation of the decoded
+/// chunks each time. The ingress reader already keeps one decoder across reads. This drives the
+/// production `complete_message` and counts the bytes it actually feeds a decoder.
 #[test]
-fn egress_refuses_a_chunked_request_at_its_head() {
-    let head = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n";
+fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
+    let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     let mut cache = EgressHead::default();
-    assert_eq!(
-        complete_message(head, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
-        "a chunked head is refused before its body arrives"
-    );
-    assert!(cache.head.is_none(), "a refused head is never cached");
+    assert!(complete_message(&buffered, &mut cache, usize::MAX)
+        .unwrap()
+        .is_none());
 
-    let whole =
-        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
-    let mut cache = EgressHead::default();
+    const CALLS: usize = 200;
+    const PIECE: &[u8] = b"10\r\naaaaaaaaaaaaaaaa\r\n";
+    let mut wire_bytes = 0_usize;
+    for _ in 0..CALLS {
+        buffered.extend_from_slice(PIECE);
+        wire_bytes += PIECE.len();
+        assert!(
+            complete_message(&buffered, &mut cache, usize::MAX)
+                .unwrap()
+                .is_none(),
+            "no terminal chunk yet, so the message is not whole"
+        );
+    }
+    buffered.extend_from_slice(b"0\r\n\r\n");
+    wire_bytes += 5;
+    let done = complete_message(&buffered, &mut cache, usize::MAX)
+        .unwrap()
+        .expect("the terminal chunk completes the message");
     assert_eq!(
-        complete_message(whole, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
-        "a whole chunked message is refused, never decoded and carried"
+        done.body.len(),
+        CALLS * 16,
+        "the body is decoded byte-exact"
+    );
+
+    let fed = cache.feeds;
+    assert!(
+        fed <= 2 * wire_bytes,
+        "a {wire_bytes}-byte chunked body arriving in {CALLS} calls cost {fed} bytes of decoding; \
+         one decoder across the calls makes that O(n), a fresh one per call makes it O(n^2)"
+    );
+
+    // And the decoder is spent with the message: the next one decodes its own body.
+    assert!(
+        cache.head.is_none() && cache.decoder.is_none(),
+        "a completed message leaves no stale decoder"
     );
 }
 
-/// The egress smuggling pair: a `Transfer-Encoding` beside a `Content-Length` is refused, as any
-/// transfer coding is, and the `Content-Length` alone still completes. The second half proves the
-/// refusal is the coding's, not the length's.
+/// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
+/// the ingress reader's own refusal.
+///
+/// Two headers naming two different lengths for one body is the canonical request-smuggling
+/// primitive. Before this was wired, `complete_message` only refused a `Transfer-Encoding` it
+/// could not read at all (anything but `chunked`); a body that was validly `chunked` AND carried a
+/// `Content-Length` fell through to the chunked branch, was decoded, and was handed back as a
+/// message with both framing headers stripped — a quiet disambiguation forwarded to the next hop,
+/// which may resolve the same ambiguity the other way. This refuses the pair outright, mirroring
+/// the ingress reader's identical check and identical error.
+///
+/// The second half proves this is not an over-refusal: a normal chunked body with no
+/// `Content-Length` beside it — the exact shape every other egress chunked cell in this file
+/// exercises — still completes.
 #[test]
 fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let smuggled = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
@@ -121,12 +157,19 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
          than silently disambiguated and forwarded"
     );
 
-    let clean = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc";
+    let clean =
+        b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
     let mut clean_cache = EgressHead::default();
     let done = complete_message(clean, &mut clean_cache, usize::MAX)
         .unwrap()
-        .expect("a stated length with no coding beside it completes");
-    assert_eq!(done.body, b"abc", "the stated body goes out byte-exact");
+        .expect(
+            "a normal chunked body with no Content-Length still completes — this refuses the \
+                 smuggling PAIR, not chunked encoding on its own",
+        );
+    assert_eq!(
+        done.body, b"abc",
+        "the clean chunked body still decodes byte-exact"
+    );
 }
 
 /// Every request line names its version. Without the check any two words followed by a space parse
@@ -347,4 +390,91 @@ fn encode_refuses_a_request_line_its_emit_could_not_read() {
         "a token method and a clean target render"
     );
     assert!(!refused(b"M-SEARCH", b"/x"), "any token method renders");
+}
+
+/// RED (audit A1 F10; `limits.request_body_max_bytes` is the BODY's cap, held to a `Content-Length`
+/// body already): a chunked request body is held to the same cap, by its decoded length. A body at
+/// the cap completes; one byte over is refused, and refused as soon as the decoded bytes pass the
+/// cap, before its terminal chunk. RED on the reader that bounded a chunked body only by the whole
+/// buffer (the cap plus the head's allowance).
+#[test]
+fn a_chunked_request_body_is_held_to_the_body_cap() {
+    let whole =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let mut cache = EgressHead::default();
+    let done = complete_message(whole, &mut cache, 5)
+        .unwrap()
+        .expect("a body at the cap is whole");
+    assert_eq!(done.body, b"abcde");
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(whole, &mut cache, 4).unwrap_err(),
+        TransportError::Framing,
+        "one byte over the cap"
+    );
+    let open = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(open, &mut cache, 4).unwrap_err(),
+        TransportError::Framing,
+        "refused once the decoded bytes pass the cap, before the terminal chunk"
+    );
+}
+
+/// RED (audit A1 F11): bytes an `emit` carries past the end of its message (past the declared
+/// `Content-Length`, or past the terminal chunk and its trailer section) are a mis-framed writer's,
+/// refused loudly rather than dropped. A message that ends exactly where its bytes end completes.
+#[test]
+fn bytes_past_the_end_of_a_request_message_are_refused() {
+    let past_length = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_length, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte past the declared length"
+    );
+    let past_chunks =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_chunks, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte past the terminal chunk"
+    );
+    let past_head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_head, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte after a message that declares no body"
+    );
+    let exact = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    let mut cache = EgressHead::default();
+    assert!(complete_message(exact, &mut cache, usize::MAX)
+        .unwrap()
+        .is_some());
+}
+
+/// RED (audit A1 F12): a head arriving across many `emit` calls is searched for its end once, each
+/// call resuming where the last stopped (`find_header_end_from`), not rescanned from its first byte
+/// every call: linear in the head, never quadratic up to the head's allowance. RED on the search
+/// that restarted at offset 0 on every call.
+#[test]
+fn the_egress_header_search_resumes_where_it_stopped() {
+    let mut head = b"POST / HTTP/1.1\r\nHost: x\r\nX-Long: ".to_vec();
+    head.extend(std::iter::repeat_n(b'a', 4096));
+    head.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    let mut cache = EgressHead::default();
+    let mut buffered = Vec::new();
+    for (i, b) in head.iter().enumerate() {
+        buffered.push(*b);
+        let done = complete_message(&buffered, &mut cache, usize::MAX).unwrap();
+        assert_eq!(done.is_some(), i == head.len() - 1);
+    }
+    let scanned = cache.scanned;
+    assert!(
+        scanned <= 4 * head.len(),
+        "a {}-byte head arriving a byte per call cost {scanned} bytes of searching",
+        head.len()
+    );
 }
