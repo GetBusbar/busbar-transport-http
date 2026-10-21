@@ -460,10 +460,11 @@ fn host_value(uri: &http::Uri) -> Option<String> {
 
 /// THE FRAMER'S OWN HEAD LINES on a request to `dial` (`LocateIn::defaults_buf`), as `locate`
 /// states them: 1.5.5's client defaults in 1.5.5's order, `accept: */*` then `host`, field lines
-/// `name: value` CRLF each. The host puts each one a request does not carry in the head BEFORE the
-/// auth signs it (THE DESIGN §6 "Auth points and guest lists", item 5), so what a signing style
-/// signs is what goes out: [`client_posture`] then finds them stated and adds neither. `None`: not
-/// a target this framer reads.
+/// `name: value` CRLF each. A host that reads them (`Located.defaults`; no busbar host does yet)
+/// puts each one a request does not carry in the head BEFORE the auth signs it (THE DESIGN §6
+/// "Auth points and guest lists", item 5), so what a signing style signs is what goes out:
+/// [`client_posture`] then finds them stated and adds neither. Until a host reads them,
+/// [`client_posture`] adds both itself. `None`: not a target this framer reads.
 pub(super) fn head_lines(dial: &str) -> Option<String> {
     let uri = canonical_host(dial.parse().ok()?);
     let host = host_value(&uri)?;

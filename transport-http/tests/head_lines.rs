@@ -6,7 +6,8 @@
 //! added to the head after the auth has run, so what a signing style signed is what is sent").
 //!
 //! `locate` answers the lines this framer's wire adds to a request that does not state them
-//! (`LocateIn::defaults_buf`), so the host puts them in the head BEFORE the auth signs it: 1.5.5's
+//! (`LocateIn::defaults_buf`), so a host that reads them puts them in the head BEFORE the auth signs
+//! it (no busbar host reads `Located.defaults` yet; this test is the reader): 1.5.5's
 //! client defaults in 1.5.5's order, `accept: */*` then `host`, the host as 1.5.5's URL parser
 //! wrote it (lower case, the scheme's own port dropped, an IPv4 spelling as the address it names).
 //! Driven through the door's table, as the host drives it.

@@ -541,9 +541,11 @@ impl SafeSlot for Locate {
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
-        // THE FRAMER'S OWN HEAD LINES (`engine::head_lines`): stated here, so the host puts them in
-        // the head before the auth signs it and `emit` adds none (THE DESIGN §6, item 5). A host
-        // that lends no buffer for them is answered none, and `emit` adds them as before.
+        // THE FRAMER'S OWN HEAD LINES (`engine::head_lines`), stated for a host that reads them
+        // (`Located.defaults`, THE DESIGN §6, item 5): such a host puts them in the head before the
+        // auth signs it, and `emit` then finds them stated and adds none. No busbar host reads
+        // `Located.defaults` yet, so today `emit` adds both defaults itself. A host that lends no
+        // buffer for them is answered none, and `emit` adds them as before.
         let lines = if i.defaults_cap() == 0 {
             String::new()
         } else {
