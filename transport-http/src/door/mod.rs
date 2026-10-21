@@ -512,7 +512,7 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// offered as written.
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
-    if let Ok(v4) = bare.parse::<std::net::Ipv4Addr>() {
+    if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
         return v4.to_string();
     }
     sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
