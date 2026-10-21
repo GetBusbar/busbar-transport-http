@@ -312,6 +312,14 @@ pub struct Accepted {
     refused_whole: bool,
     /// The connection opened with the HTTP/2 preface: it is HTTP/2.
     h2: bool,
+    /// The protocol the secure layer's handshake agreed (ALPN), as its position in the accepting
+    /// offer; `0` where no handshake stated one (a cleartext connection).
+    alpn: u32,
+    /// The protocol hyper serves, as its position in the accepting offer, once the connection's
+    /// first bytes show it: the HTTP/2 preface, or anything else (HTTP/1.1).
+    spoken: Option<u32>,
+    /// The first bytes, held only until they show whether they open the HTTP/2 preface.
+    lead: Vec<u8>,
     /// Bytes owed to the far side that are not hyper's: a whole-connection refusal's.
     owed: VecDeque<u8>,
 }
@@ -373,6 +381,9 @@ impl Accepted {
             scheme: SCHEME_PLAIN,
             refused_whole: false,
             h2: false,
+            alpn: 0,
+            spoken: None,
+            lead: Vec::new(),
             owed: VecDeque::new(),
         }
     }
@@ -390,8 +401,46 @@ impl Accepted {
         self.seq
     }
 
+    /// THE PROTOCOL THE SECURE LAYER AGREED (`ConnFacts::agreed_protocol`, the ALPN result), when
+    /// its handshake stated one: stated as agreed (`FramerYield::agreed`) from `begin` on.
+    #[must_use]
+    pub fn with_alpn(mut self, protocol: &[u8]) -> Self {
+        self.alpn = offer_position(protocol);
+        self
+    }
+
+    /// THE PROTOCOL AGREED (`FramerYield::agreed`, busbar #1446): its 1-based position in the
+    /// door's accepting offer (`super::ACCEPT_OFFER`), `0` = not stated. The protocol hyper serves
+    /// once the first bytes show it (the HTTP/2 preface: h2, by prior knowledge in the clear;
+    /// anything else: HTTP/1.1); until then the handshake's ALPN result, where one ran.
+    #[must_use]
+    pub fn agreed(&self) -> u32 {
+        self.spoken.unwrap_or(self.alpn)
+    }
+
+    /// Read the connection's first bytes until they show whether they open the HTTP/2 preface,
+    /// as hyper's auto server reads them to choose its protocol.
+    fn note_lead(&mut self, bytes: &[u8]) {
+        if self.spoken.is_some() {
+            return;
+        }
+        let room = H2_PREFACE.len() - self.lead.len();
+        self.lead.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        let spoken = if self.lead.starts_with(H2_PREFACE) {
+            b"h2".as_slice()
+        } else if H2_PREFACE.starts_with(&self.lead) {
+            return;
+        } else {
+            b"http/1.1".as_slice()
+        };
+        self.spoken = Some(offer_position(spoken));
+        self.lead.zeroize();
+        self.lead = Vec::new();
+    }
+
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
+        self.note_lead(bytes);
         let h2 = self.raw.as_mut().is_some_and(|raw| {
             extend_wiped(raw, bytes);
             raw.starts_with(H2_PREFACE)
@@ -1386,6 +1435,25 @@ fn let_unread_body_go(a: &mut Answer) {
         a.asked = true;
         a.told = true;
     }
+}
+
+/// `protocol`'s 1-based position in the door's accepting offer (`super::ACCEPT_OFFER`, the
+/// handshake's ProtocolNameList encoding), `0` when the offer names none such.
+fn offer_position(protocol: &[u8]) -> u32 {
+    let offer = super::ACCEPT_OFFER;
+    let (mut at, mut position) = (0usize, 0u32);
+    while at < offer.len() {
+        let n = usize::from(offer[at]);
+        let Some(name) = offer.get(at + 1..at + 1 + n) else {
+            return 0;
+        };
+        position += 1;
+        if !protocol.is_empty() && name == protocol {
+            return position;
+        }
+        at += 1 + n;
+    }
+    0
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
