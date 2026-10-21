@@ -14,6 +14,7 @@
 use std::mem::{size_of, zeroed};
 use std::sync::Arc;
 
+use busbar_contract::abi::host::service::SCHEME_PLAIN;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, Outcome, BLOB_ABSENT};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::KindCode;
@@ -111,6 +112,9 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
     i.head = in_head();
     i.side = SIDE_DIAL;
     i.target = s("http://127.0.0.1:40123");
+    // The scheme the host states for the dial (`BeginIn::scheme`): the loader refuses a `begin`
+    // stating none (`check_begin_scheme`), and this target is plain http.
+    i.scheme = SCHEME_PLAIN;
     i.facts = &facts;
     i.sink = sink();
     let mut o: FramerOut = z();
