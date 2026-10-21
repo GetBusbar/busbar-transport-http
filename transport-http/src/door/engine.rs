@@ -82,8 +82,9 @@ enum Stage {
         BoxFut<hyper::Result<http::Response<Incoming>>>,
         Pin<Box<dyn Sleep>>,
     ),
-    /// The response body.
-    Body(Incoming, Pin<Box<dyn Sleep>>),
+    /// The response body, and where its last queued byte stands in the framing's queue
+    /// (`Queue::pushed` just after it was queued).
+    Body(Incoming, Pin<Box<dyn Sleep>>, u64),
     /// Refused partway through its request message (HTTP/2): the failure piece is out, and every
     /// later byte of THAT message is dropped until the host's end of it, so the rest is never read
     /// as a fresh request on the same stream (a head the auth never saw).
@@ -96,6 +97,36 @@ enum Stage {
 /// message: hyper's own HTTP/1 read-buffer ceiling (`8192 + 4096 * 100`), the largest head hyper
 /// would read back.
 const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
+
+/// How far an HTTP/2 stream's body may run ahead of the host: once this many queued bytes stand
+/// ahead of (and including) its last one, its body is not polled again until the host has taken
+/// them. Polling a body is what returns its flow-control credit to the far end (hyper releases a
+/// data frame's capacity as the frame is polled), so a stream's window refills only as the host
+/// drains it, as 1.5.5's body released credit only as its reader read. Two maximum-size HTTP/2
+/// frames.
+pub(crate) const BODY_HOLD: u64 = 32 * 1024;
+
+/// The pieces waiting for the host, and how many piece bytes were ever queued: the difference with
+/// what is still queued is what the host has taken (the sink fill drains the front, a piece
+/// at a time or part of one).
+#[derive(Default)]
+struct Queue {
+    pieces: VecDeque<Piece>,
+    pushed: u64,
+}
+
+impl Queue {
+    fn push(&mut self, p: Piece) {
+        self.pushed += p.bytes.len() as u64;
+        self.pieces.push_back(p);
+    }
+
+    /// The bytes ever queued that the host has taken.
+    fn taken(&self) -> u64 {
+        let queued: u64 = self.pieces.iter().map(|p| p.bytes.len() as u64).sum();
+        self.pushed - queued
+    }
+}
 
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +147,11 @@ pub struct Framing {
     proto: Proto,
     posture: Posture,
     exchanges: Vec<(u64, Stage)>,
-    out: VecDeque<Piece>,
+    out: Queue,
+    /// Whether the last drive left an HTTP/2 body unpolled for `BODY_HOLD`: the framing asks to
+    /// be called again at once (`Owed::next_deadline`), so the body moves on once the host has
+    /// taken what was queued.
+    held: bool,
     failed: Option<Failure>,
     now_unix_ns: u64,
 }
@@ -181,7 +216,8 @@ impl Framing {
             proto,
             posture,
             exchanges: Vec::new(),
-            out: VecDeque::new(),
+            out: Queue::default(),
+            held: false,
             failed: None,
             now_unix_ns: 0,
         })
@@ -266,7 +302,7 @@ impl Framing {
                     None => self.exchanges.push((stream, after)),
                 }
                 self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
-                self.out.push_back(Piece::failure(stream, &f.0));
+                self.out.push(Piece::failure(stream, &f.0));
                 Ok(())
             }
             Err(f) => {
@@ -311,15 +347,20 @@ impl Framing {
         self.carried = true;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
-            // Every line goes out as stated. A transfer coding never reaches here
-            // (`complete_message` refuses one); the length line is the one the auth saw (THE
+            // A chunked body was decoded by `complete_message`, so its coding describes the wire
+            // it was written for, not the one going out: hyper frames the body by its length, as
+            // 1.5.5's client sent a decoded body on (`crates/busbar/src/proxy/engine/walk.rs:592`).
+            if k.eq_ignore_ascii_case("transfer-encoding") {
+                continue;
+            }
+            // Every other line goes out as stated. The length line is the one the auth saw (THE
             // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
             b = b.header(k.as_str(), v.as_slice());
         }
         let mut req = b
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
-        target_form(&mut req, self.proto);
+        target_form(&mut req, self.proto)?;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
@@ -330,6 +371,7 @@ impl Framing {
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
+        self.held = false;
         if self.failed.is_some() {
             return;
         }
@@ -362,15 +404,17 @@ impl Framing {
         }
         let k = Knobs {
             now_unix_secs: self.now_unix_ns / 1_000_000_000,
+            hold: (self.proto == Proto::H2).then(|| self.out.taken()),
         };
         for (id, stage) in &mut self.exchanges {
-            if let Err(f) = advance(*id, stage, &mut self.sender, &mut self.out, &k, cx) {
+            let r = advance(*id, stage, &mut self.sender, &mut self.out, &k, cx);
+            if let Err(f) = r.map(|held| self.held |= held) {
                 let conn_dead = self.conn_err.lock().expect("err").is_some();
                 if self.proto == Proto::H1 || conn_dead || f.1 {
                     return Err(f.0);
                 }
                 *stage = Stage::Done;
-                self.out.push_back(Piece::failure(*id, &f.0 .0));
+                self.out.push(Piece::failure(*id, &f.0 .0));
             }
         }
         self.exchanges.retain(|(_, s)| !matches!(s, Stage::Done));
@@ -392,10 +436,17 @@ impl Owed for Framing {
         self.io.wire_pending()
     }
     fn pieces(&mut self) -> &mut VecDeque<Piece> {
-        &mut self.out
+        &mut self.out.pieces
     }
+    /// The earliest sleep still waiting, or NOW where a body was held back for the host: once the
+    /// host has taken what was queued, the next call polls it on.
     fn next_deadline(&self) -> Option<u64> {
-        self.io.next_deadline()
+        let at = self.io.next_deadline();
+        if !self.held {
+            return at;
+        }
+        let now = self.io.timer().now_ns();
+        Some(at.map_or(now, |d| d.min(now)))
     }
     fn ended(&self) -> bool {
         self.conn_done.load(Ordering::Acquire)
@@ -463,22 +514,32 @@ pub(crate) fn client_defaults(target: &http::Uri) -> String {
 /// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
 /// to origin form (the `host` line the host added carries the authority); on HTTP/2 it stays
 /// absolute, becoming `:scheme`, `:authority` and `:path`, and a `host` line is that `:authority`,
-/// not a field of its own (1.5.5's HTTP/2 requests carried none).
-fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) {
+/// not a field of its own (1.5.5's HTTP/2 requests carried none). The target's path is origin form
+/// already (`request_target` refuses any other); one that is not fails the request rather than
+/// going somewhere else (audit A1 F5).
+fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
     if proto == Proto::H2 {
         req.headers_mut().remove(http::header::HOST);
-        return;
+        return Ok(());
     }
     let uri = req.uri().clone();
     *req.uri_mut() = match uri.path_and_query() {
-        Some(p) if p.as_str() != "/" => p.as_str().parse().unwrap_or_default(),
+        Some(p) if p.as_str() != "/" => p
+            .as_str()
+            .parse()
+            .map_err(|_| Failure(format!("not an origin-form target: {p}")))?,
         _ => http::Uri::default(),
     };
+    Ok(())
 }
 
 /// What every stream's round reads.
 struct Knobs {
     now_unix_secs: u64,
+    /// HTTP/2 only: the queue bytes the host had taken when the round began, against which a
+    /// body's [`BODY_HOLD`] is judged. `None` (HTTP/1.1): the connection carries one exchange and
+    /// its bytes are already in the pipe, so a body is read as it arrives.
+    hold: Option<u64>,
 }
 
 /// The failure a stream's deadline passing is.
@@ -489,33 +550,34 @@ fn timed_out() -> (Failure, bool) {
     )
 }
 
-/// Move one stream as far as it goes this round. `Err((why, true))` is the connection's failure
-/// (the sender refused), `Err((why, false))` the stream's own.
+/// Move one stream as far as it goes this round: `Ok(true)` = its body was held back for the
+/// host (`BODY_HOLD`). `Err((why, true))` is the connection's failure (the sender refused),
+/// `Err((why, false))` the stream's own.
 fn advance(
     id: u64,
     stage: &mut Stage,
     sender: &mut Option<Sender>,
-    out: &mut VecDeque<Piece>,
+    out: &mut Queue,
     k: &Knobs,
     cx: &mut Context<'_>,
-) -> Result<(), (Failure, bool)> {
+) -> Result<bool, (Failure, bool)> {
     let own = |e: hyper::Error| (Failure(e.to_string()), false);
     loop {
         match stage {
-            Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(()),
+            Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(false),
             Stage::Queued(_, wait) => {
                 if wait.as_mut().poll(cx).is_ready() {
                     return Err(timed_out());
                 }
                 let Some(s) = sender.as_mut() else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 let ready = match s {
                     Sender::H1(s) => s.poll_ready(cx),
                     Sender::H2(s) => s.poll_ready(cx),
                 };
                 match ready {
-                    Poll::Pending => return Ok(()),
+                    Poll::Pending => return Ok(false),
                     Poll::Ready(r) => r.map_err(|e| (Failure(e.to_string()), true))?,
                 }
                 let Stage::Queued(req, wait) = std::mem::replace(stage, Stage::Done) else {
@@ -532,42 +594,55 @@ fn advance(
                     if wait.as_mut().poll(cx).is_ready() {
                         return Err(timed_out());
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 Poll::Ready(r) => {
                     let r = r.map_err(own)?;
-                    out.push_back(head_piece(id, &r, k.now_unix_secs));
+                    out.push(head_piece(id, &r, k.now_unix_secs));
                     let Stage::Asked(_, wait) = std::mem::replace(stage, Stage::Done) else {
                         unreachable!("matched above")
                     };
-                    *stage = Stage::Body(r.into_body(), wait);
+                    *stage = Stage::Body(r.into_body(), wait, out.pushed);
                 }
             },
-            Stage::Body(b, wait) => match Pin::new(&mut *b).poll_frame(cx) {
-                Poll::Pending => {
+            Stage::Body(b, wait, last) => {
+                // Held: the host has not yet taken enough of what this stream already queued.
+                // The body stays unpolled (its credit unreturned) under the same one clock.
+                if k.hold
+                    .is_some_and(|taken| last.saturating_sub(taken) >= BODY_HOLD)
+                {
                     if wait.as_mut().poll(cx).is_ready() {
                         return Err(timed_out());
                     }
-                    return Ok(());
+                    return Ok(true);
                 }
-                Poll::Ready(Some(Err(e))) => return Err(own(e)),
-                // Data is carried as it arrives. A trailer section is not: 1.5.5's client read a
-                // response through reqwest, which yields data frames only, so trailers never
-                // reached what the layer above read, and they do not here either.
-                Poll::Ready(Some(Ok(fr))) => {
-                    if let Ok(d) = fr.into_data() {
-                        if !d.is_empty() {
-                            out.push_back(Piece::data(id, d));
+                match Pin::new(&mut *b).poll_frame(cx) {
+                    Poll::Pending => {
+                        if wait.as_mut().poll(cx).is_ready() {
+                            return Err(timed_out());
+                        }
+                        return Ok(false);
+                    }
+                    Poll::Ready(Some(Err(e))) => return Err(own(e)),
+                    // Data is carried as it arrives. A trailer section is not: 1.5.5's client read
+                    // a response through reqwest, which yields data frames only, so trailers never
+                    // reached what the layer above read, and they do not here either.
+                    Poll::Ready(Some(Ok(fr))) => {
+                        if let Ok(d) = fr.into_data() {
+                            if !d.is_empty() {
+                                out.push(Piece::data(id, d));
+                                *last = out.pushed;
+                            }
                         }
                     }
+                    Poll::Ready(None) => {
+                        // The end piece (`PIECE_END`) that says this stream's response is whole.
+                        out.push(Piece::end(id));
+                        *stage = Stage::Done;
+                        return Ok(false);
+                    }
                 }
-                Poll::Ready(None) => {
-                    // The end piece (`PIECE_END`) that says this stream's response is whole.
-                    out.push_back(Piece::end(id));
-                    *stage = Stage::Done;
-                    return Ok(());
-                }
-            },
+            }
         }
     }
 }
