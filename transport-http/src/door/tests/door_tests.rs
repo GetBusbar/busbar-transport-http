@@ -27,11 +27,33 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
         (p.request_timeout, p.max_body_bytes),
         (Duration::from_secs(7), 9)
     );
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
     assert_eq!(
-        read_settings(blob(r#"{"advanced.upstream_http1_only":"yes"}"#)).err(),
-        Some("settings: a value is not of its declared kind")
+        refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
+        Some("advanced.upstream_http1_only: not of its declared kind")
     );
-    assert_eq!(read_settings(blob("[")).err(), Some("settings: not JSON"));
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
+        Some("limits.request_body_max_bytes: not of its declared kind")
+    );
+    assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
+}
+
+/// The defaults the settings declare are the host's own (`transport::registry`), so the door and
+/// the host read one figure for each.
+#[test]
+fn the_declared_defaults_are_the_hosts() {
+    use busbar_contract::transport::registry::{
+        DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
+    };
+    assert_eq!(
+        declared_count(setting::REQUEST_TIMEOUT_SECS),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        declared_count(setting::BODY_MAX_BYTES),
+        DEFAULT_REQUEST_BODY_MAX_BYTES as u64
+    );
 }
 
 /// Each status band lands in its class; anything outside the three bands is other.
