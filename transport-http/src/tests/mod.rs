@@ -79,9 +79,9 @@ fn retry_after_reads_every_http_date_form_1_5_5_read() {
     }
 }
 
-/// The egress header block is parsed once per message, not once per `write` call.
+/// The egress header block is parsed once per message, not once per `emit` call.
 ///
-/// `write` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
+/// `emit` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
 /// used to re-run the whole header parse over the same unchanged prefix each time — a fresh Vec and
 /// two Strings per header, allocated and dropped, for every chunk of the body. Same standard the
 /// crate holds its chunked decoding to, now applied here.
@@ -111,13 +111,13 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     );
 }
 
-/// The egress chunked body is decoded once, not once per `write` call.
+/// The egress chunked body is decoded once, not once per `emit` call.
 ///
-/// The sibling of the header-parse cell above, and the same standard: `write` accumulates and asks
+/// The sibling of the header-parse cell above, and the same standard: `emit` accumulates and asks
 /// "is this message whole yet?" on every chunk, and answering that with a FRESH decoder re-decoded
 /// every byte received so far — quadratic in the body, with a full re-allocation of the decoded
-/// chunks each time. The ingress reader already keeps one decoder across reads. This drives the
-/// production `complete_message` and counts the bytes it actually feeds a decoder.
+/// chunks each time. One decoder is kept across the calls instead. This drives the production
+/// `complete_message` and counts the bytes it actually feeds a decoder.
 #[test]
 fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
@@ -164,16 +164,15 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     );
 }
 
-/// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
-/// the ingress reader's own refusal.
+/// The message `emit` accumulates is refused when it carries both a `Transfer-Encoding` and a
+/// `Content-Length`.
 ///
 /// Two headers naming two different lengths for one body is the canonical request-smuggling
 /// primitive. Before this was wired, `complete_message` only refused a `Transfer-Encoding` it
 /// could not read at all (anything but `chunked`); a body that was validly `chunked` AND carried a
 /// `Content-Length` fell through to the chunked branch, was decoded, and was handed back as a
 /// message with both framing headers stripped — a quiet disambiguation forwarded to the next hop,
-/// which may resolve the same ambiguity the other way. This refuses the pair outright, mirroring
-/// the ingress reader's identical check and identical error.
+/// which may resolve the same ambiguity the other way. This refuses the pair outright.
 ///
 /// The second half proves this is not an over-refusal: a normal chunked body with no
 /// `Content-Length` beside it — the exact shape every other egress chunked cell in this file
@@ -233,7 +232,7 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
 ///
 /// The egress unit used to write a neutral layout — every field as `name: value`, a blank line, the
-/// body — and hand it to `write` as if it were a request. It ran the lane cross-check over the same
+/// body — and hand it on as if it were a request. It ran the lane cross-check over the same
 /// buffer, so the check was honest about there being ONE buffer and wrong about what was in it. The
 /// layout is the transport's, and this is the transport.
 #[test]

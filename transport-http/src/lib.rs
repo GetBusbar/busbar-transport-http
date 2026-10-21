@@ -36,7 +36,7 @@ mod transport;
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// THE DOOR: this plugin's one public item (BUSBAR-1.6.0.md l.3567, Crate shape). Its Statement
-/// claims `http` and `sse`; the root registers both from it.
+/// claims `http`, `https` and `sse`; the root registers each from it.
 pub use door::door;
 
 #[cfg(test)]
