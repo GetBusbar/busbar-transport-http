@@ -4,8 +4,8 @@
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
 //! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
 //! crate's ONE entry and claims three schemes, `http`, `https` (an `http` target the connector
-//! secures) and `sse` (an event stream is an HTTP response body, framed alike); it composes over
-//! nothing, the carrier being the connector's choice.
+//! secures) and `sse` (an event stream is an HTTP response body), all framed alike; it composes
+//! over nothing, the carrier being the connector's choice.
 //!
 //! A framer frames; it does not dial. The connector owns the socket and connection security; the
 //! protocol offer is this framer's (`locate` answers it; THE DESIGN, connections: "the ALPN offer is
@@ -55,14 +55,12 @@
 
 pub mod dest_head;
 pub mod engine;
+mod framings;
 
 // The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK,
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
@@ -86,6 +84,7 @@ use busbar_contract::abi::transport::{
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
 use engine::{Framing, Posture, Proto};
+use framings::{Framings, Held};
 #[cfg(test)]
 use hyper_io::field_cut;
 use hyper_io::{fill, Owed};
@@ -292,13 +291,7 @@ pub struct Instance {
     posture: Posture,
     prior_knowledge: bool,
     http1_only: bool,
-    framings: Mutex<HashMap<u64, Arc<Mutex<Held>>>>,
-    next: AtomicU64,
-}
-
-/// One framing the instance holds, by its token.
-struct Held {
-    framing: Framing,
+    framings: Framings,
 }
 
 /// The default the count setting `path` declares ([`SETTING_ROWS`]).
@@ -389,8 +382,7 @@ slot!(
                     posture,
                     prior_knowledge,
                     http1_only,
-                    framings: Mutex::new(HashMap::new()),
-                    next: AtomicU64::new(1),
+                    framings: Framings::default(),
                 });
                 Outcome::Ready
             }
@@ -605,15 +597,16 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
-        let token = inst.next.fetch_add(1, Ordering::Relaxed);
-        let held = Arc::new(Mutex::new(Held { framing }));
-        inst.framings
-            .lock()
-            .expect("framings")
-            .insert(token, held.clone());
+        let Some(token) = inst.framings.insert(framing) else {
+            o.error("begin: every framing slot is in use");
+            return Outcome::Failed;
+        };
         o.set(|x| &x.framing, token);
-        let mut h = held.lock().expect("framing");
-        step(&mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        let mut slot = match inst.framings.reach(token) {
+            Ok(s) => s,
+            Err(why) => return failed(&mut o, why.why().into()),
+        };
+        step(slot.held(), i.field(|x| &x.sink), &mut o, |_| Ok(()))
     }
 }
 
@@ -681,16 +674,15 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p
-            .get()
-            .and_then(|inst| inst.framings.lock().expect("framings").remove(&i.framing));
-        o.set(|x| &x.yielded.flags, YIELD_ENDED);
-        if removed.is_some() {
-            Outcome::Ready
-        } else {
-            o.set(|x| &x.yielded.flags, 0);
-            o.error("finish: no such framing");
-            Outcome::Failed
+        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
+            inst.framings.remove(i.framing)
+        });
+        match removed {
+            Ok(()) => {
+                o.set(|x| &x.yielded.flags, YIELD_ENDED);
+                Outcome::Ready
+            }
+            Err(why) => failed(&mut o, format!("finish: {}", why.why())),
         }
     }
 }
@@ -767,15 +759,17 @@ fn with(
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
-    let held = p
-        .get()
-        .and_then(|inst| inst.framings.lock().expect("framings").get(&token).cloned());
-    let Some(held) = held else {
+    let Some(inst) = p.get() else {
         o.error("no such framing");
         return Outcome::Failed;
     };
-    let mut h = held.lock().expect("framing");
-    step(&mut h, sink, o, f)
+    match inst.framings.reach(token) {
+        Ok(mut slot) => step(slot.held(), sink, o, f),
+        Err(why) => {
+            o.error(why.why());
+            Outcome::Failed
+        }
+    }
 }
 
 fn step(

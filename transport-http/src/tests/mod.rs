@@ -334,3 +334,90 @@ fn a_field_name_that_is_not_a_token_is_refused() {
     let text = String::from_utf8(ok).unwrap();
     assert_eq!(text.matches("authorization").count(), 1);
 }
+
+/// RED (audit A1 F10; `limits.request_body_max_bytes` is the BODY's cap, held to a `Content-Length`
+/// body already): a chunked request body is held to the same cap, by its decoded length. A body at
+/// the cap completes; one byte over is refused, and refused as soon as the decoded bytes pass the
+/// cap, before its terminal chunk. RED on the reader that bounded a chunked body only by the whole
+/// buffer (the cap plus the head's allowance).
+#[test]
+fn a_chunked_request_body_is_held_to_the_body_cap() {
+    let whole =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let mut cache = EgressHead::default();
+    let done = complete_message(whole, &mut cache, 5)
+        .unwrap()
+        .expect("a body at the cap is whole");
+    assert_eq!(done.body, b"abcde");
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(whole, &mut cache, 4).unwrap_err(),
+        TransportError::Framing,
+        "one byte over the cap"
+    );
+    let open = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(open, &mut cache, 4).unwrap_err(),
+        TransportError::Framing,
+        "refused once the decoded bytes pass the cap, before the terminal chunk"
+    );
+}
+
+/// RED (audit A1 F11): bytes an `emit` carries past the end of its message (past the declared
+/// `Content-Length`, or past the terminal chunk and its trailer section) are a mis-framed writer's,
+/// refused loudly rather than dropped. A message that ends exactly where its bytes end completes.
+#[test]
+fn bytes_past_the_end_of_a_request_message_are_refused() {
+    let past_length = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_length, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte past the declared length"
+    );
+    let past_chunks =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_chunks, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte past the terminal chunk"
+    );
+    let past_head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
+    let mut cache = EgressHead::default();
+    assert_eq!(
+        complete_message(past_head, &mut cache, usize::MAX).unwrap_err(),
+        TransportError::Framing,
+        "a byte after a message that declares no body"
+    );
+    let exact = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    let mut cache = EgressHead::default();
+    assert!(complete_message(exact, &mut cache, usize::MAX)
+        .unwrap()
+        .is_some());
+}
+
+/// RED (audit A1 F12): a head arriving across many `emit` calls is searched for its end once, each
+/// call resuming where the last stopped (`find_header_end_from`), not rescanned from its first byte
+/// every call: linear in the head, never quadratic up to the head's allowance. RED on the search
+/// that restarted at offset 0 on every call.
+#[test]
+fn the_egress_header_search_resumes_where_it_stopped() {
+    let mut head = b"POST / HTTP/1.1\r\nHost: x\r\nX-Long: ".to_vec();
+    head.extend(std::iter::repeat_n(b'a', 4096));
+    head.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    let mut cache = EgressHead::default();
+    let mut buffered = Vec::new();
+    for (i, b) in head.iter().enumerate() {
+        buffered.push(*b);
+        let done = complete_message(&buffered, &mut cache, usize::MAX).unwrap();
+        assert_eq!(done.is_some(), i == head.len() - 1);
+    }
+    let scanned = cache.scanned;
+    assert!(
+        scanned <= 4 * head.len(),
+        "a {}-byte head arriving a byte per call cost {scanned} bytes of searching",
+        head.len()
+    );
+}

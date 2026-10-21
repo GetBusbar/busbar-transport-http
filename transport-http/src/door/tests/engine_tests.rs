@@ -469,3 +469,137 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
         String::from_utf8_lossy(&wire)
     );
 }
+
+/// RED (audit A1 F3; this method's own contract: a message that cannot be sent fails "the framing
+/// on HTTP/1.1, where the connection carries one exchange"): an HTTP/1.1 `emit` that is refused
+/// (here, a body over the cap) fails the FRAMING, so the next op answers FAILED, and keeps nothing
+/// of the refused message. RED on the framing that answered the error but kept the line usable
+/// with the dead buffer held for the connection's life.
+#[test]
+fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
+    let capped = Posture {
+        max_body_bytes: 4,
+        ..posture(30)
+    };
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
+    f.drive(0, 0);
+    let r = f.emit(
+        1,
+        b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\n123456789",
+        0,
+        0,
+    );
+    assert!(r.is_err(), "a body over the cap is refused");
+    assert!(
+        f.failure().is_some(),
+        "the refusal fails the HTTP/1.1 framing"
+    );
+    assert!(
+        f.exchanges.is_empty(),
+        "nothing of the refused message is kept"
+    );
+}
+
+/// RED (audit A1 F4; RFC 9110 §6.5.1: a trailer field is not merged into the header section; THE
+/// DESIGN §5 refuses a trailer piece on the transport ABI): the trailer section of a chunked
+/// request never leaves as header fields. A trailer `host` would be a second `Host` (a 400 on
+/// HTTP/1.1), a trailer `connection` would change the line's semantics. They are discarded, as RFC
+/// 9110 §6.5.1 lets a recipient that removes the chunked coding do. RED on the reader that appended
+/// every trailer to the head.
+#[test]
+fn a_request_trailer_never_joins_the_header_section() {
+    let wire = h1_wire(
+        b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\nhost: elsewhere\r\nconnection: close\r\nx-t: 1\r\n\r\n",
+    );
+    let lower = wire.to_ascii_lowercase();
+    assert!(lower.starts_with("post /x http/1.1\r\n"), "{wire:?}");
+    assert_eq!(lower.matches("\r\nhost:").count(), 1, "{wire:?}");
+    assert!(lower.contains("host: 127.0.0.1:9\r\n"), "{wire:?}");
+    assert!(!lower.contains("elsewhere"), "{wire:?}");
+    assert!(!lower.contains("connection: close"), "{wire:?}");
+    assert!(!lower.contains("x-t:"), "{wire:?}");
+    assert!(lower.ends_with("\r\n\r\nabc"), "{wire:?}");
+}
+
+/// RED (audit A1 F5; THE DESIGN §5 l.722-723: the http door sends "on h1 the host header and
+/// origin-form target"): a stated target that is not origin form (`/...`) is refused, never
+/// rewritten. `?a=1` (a query with no path, which `http`'s path parser takes) went out as `/` on
+/// HTTP/1.1, the query dropped, and as `:path: ?a=1` on HTTP/2. A relative `v1/chat`, an
+/// absolute-form `http://other/x` and the asterisk form fail too, the HTTP/1.1 framing or the
+/// HTTP/2 stream, and put no request on the wire; an origin-form target still goes out as stated.
+#[test]
+fn a_target_not_in_origin_form_is_refused_not_rewritten() {
+    for target in ["?a=1", "#f", "v1/chat", "http://other/x", "*"] {
+        let message = format!("GET {target} HTTP/1.1\r\n\r\n");
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message.as_bytes(), 0, 0);
+        f.drive(0, 0);
+        let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned();
+        assert!(r.is_err(), "h1 {target}: refused: {wire:?}");
+        assert!(
+            !wire.contains("HTTP/1.1"),
+            "h1 {target}: nothing sent: {wire:?}"
+        );
+
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        f.emit(1, message.as_bytes(), 0, 0)
+            .expect("h2 answers per stream");
+        assert!(
+            f.pieces().iter().any(|p| p.stream == 1 && p.failed),
+            "h2 {target}: the stream fails at its emit"
+        );
+        assert!(f.exchanges.is_empty(), "h2 {target}: nothing kept");
+    }
+    let ok = h1_wire(b"GET /v1/chat?a=1 HTTP/1.1\r\n\r\n");
+    assert!(ok.starts_with("GET /v1/chat?a=1 HTTP/1.1\r\n"), "{ok:?}");
+}
+
+/// The body bytes queued in `out` on stream 1.
+fn queued(f: &mut Framing) -> usize {
+    f.pieces()
+        .iter()
+        .filter(|p| p.stream == 1 && !p.fields)
+        .map(|p| p.bytes.len())
+        .sum()
+}
+
+/// RED (audit A1 F7; THE DESIGN §5 *Proven by*: 2,000 concurrent streams on bounded resources;
+/// 1.5.5's hyper body released a stream's HTTP/2 credit only as its consumer read): a stream's
+/// body is pulled from the connection only as far as the host has taken what was already handed
+/// up. The far end may send a whole window; the framer queues about one sink's worth, asks to be
+/// called again once the host has taken it, and the whole body still arrives. RED on the round
+/// that pulled every frame into an unbounded queue (and returned the window as it did).
+#[test]
+fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
+    let mut f = asked(Proto::H2, 300);
+    let frame = vec![b'x'; 16_000];
+    let mut far = h2(4, 0, 0, &[]);
+    far.extend(h2(1, 0x4, 1, &[0x88]));
+    for _ in 0..4 {
+        far.extend(h2(0, 0, 1, &frame));
+    }
+    f.ingest(&far, false);
+    f.drive(SEC, 0);
+    let held = queued(&mut f);
+    // The hold (32 KiB) plus the one frame polled to reach it.
+    assert!(
+        held <= 48 * 1024,
+        "{held} body bytes queued for a host that has taken none"
+    );
+    let mut seen = 0;
+    for _ in 0..16 {
+        seen += body(&mut f).0.len();
+        if seen == 4 * 16_000 {
+            break;
+        }
+        assert!(
+            f.next_deadline().is_some(),
+            "a held stream asks to be called again once the host has taken its bytes"
+        );
+        f.drive(SEC, 0);
+    }
+    assert_eq!(seen, 4 * 16_000, "the whole body arrives");
+}
