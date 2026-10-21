@@ -2882,6 +2882,136 @@ fn host_framed_refusal_arrives_byte_identical(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// The HTTP/2 frames `wire` holds, in order: `(type, flags, stream, payload)`.
+fn h2_frames(wire: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at + 9 <= wire.len() {
+        let len = (usize::from(wire[at]) << 16)
+            | (usize::from(wire[at + 1]) << 8)
+            | usize::from(wire[at + 2]);
+        let stream = u32::from_be_bytes([wire[at + 5], wire[at + 6], wire[at + 7], wire[at + 8]])
+            & 0x7fff_ffff;
+        let end = (at + 9 + len).min(wire.len());
+        frames.push((
+            wire[at + 3],
+            wire[at + 4],
+            stream,
+            wire[at + 9..end].to_vec(),
+        ));
+        at = end;
+    }
+    frames
+}
+
+/// THE ANSWER ENDS WITH THE REQUEST BODY UNREAD (the over-cap case: the host answers `413` while
+/// the request body is still arriving), and the stream ends as 1.5.5's server (hyper under axum,
+/// whose body limit answered and let the unread body go) ended it. HTTP/1.1: the answer is written
+/// whole and the connection closes, no later body byte going up. HTTP/2: the answer goes out
+/// whole (its last DATA frame ends the stream on this side), then the stream is reset `NO_ERROR`
+/// (RFC 9113 §8.1: a server that answers before the request is whole asks the client to stop
+/// sending it), and the connection is kept: no GOAWAY. RED on the accepted side that held the
+/// unread body and went on reading it after the answer ended.
+fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
+    // HTTP/1.1: 5 of 100 declared body bytes have arrived.
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
+        Script::default(),
+        b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 100\r\n\r\nhello",
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: h1: the request went up");
+    assert_eq!(
+        h.emit(
+            1,
+            b"content-type: application/json\r\ncontent-length: 4\r\n",
+            false,
+            413
+        ),
+        Outcome::Ready,
+        "{label}: h1"
+    );
+    assert_eq!(h.emit(1, b"big!", true, 0), Outcome::Ready, "{label}: h1");
+    let wire = String::from_utf8_lossy(&undated(h.out.clone())).into_owned();
+    assert!(
+        wire.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+        "{label}: h1: {wire:?}"
+    );
+    assert!(
+        wire.ends_with("\r\n\r\nbig!"),
+        "{label}: h1: the answer whole: {wire:?}"
+    );
+    assert!(
+        h.ended,
+        "{label}: h1: the connection closes once the answer is written"
+    );
+    let before = h.got.len();
+    let _ = h.ingest(b"world");
+    assert!(
+        h.got[before..].iter().all(|g| g.1 != b"world"),
+        "{label}: h1: no body byte goes up after the answer ended"
+    );
+    h.close();
+
+    // HTTP/2 by prior knowledge: a POST whose DATA has not ended its stream.
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
+        Script::default(),
+    );
+    let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    wire.extend(h2_frame(4, 0, 0, &[]));
+    let mut block = vec![0x83, 0x86, 0x04, 12];
+    block.extend_from_slice(b"/v1/messages");
+    block.extend_from_slice(&[0x01, 11]);
+    block.extend_from_slice(b"busbar.test");
+    wire.extend(h2_frame(1, 0x4, 1, &block));
+    wire.extend(h2_frame(0, 0, 1, b"hello"));
+    assert_eq!(h.ingest(&wire), Outcome::Ready, "{label}: h2");
+    assert_eq!(
+        h.words,
+        vec![(1, b"POST".to_vec(), b"/v1/messages".to_vec())],
+        "{label}: h2: the request went up"
+    );
+    assert_eq!(
+        h.emit(
+            1,
+            b"content-type: application/json\r\ncontent-length: 4\r\n",
+            false,
+            413
+        ),
+        Outcome::Ready,
+        "{label}: h2"
+    );
+    assert_eq!(h.emit(1, b"big!", true, 0), Outcome::Ready, "{label}: h2");
+    let frames = h2_frames(&h.out);
+    let ended_at = frames
+        .iter()
+        .position(|f| f.0 == 0 && f.2 == 1 && f.1 & 0x1 != 0)
+        .unwrap_or_else(|| panic!("{label}: h2: the answer ends its side: {frames:?}"));
+    let body: Vec<u8> = frames[..=ended_at]
+        .iter()
+        .filter(|f| f.0 == 0 && f.2 == 1)
+        .flat_map(|f| f.3.clone())
+        .collect();
+    assert_eq!(
+        body, b"big!",
+        "{label}: h2: the answer's body whole: {frames:?}"
+    );
+    assert!(
+        frames[ended_at..]
+            .iter()
+            .any(|f| f.0 == 3 && f.2 == 1 && f.3 == [0, 0, 0, 0]),
+        "{label}: h2: the stream is reset NO_ERROR after the answer: {frames:?}"
+    );
+    assert!(
+        frames.iter().all(|f| f.0 != 7),
+        "{label}: h2: no GOAWAY: {frames:?}"
+    );
+    assert!(!h.ended, "{label}: h2: the connection is kept");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -3058,4 +3188,9 @@ fn the_header_read_bound_closes_a_trickled_head_linked_and_dropped_in() {
 #[test]
 fn a_host_framed_refusal_arrives_byte_identical_linked_and_dropped_in() {
     both(host_framed_refusal_arrives_byte_identical);
+}
+
+#[test]
+fn an_answer_ending_with_the_body_unread_ends_the_stream_as_hyper_did_linked_and_dropped_in() {
+    both(answer_ends_with_the_body_unread);
 }
