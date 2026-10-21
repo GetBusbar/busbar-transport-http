@@ -603,3 +603,86 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     }
     assert_eq!(seen, 4 * 16_000, "the whole body arrives");
 }
+
+/// The authority 1.5.5's client sent for `target`: its URL parser's (WHATWG, the `url` crate
+/// reqwest 0.12 serialised every upstream URL with) host and port, the port only when it is not
+/// the scheme's own.
+fn authority_1_5_5(target: &str) -> String {
+    let u = url::Url::parse(target).expect("a URL");
+    let host = u.host_str().expect("a host");
+    match u.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    }
+}
+
+/// RED (row 159 transport-http MEDIUM 1; THE DESIGN §5 holds the h1 bytes and the h2 HPACK bytes to
+/// 1.5.5's): the dial's authority goes out as 1.5.5's URL parser wrote it: the host in lower case,
+/// a port equal to the scheme's own dropped, an IPv4 spelling as the address it names. HTTP/2's
+/// `:authority` is the request URI's authority, copied verbatim by h2, and HTTP/1.1's `host` is
+/// read off the same URI. RED on the framing that kept `:443` and the host's letter case.
+#[test]
+fn the_dial_authority_goes_out_as_1_5_5s_url_parser_wrote_it() {
+    for target in [
+        "https://API.Example.com:443/v1",
+        "https://api.example.com:443/v1",
+        "http://Example.COM:80/x",
+        "https://HOST.example/v1",
+        "https://api.example.com:8443/v1",
+        "http://127.1:8080/",
+        "http://[::1]:80/",
+        "http://localhost:9",
+    ] {
+        let want = authority_1_5_5(target);
+        let uri = canonical_host(target.parse().expect("a URI"));
+        assert_eq!(
+            uri.authority().map(http::uri::Authority::as_str),
+            Some(want.as_str()),
+            "HTTP/2 :authority for {target}"
+        );
+        let mut f = Framing::dial(target, Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+        f.drive(0, 0);
+        let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned();
+        assert!(
+            wire.contains(&format!("host: {want}\r\n")),
+            "HTTP/1.1 host for {target}: {wire:?}"
+        );
+    }
+}
+
+/// RED (row 159 transport-http MEDIUM 3; THE DESIGN §6 "Auth points and guest lists", item 5): a
+/// head that states its `host` (the line `locate` states, which the host puts in the head before
+/// the auth signs it) goes out with THAT host: on HTTP/2 as the `:authority`, never as a second
+/// field beside one the door derived; on HTTP/1.1 as the one `host` line. What a signing style
+/// signed is what is sent. RED on the HTTP/2 head that kept the stated `host` as a field and took
+/// its `:authority` from the dial.
+#[test]
+fn a_stated_host_is_the_one_sent() {
+    let request = |dial: &str| {
+        http::Request::builder()
+            .uri(canonical_host(dial.parse().expect("a URI")))
+            .header("authorization", "AWS4-HMAC-SHA256 signed")
+            .header("accept", "*/*")
+            .header("host", "api.example.com")
+            .body(Full::new(Bytes::new()))
+            .expect("request")
+    };
+    let mut h2 = request("https://API.Example.com:443/v1");
+    client_posture(&mut h2, Proto::H2).expect("posture");
+    assert!(
+        h2.headers().get(http::header::HOST).is_none(),
+        "HTTP/2 carries the host as :authority, not a field: {:?}",
+        h2.headers()
+    );
+    assert_eq!(
+        h2.uri().authority().map(http::uri::Authority::as_str),
+        Some("api.example.com")
+    );
+    assert_eq!(h2.headers().get_all(http::header::ACCEPT).iter().count(), 1);
+    let mut h1 = request("https://api.example.com/v1");
+    client_posture(&mut h1, Proto::H1).expect("posture");
+    let hosts: Vec<_> = h1.headers().get_all(http::header::HOST).iter().collect();
+    assert_eq!(hosts, ["api.example.com"], "{:?}", h1.headers());
+}
