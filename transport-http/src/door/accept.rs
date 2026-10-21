@@ -310,6 +310,8 @@ pub struct Accepted {
     scheme: u8,
     /// The host refused the whole connection: its bytes are written, and nothing more is framed.
     refused_whole: bool,
+    /// The connection opened with the HTTP/2 preface: it is HTTP/2.
+    h2: bool,
     /// Bytes owed to the far side that are not hyper's: a whole-connection refusal's.
     owed: VecDeque<u8>,
 }
@@ -370,6 +372,7 @@ impl Accepted {
             seq: 0,
             scheme: SCHEME_PLAIN,
             refused_whole: false,
+            h2: false,
             owed: VecDeque::new(),
         }
     }
@@ -396,6 +399,7 @@ impl Accepted {
         // An HTTP/2 connection is never handed over (`detach`): it keeps no copy (Q128 reader A
         // finding 1).
         if h2 {
+            self.h2 = true;
             self.let_raw_go();
         }
         self.io.ingest(bytes, end);
@@ -455,9 +459,15 @@ impl Accepted {
     /// * for the WHOLE connection (`stream` `None`): `bytes` are the transport's whole envelope, as
     ///   the host rendered it (the connector's `unit0_refusal`), written as they are; hyper is let
     ///   go and the connection is over;
-    /// * for a stream whose answer head has not gone: `bytes` are its answer's body, at `status`
-    ///   (`100..=599`, else `500`, the status v1.5.5's server gave a handler's failure), its length
-    ///   stated, as v1.5.5's server answered a handler's error response;
+    /// * for a stream whose answer head has not gone, with a neutral `status`: `bytes` are its
+    ///   answer's body, at `status` (`100..=599`, else `500`, the status v1.5.5's server gave a
+    ///   handler's failure), its length stated, as v1.5.5's server answered a handler's error
+    ///   response;
+    /// * for such a stream with NO neutral status (`0`, "none stated": the connector's
+    ///   `unit0_refusal`, whose bytes are the transport's whole envelope, D3): the host framed the
+    ///   refusal whole, its status line and fields included, so `bytes` are written as they are and
+    ///   the connection is over, as for the whole connection. An HTTP/2 connection carries no such
+    ///   envelope on a stream: refused;
     /// * for a stream whose head went (`head_sent`): the answer ends failed (HTTP/1.1 closes the
     ///   connection with no terminating chunk, HTTP/2 resets the stream); `bytes` are not written.
     ///
@@ -483,6 +493,10 @@ impl Accepted {
             }
             return Ok(());
         };
+        // The re-call of a stream's whole envelope (below) after `YIELD_MORE` only drains it.
+        if self.refused_whole && bytes.is_empty() {
+            return Ok(());
+        }
         let mut sh = self.shared.lock().expect("shared");
         let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
             return Err(Failure(format!("refuse: no request on stream {stream}")));
@@ -513,6 +527,28 @@ impl Accepted {
             return Err(Failure(format!(
                 "refuse: stream {stream}'s answer already went"
             )));
+        }
+        if status == 0 {
+            // THE HOST'S WHOLE ENVELOPE (D3, row 192 ruling: `RefuseIn` carries bytes by design, and
+            // the host frames the refusal, its fields included, before it calls `refuse`): written
+            // byte for byte, nothing of this door's added; hyper is let go and the connection is
+            // over. HTTP/2 frames every answer itself, so an HTTP/1.1 envelope has no place on one
+            // of its streams.
+            if self.h2 {
+                return Err(Failure(format!(
+                    "refuse: stream {stream}: an HTTP/1.1 envelope on an HTTP/2 connection"
+                )));
+            }
+            a.respond = None;
+            a.gate = Gate::Refused;
+            a.told = true;
+            drop(sh);
+            self.refused_whole = true;
+            self.conn = None;
+            self.ended = true;
+            self.let_raw_go();
+            self.owed.extend(bytes);
+            return Ok(());
         }
         let status = u16::try_from(status)
             .ok()
