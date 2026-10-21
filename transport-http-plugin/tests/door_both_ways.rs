@@ -2854,6 +2854,34 @@ fn header_read_bound(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// THE HOST'S OWN REFUSAL ON A STREAM (D3, coordinator ruling, row 192): `RefuseIn` carries bytes
+/// by design, and the host frames the whole refusal, its fields included, before it calls `refuse`;
+/// stating no neutral status (`0`, the connector's `unit0_refusal`), the bytes state their own. They
+/// reach the wire byte-identical, nothing of this door's added, and the connection is over, as a
+/// refusal of the whole connection is. RED on the door that framed them as the body of a `500`.
+fn host_framed_refusal_arrives_byte_identical(label: &str, ops: &'static Ops) {
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: the request went up");
+    let bytes: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 7\r\ncontent-length: 22\r\n\r\n{\"error\":\"rate_limit\"}";
+    assert_eq!(
+        h.refuse(Some(1), bytes, 0, false),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&h.out),
+        String::from_utf8_lossy(bytes),
+        "{label}: the host's refusal, byte-identical"
+    );
+    assert!(h.ended, "{label}: the connection is over");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -3025,4 +3053,9 @@ fn a_head_request_is_answered_without_a_body_linked_and_dropped_in() {
 #[test]
 fn the_header_read_bound_closes_a_trickled_head_linked_and_dropped_in() {
     both(header_read_bound);
+}
+
+#[test]
+fn a_host_framed_refusal_arrives_byte_identical_linked_and_dropped_in() {
+    both(host_framed_refusal_arrives_byte_identical);
 }
