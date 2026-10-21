@@ -935,6 +935,8 @@ struct AcceptHost {
     ticket: Ticket,
     /// An answer said the connection is over (`YIELD_ENDED`).
     ended: bool,
+    /// The host's monotonic clock, as the sink states it.
+    now: u64,
 }
 
 impl AcceptHost {
@@ -1003,6 +1005,7 @@ impl AcceptHost {
             ctx,
             ticket: TICKET,
             ended: false,
+            now: 7 * SEC,
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
@@ -1030,7 +1033,7 @@ impl AcceptHost {
             frame_cap: self.frame.len(),
             pieces: self.pieces.as_mut_ptr(),
             pieces_cap: self.pieces.len(),
-            now_monotonic_ns: 7 * SEC,
+            now_monotonic_ns: self.now,
             now_unix_ns: 1_790_000_000 * SEC,
             heads: self.heads.as_mut_ptr(),
             heads_cap: self.heads.len(),
@@ -1136,6 +1139,26 @@ impl AcceptHost {
                 return r;
             }
             first = false;
+        }
+    }
+
+    /// `detach`, on no ticket, re-called while it answers `YIELD_MORE`: its outcome and every
+    /// frame byte it handed over (the bytes the adopting framer is given).
+    fn detach(&mut self) -> (Outcome, Vec<u8>) {
+        let mut handed = Vec::new();
+        loop {
+            let mut i: FramingIn = z();
+            i.framing = self.framing;
+            i.sink = self.sink();
+            let mut o: FramerOut = z();
+            let r = call(self.ops.detach, self.inst, &mut i, &mut o, slot::DETACH);
+            let more = o.yielded.flags & YIELD_MORE != 0;
+            let frame = self.frame[..o.yielded.frame_len as usize].to_vec();
+            let r = self.take(r, &o);
+            handed.extend_from_slice(&frame);
+            if r != Outcome::Ready || !more {
+                return (r, handed);
+            }
         }
     }
 
@@ -1391,6 +1414,8 @@ struct Script {
     /// The request each `unit.refuse` was handed, in order.
     refused: Vec<View>,
     asked: Vec<Asked>,
+    /// The fields `unit.refuse` answers, in order; empty: `content-type: application/json` alone.
+    refusal_fields: Vec<(&'static str, &'static str)>,
 }
 
 /// Which of the auth handle's services answer FAILED.
@@ -1627,13 +1652,24 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
         if script.fails.refuse {
             return outcome(out, Outcome::Failed);
         }
+        let named = if script.refusal_fields.is_empty() {
+            vec![("content-type", "application/json")]
+        } else {
+            script.refusal_fields.clone()
+        };
         drop(scripts);
         let (status, body) = refusal(i.cause);
         // The kernel's memory, valid past the call (the test leaks it).
-        let fields: &'static [Field] = Box::leak(Box::new([Field {
-            name: s("content-type"),
-            value: s("application/json"),
-        }]));
+        let fields: &'static [Field] = Box::leak(
+            named
+                .into_iter()
+                .map(|(name, value)| Field {
+                    name: s(name),
+                    value: s(value),
+                })
+                .collect::<Vec<Field>>()
+                .into_boxed_slice(),
+        );
         i.answer.write_unaligned(RefusalAnswer {
             size: size_of::<RefusalAnswer>() as u32,
             status,
@@ -2675,6 +2711,149 @@ fn refusal_carries_the_request(label: &str, ops: &'static Ops) {
     }
 }
 
+/// THE KERNEL'S REFUSAL KEEPS ITS FIELDS (D3): every field `unit.refuse` answers is framed on the
+/// refusal, in the kernel's order, before the length hyper states for its body; nothing goes up.
+fn kernel_refusal_keeps_its_fields(label: &str, ops: &'static Ops) {
+    let script = Script {
+        refusal_fields: vec![
+            ("content-type", "application/json"),
+            ("www-authenticate", "Bearer realm=\"busbar\""),
+            ("x-request-id", "r-1"),
+        ],
+        ..Script::default()
+    };
+    let h = admitted(
+        ops,
+        vec![line(7, 0, METHOD_POST, "/v1/messages", 0)],
+        script,
+        b"GET /nope HTTP/1.1\r\nhost: busbar.test\r\n\r\n",
+    );
+    assert_eq!(h.heads_up(), 0, "{label}: nothing went up to the host");
+    let (status, body) = refusal(REFUSE_NO_ROUTE);
+    assert_eq!(status, 404, "{label}");
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        format!(
+            "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\nwww-authenticate: Bearer realm=\"busbar\"\r\nx-request-id: r-1\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+        "{label}: the kernel's fields, in order, on its refusal"
+    );
+    h.close();
+}
+
+/// AN UPGRADE THE LINE HANDS TO ANOTHER FRAMER IS NOT ANSWERED HERE (coordinator ruling, row 192):
+/// the request is admitted through its line and goes up; the host answers nothing and detaches,
+/// and the adopting framer is handed the upgrade request's head bytes and every byte after them,
+/// as the far side sent them. This door writes no `101` and no other byte: the adopting framer
+/// writes its own `101`.
+fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
+    let request: &[u8] = b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n";
+    let mut h = admitted(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_ANY, "/v1/session", 0)],
+        Script::default(),
+        request,
+    );
+    assert_eq!(
+        h.heads_up(),
+        1,
+        "{label}: the upgrade request was admitted and went up"
+    );
+    assert!(
+        h.asked()
+            .iter()
+            .any(|a| matches!(a, Asked::Auth { point, .. } if *point == POINT_HEAD)),
+        "{label}: through its line's auth"
+    );
+    let after: &[u8] = b"\x81\x02hi";
+    assert_eq!(h.ingest(after), Outcome::Ready, "{label}");
+    let (r, handed) = h.detach();
+    assert_eq!(r, Outcome::Ready, "{label}: detach");
+    let mut sent = request.to_vec();
+    sent.extend_from_slice(after);
+    assert_eq!(
+        String::from_utf8_lossy(&handed),
+        String::from_utf8_lossy(&sent),
+        "{label}: the upgrade request's head and what followed it, as sent"
+    );
+    assert!(
+        h.out.is_empty(),
+        "{label}: nothing answered, no 101: {:?}",
+        String::from_utf8_lossy(&h.out)
+    );
+    assert!(h.ended, "{label}: the framing has ended");
+    h.close();
+}
+
+/// A `HEAD` request is answered with its head alone, as v1.5.5's server (hyper) answered it: the
+/// status and the fields the host emitted, and no body byte, whatever body the host emits.
+fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open(ops);
+    assert_eq!(
+        h.ingest(b"HEAD /v1/messages HTTP/1.1\r\nhost: busbar.test\r\n\r\n"),
+        Outcome::Ready
+    );
+    assert_eq!(
+        h.words,
+        vec![(1, b"HEAD".to_vec(), b"/v1/messages".to_vec())],
+        "{label}: the request went up"
+    );
+    assert_eq!(
+        h.emit(
+            1,
+            b"content-type: text/plain\r\ncontent-length: 5\r\n",
+            false,
+            200
+        ),
+        Outcome::Ready,
+        "{label}: the head"
+    );
+    // The body the host emits for it is never written; whether the op takes it or answers the
+    // stream over is hyper's, not the wire's.
+    let _ = h.emit(1, b"hello", true, 0);
+    let wire = String::from_utf8_lossy(&undated(h.out.clone())).into_owned();
+    println!("PROOF {label}: head answer {wire:?}");
+    assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{label}: {wire:?}");
+    assert!(
+        wire.contains("content-type: text/plain\r\n"),
+        "{label}: {wire:?}"
+    );
+    assert!(
+        wire.ends_with("\r\n\r\n"),
+        "{label}: the head alone: {wire:?}"
+    );
+    assert!(!wire.contains("hello"), "{label}: no body byte: {wire:?}");
+    h.close();
+}
+
+/// THE HEADER READ BOUND (v1.5.5 `hardened_conn_builder`, 30 s on the host's clock): a head the far
+/// side trickles and never finishes ends the connection at the bound and not before it; nothing
+/// goes up.
+fn header_read_bound(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open(ops);
+    let start = h.now;
+    assert_eq!(
+        h.ingest(b"GET /v1/messages HTTP/1.1\r\nhost: slo"),
+        Outcome::Ready
+    );
+    h.now = start + 10 * SEC;
+    assert_eq!(
+        h.ingest(b"w.busbar"),
+        Outcome::Ready,
+        "{label}: one more trickle"
+    );
+    h.now = start + 29 * SEC;
+    assert_eq!(h.timer(), Outcome::Ready, "{label}");
+    assert!(!h.ended, "{label}: not before 30 s");
+    h.now = start + 31 * SEC;
+    assert_eq!(h.timer(), Outcome::Ready, "{label}");
+    assert!(h.ended, "{label}: the bound ends the connection");
+    assert_eq!(h.heads_up(), 0, "{label}: no request went up");
+    assert!(h.words.is_empty(), "{label}: no head slots went up");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -2826,4 +3005,24 @@ fn a_pending_auth_call_parks_only_its_own_stream_and_others_flow() {
 #[test]
 fn unit_refuse_is_handed_the_request_it_refuses() {
     both(refusal_carries_the_request);
+}
+
+#[test]
+fn a_kernel_refusal_keeps_its_fields_linked_and_dropped_in() {
+    both(kernel_refusal_keeps_its_fields);
+}
+
+#[test]
+fn a_101_upgrade_is_detached_unanswered_linked_and_dropped_in() {
+    both(upgrade_detached_unanswered);
+}
+
+#[test]
+fn a_head_request_is_answered_without_a_body_linked_and_dropped_in() {
+    both(head_answered_without_a_body);
+}
+
+#[test]
+fn the_header_read_bound_closes_a_trickled_head_linked_and_dropped_in() {
+    both(header_read_bound);
 }
