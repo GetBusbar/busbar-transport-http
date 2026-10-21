@@ -657,67 +657,73 @@ fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static 
     }
 }
 
-/// AN `sse` TARGET AS ITS `http` TWIN (BUSBAR-1.6.0.md l.584: "http claims `http`, `https` and
-/// `sse`"; Q128 reader B, coordinator ruling: the claim kept, framed exactly as `http`). An `sse`
-/// stream is an HTTP response body read as events (`crate` docs), so its target is the `http` one
-/// with the same authority, path and query: plain, the scheme's own port 80, the same request
-/// target, `host` line and protocol offer, and on HTTP/2 an `http` `:scheme`. v1.5.5 had no `sse`
-/// target (its one `sse` reading was an `http(s)` request's `alt=sse` query), so nothing it sent
-/// moves. Any other target is returned as it is.
-pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
-    if uri.scheme_str() != Some(crate::meta::SSE_KEY) {
-        return uri;
-    }
-    let mut parts = uri.clone().into_parts();
-    parts.scheme = Some(http::uri::Scheme::HTTP);
-    http::Uri::from_parts(parts).unwrap_or(uri)
+/// A DIAL TARGET AS 1.5.5'S CLIENT DIALLED AND NAMED IT, read once by the contract's
+/// [`busbar_contract::net::dial_authority`] (busbar #1450): the host as `url` 2.5.8 serialised it
+/// (UTS #46, so lower-case and punycode for an IDN; an IPv4 spelling as its dotted quad; IPv6
+/// bracketed), the port dialled, and the authority the request carries (`:authority` on HTTP/2, the
+/// `host` line on HTTP/1.1), the scheme's own port elided. No host or port is parsed here.
+pub(crate) struct Dialled {
+    /// The target asks for connection security (`https`).
+    pub secure: bool,
+    /// Where the dial goes and what it calls the place.
+    pub at: busbar_contract::net::DialAuthority,
+    /// The target the request is built over: the scheme, [`DialAuthority::authority`] and the
+    /// target's own path and query.
+    ///
+    /// [`DialAuthority::authority`]: busbar_contract::net::DialAuthority::authority
+    pub uri: http::Uri,
 }
 
-/// What `locate` answers for `target`: whether it is secured, the authority to dial (the host as
-/// the URL writes it, so the connector's destination guard judges the spelling the operator wrote),
-/// and the name offered to and verified against the far end ([`offered_name`]).
-fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
-    let Some(uri) = std::str::from_utf8(target)
-        .ok()
-        .and_then(|t| t.parse::<http::Uri>().ok())
-        .map(as_http)
-    else {
+/// `target` read as a dial ([`Dialled`]). AN `sse` TARGET IS ITS `http` TWIN (BUSBAR-1.6.0.md
+/// l.584: "http claims `http`, `https` and `sse`"; Q128 reader B, coordinator ruling: the claim
+/// kept, framed exactly as `http`): an `sse` stream is an HTTP response body read as events
+/// (`crate` docs), so its target is the `http` one with the same authority, path and query: plain,
+/// the scheme's own port 80, the same request target, `host` line and protocol offer, and on HTTP/2
+/// an `http` `:scheme`. v1.5.5 had no `sse` target (its one `sse` reading was an `http(s)` request's
+/// `alt=sse` query), so nothing it sent moves.
+pub(crate) fn dialled(target: &str) -> Result<Dialled, &'static str> {
+    let Some((scheme, rest)) = target.split_once("://") else {
         return Err("locate: the target is not a URL");
     };
-    let secure = match uri.scheme_str() {
-        Some("https") => true,
-        Some("http") => false,
+    let secure = match scheme.to_ascii_lowercase().as_str() {
+        "https" => true,
+        "http" => false,
+        s if s == crate::meta::SSE_KEY => false,
         _ => return Err("locate: the target's scheme is not http or https"),
     };
-    let Some(host) = uri.host() else {
+    let scheme = if secure { "https" } else { "http" };
+    let twin = format!("{scheme}://{rest}");
+    let Ok(at) = busbar_contract::net::dial_authority(&twin) else {
         return Err("locate: the target names no host");
     };
-    let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let authority = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+    // The path and query, as the target wrote them (a fragment is never sent).
+    let tail = busbar_contract::net::url_authority(&twin).tail;
+    let tail = tail.split('#').next().unwrap_or_default();
+    let Ok(uri) = format!("{scheme}://{}{tail}", at.authority).parse::<http::Uri>() else {
+        return Err("locate: the target is not a URL");
     };
-    Ok((secure, authority, offered_name(host)))
+    Ok(Dialled { secure, at, uri })
 }
 
-/// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
-/// its URL parser (WHATWG, reqwest 0.12) turned every IPv4 spelling into the dotted quad before it
-/// connected, so `https://127.1/` was verified against `127.0.0.1` and `https://16909060/` against
-/// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
-/// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
-/// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal, a dotted quad) is
-/// offered as written.
-fn offered_name(host: &str) -> String {
-    let bare = host.strip_suffix('.').unwrap_or(host);
-    // An IP literal (a canonical dotted quad, or an IPv6 address, the only spellings
-    // `is_ip_literal` accepts) is offered as written.
-    if busbar_contract::net::is_ip_literal(bare) {
-        return bare.to_owned();
-    }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
+/// What `locate` answers for `target`: whether it is secured, the authority to dial (the host
+/// [`dial_authority`](busbar_contract::net::dial_authority) serialised and the port dialled) and
+/// the name offered to and verified against the far end (that host, unbracketed): as 1.5.5's
+/// client had them, its URL parser (WHATWG, reqwest 0.12) serialised the host before it connected,
+/// so `https://127.1/` was verified against `127.0.0.1` and `https://bücher.example/` dialled and
+/// verified as `xn--bcher-kva.example`.
+fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
+    let Ok(target) = std::str::from_utf8(target) else {
+        return Err("locate: the target is not a URL");
+    };
+    let d = dialled(target)?;
+    let port = d.at.dial_port.unwrap_or(if d.secure { 443 } else { 80 });
+    let authority = format!("{}:{port}", d.at.host);
+    let name =
+        d.at.host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+    Ok((d.secure, authority, name))
 }
 
 /// `locate`.
@@ -761,8 +767,7 @@ impl SafeSlot for Locate {
             i.field(|x| &x.target)
                 .as_str()
                 .ok()
-                .and_then(|t| t.parse::<http::Uri>().ok())
-                .map(|u| engine::client_defaults(&u))
+                .map(engine::client_defaults)
                 .unwrap_or_default()
         };
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());

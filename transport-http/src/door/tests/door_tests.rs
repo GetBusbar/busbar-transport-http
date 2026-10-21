@@ -178,20 +178,25 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
 /// certificate verified against, the ADDRESS an IPv4 spelling names, as 1.5.5's client did (its
 /// URL parser canonicalized the host before it connected): a spelling of loopback is `127.0.0.1`,
 /// a spelling of a public address is that address, a trailing root dot on an IPv4 literal is
-/// dropped. The authority dialled keeps the host as written, so the connector's destination guard
-/// still judges the spelling. A DNS name, an IPv6 literal and a dotted quad are offered as written.
-/// RED on the `locate` that offered `127.1` and `16909060` as names.
+/// dropped. The authority dialled is the host `busbar_contract::net::dial_authority` serialises
+/// (coordinator ruling, row 159: the dial host is `DialAuthority::host`, as 1.5.5 dialled it), so
+/// an IPv4 spelling is dialled as the address it names. A DNS name, an IPv6 literal and a dotted
+/// quad are offered as written. RED on the `locate` that offered `127.1` and `16909060` as names.
 #[test]
 fn locate_offers_the_address_an_ipv4_spelling_names() {
     for (target, authority, name) in [
-        ("https://127.1:4318/v1/traces", "127.1:4318", "127.0.0.1"),
-        ("https://2130706433/", "2130706433:443", "127.0.0.1"),
-        ("https://0x7f000001:8443/", "0x7f000001:8443", "127.0.0.1"),
-        ("https://017700000001/", "017700000001:443", "127.0.0.1"),
-        ("https://16909060/", "16909060:443", "1.2.3.4"),
-        ("https://0x1020304/x", "0x1020304:443", "1.2.3.4"),
-        ("https://1.2.772/", "1.2.772:443", "1.2.3.4"),
-        ("https://127.0.0.1./", "127.0.0.1.:443", "127.0.0.1"),
+        (
+            "https://127.1:4318/v1/traces",
+            "127.0.0.1:4318",
+            "127.0.0.1",
+        ),
+        ("https://2130706433/", "127.0.0.1:443", "127.0.0.1"),
+        ("https://0x7f000001:8443/", "127.0.0.1:8443", "127.0.0.1"),
+        ("https://017700000001/", "127.0.0.1:443", "127.0.0.1"),
+        ("https://16909060/", "1.2.3.4:443", "1.2.3.4"),
+        ("https://0x1020304/x", "1.2.3.4:443", "1.2.3.4"),
+        ("https://1.2.772/", "1.2.3.4:443", "1.2.3.4"),
+        ("https://127.0.0.1./", "127.0.0.1:443", "127.0.0.1"),
         (
             "https://collector.example.com/",
             "collector.example.com:443",
@@ -204,7 +209,7 @@ fn locate_offers_the_address_an_ipv4_spelling_names() {
             "93.184.216.34:443",
             "93.184.216.34",
         ),
-        ("http://127.1:4318/", "127.1:4318", "127.0.0.1"),
+        ("http://127.1:4318/", "127.0.0.1:4318", "127.0.0.1"),
     ] {
         let (_, a, n) = located(target.as_bytes()).expect(target);
         assert_eq!((a.as_str(), n.as_str()), (authority, name), "{target}");
@@ -212,6 +217,55 @@ fn locate_offers_the_address_an_ipv4_spelling_names() {
     assert_eq!(located(b"https://127.1/").map(|l| l.0), Ok(true));
     assert_eq!(located(b"http://127.1/").map(|l| l.0), Ok(false));
     assert!(located(b"ftp://127.1/").is_err());
+}
+
+/// RED (row 159, busbar #1450 `busbar_contract::net::dial_authority`): an IDN target is dialled,
+/// offered and named in its `host` line as the punycode 1.5.5's client (`url` 2.5.8, UTS #46) sent
+/// for it; a non-default port is kept in the authority and the `host` line, the scheme's own port
+/// is dropped from the `host` line and still dialled. One string reaches the wire: the framing's
+/// request target carries the same authority as the `host` line the framer states.
+#[test]
+fn an_idn_target_is_dialled_and_named_in_punycode() {
+    for (target, dialled_at, name, host) in [
+        (
+            "https://bücher.example/",
+            "xn--bcher-kva.example:443",
+            "xn--bcher-kva.example",
+            "xn--bcher-kva.example",
+        ),
+        (
+            "https://BÜCHER.example:8443/x?q=1",
+            "xn--bcher-kva.example:8443",
+            "xn--bcher-kva.example",
+            "xn--bcher-kva.example:8443",
+        ),
+        (
+            "http://bücher.example:80/x",
+            "xn--bcher-kva.example:80",
+            "xn--bcher-kva.example",
+            "xn--bcher-kva.example",
+        ),
+        (
+            "http://peer.test:8080/x",
+            "peer.test:8080",
+            "peer.test",
+            "peer.test:8080",
+        ),
+    ] {
+        let (_, a, n) = located(target.as_bytes()).expect(target);
+        assert_eq!((a.as_str(), n.as_str()), (dialled_at, name), "{target}");
+        let stated = engine::client_defaults(target);
+        assert!(
+            stated.contains(&format!("host: {host}\r\n")),
+            "{target}: {stated:?}"
+        );
+        let uri = super::dialled(target).expect(target).uri;
+        assert_eq!(
+            uri.authority().map(http::uri::Authority::as_str),
+            Some(host),
+            "{target}: the request's authority is the host line"
+        );
+    }
 }
 
 /// RED: the head is the field block — lower-case names, hyper's (1.5.5's) order with a repeated
@@ -429,7 +483,7 @@ fn an_sse_target_locates_as_its_http_twin() {
     ] {
         assert_eq!(located(sse.as_bytes()), located(http.as_bytes()), "{sse}");
         assert!(located(sse.as_bytes()).is_ok(), "{sse}");
-        let defaults = |t: &str| engine::client_defaults(&t.parse::<http::Uri>().expect("a URI"));
+        let defaults = |t: &str| engine::client_defaults(t);
         assert_eq!(defaults(sse), defaults(http), "{sse}");
     }
 }

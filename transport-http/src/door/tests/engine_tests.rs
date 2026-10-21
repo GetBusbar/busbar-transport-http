@@ -372,7 +372,7 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
         ("http://127.0.0.1:9", "127.0.0.1:9"),
     ] {
         // The `host` line is the framer's own, stated at `locate` (THE DESIGN §6 step 5).
-        let stated = client_defaults(&dial.parse().expect("a URL"));
+        let stated = client_defaults(dial);
         assert!(
             stated.contains(&format!("host: {host}\r\n")),
             "{dial}: {stated:?}"
@@ -641,15 +641,14 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
         ("http://127.1:80/x", "127.0.0.1"),
         ("http://Peer.Test:8080/x", "peer.test:8080"),
     ] {
-        let uri = canonical_host(dial.parse().expect("a URL"));
+        let uri = crate::door::dialled(dial).expect(dial).uri;
         assert_eq!(
             uri.authority().map(http::uri::Authority::as_str),
             Some(authority),
             "{dial}"
         );
         assert!(
-            client_defaults(&dial.parse().expect("a URL"))
-                .contains(&format!("host: {authority}\r\n")),
+            client_defaults(dial).contains(&format!("host: {authority}\r\n")),
             "{dial}: the host line is the same string"
         );
     }

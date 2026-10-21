@@ -128,10 +128,12 @@ impl Framing {
     ///
     /// `dial` is not a URI.
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
-        let dial = canonical_host(
-            dial.parse()
-                .map_err(|_| Failure(format!("not a target: {dial}")))?,
-        );
+        // The target as 1.5.5's client built its request: the authority
+        // `busbar_contract::net::dial_authority` serialised, so the request's `:authority`
+        // (HTTP/2) and the `host` line the framer states (HTTP/1.1) are one string.
+        let dial = super::dialled(dial)
+            .map_err(|_| Failure(format!("not a target: {dial}")))?
+            .uri;
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
         let (exec, timer) = (io.exec(), io.timer());
@@ -402,39 +404,6 @@ impl Owed for Framing {
     }
 }
 
-/// The dial target with its authority as 1.5.5's client sent it (its URL parser, WHATWG in
-/// reqwest 0.12, normalised the host before the request was built): the host lower-cased, an IPv4
-/// spelling written as the dotted quad it names ([`super::offered_name`]; `https://127.1:4318/`
-/// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
-/// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
-fn canonical_host(dial: http::Uri) -> http::Uri {
-    // An `sse` target is its `http` twin (`super::as_http`).
-    let dial = super::as_http(dial);
-    let Some(host) = dial.host() else {
-        return dial;
-    };
-    let name = super::offered_name(&host.to_ascii_lowercase());
-    let default_port = match dial.scheme_str() {
-        Some("https") => Some(443),
-        Some("http") => Some(80),
-        _ => None,
-    };
-    let port = dial.port_u16().filter(|p| Some(*p) != default_port);
-    let authority = match port {
-        Some(p) => format!("{name}:{p}"),
-        None => name,
-    };
-    if dial.authority().map(http::uri::Authority::as_str) == Some(authority.as_str()) {
-        return dial;
-    }
-    let Ok(authority) = authority.parse::<http::uri::Authority>() else {
-        return dial;
-    };
-    let mut parts = dial.clone().into_parts();
-    parts.authority = Some(authority);
-    http::Uri::from_parts(parts).unwrap_or(dial)
-}
-
 /// THE FRAMER'S OWN HEAD LINES for a request to `target`: the client defaults the http transport
 /// owns (THE DESIGN §5: "When the caller sets none, the http door adds `accept: */*`, and on h1 the
 /// host header and origin-form target: the http transport owns the client defaults"), in 1.5.5's
@@ -443,20 +412,14 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
 /// each the request does not carry BEFORE the auth signs the head (THE DESIGN §6 step 5, OWNER-
 /// LOCKED: "Nothing is added to the head after the auth has run"); `encode` adds none. Field lines,
 /// `name: value` CRLF each. On HTTP/2 the `host` line is the target's `:authority`, as there.
-pub(crate) fn client_defaults(target: &http::Uri) -> String {
+pub(crate) fn client_defaults(target: &str) -> String {
     let mut lines = String::from("accept: */*\r\n");
-    // The host 1.5.5's client sent: an IPv4 spelling as the address it names.
-    let target = canonical_host(target.clone());
-    if let Some(host) = target.host() {
-        let secure = matches!(target.scheme_str(), Some("https"));
-        let value = match target.port_u16() {
-            Some(443) if secure => host.to_owned(),
-            Some(80) if !secure => host.to_owned(),
-            Some(p) => format!("{host}:{p}"),
-            None => host.to_owned(),
-        };
+    // The `host` 1.5.5's client sent (`DialAuthority::host_header`): the host `url` serialised (an
+    // IDN as punycode, an IPv4 spelling as the address it names), the port only when it is not the
+    // scheme's own.
+    if let Ok(d) = super::dialled(target) {
         lines.push_str("host: ");
-        lines.push_str(&value);
+        lines.push_str(&d.at.host_header);
         lines.push_str("\r\n");
     }
     lines
