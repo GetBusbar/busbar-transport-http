@@ -937,6 +937,8 @@ struct AcceptHost {
     ended: bool,
     /// The host's monotonic clock, as the sink states it.
     now: u64,
+    /// The protocol the last answer stated it agreed (`FramerYield::agreed`).
+    agreed: u32,
 }
 
 impl AcceptHost {
@@ -1006,6 +1008,7 @@ impl AcceptHost {
             ticket: TICKET,
             ended: false,
             now: 7 * SEC,
+            agreed: 0,
         };
         let mut facts: ConnFacts = z();
         facts.size = size_of::<ConnFacts>() as u32;
@@ -1054,6 +1057,7 @@ impl AcceptHost {
         if r != Outcome::Ready {
             return r;
         }
+        self.agreed = o.yielded.agreed;
         let frame = self.frame[..o.yielded.frame_len as usize].to_vec();
         check_framer_fields(&self.pieces[..n], &frame).expect("no pseudo-field in a field block");
         check_head_slots(o, &self.heads, self.heads.len() as u64).expect("the head slots pass");
@@ -3012,6 +3016,90 @@ fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// The protocol names an ALPN ProtocolNameList holds, in order.
+fn alpn_names(list: &[u8]) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < list.len() {
+        let n = usize::from(list[at]);
+        names.push(list[at + 1..at + 1 + n].to_vec());
+        at += 1 + n;
+    }
+    names
+}
+
+/// THE ACCEPTED SIDE STATES THE PROTOCOL IT AGREED (`FramerYield::agreed`, busbar #1446): the
+/// 1-based position, in the door's own accepting offer (`locate` with `LocateIn::accept`), of the
+/// protocol the connection speaks. Under TLS the handshake's ALPN result is stated from `begin`;
+/// in the clear the protocol is the one hyper serves once the first bytes show it: the HTTP/2
+/// preface is h2 by prior knowledge, anything else HTTP/1.1. RED on the accepted side that stated
+/// none.
+fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
+    let offer = alpn_names(&accept_offer(ops));
+    let position = |name: &[u8]| -> u32 {
+        let i = offer
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{label}: the offer names {name:?}: {offer:?}"));
+        u32::try_from(i + 1).expect("a short offer")
+    };
+    let h1: &[u8] = b"GET /v1/messages HTTP/1.1\r\nhost: busbar.test\r\n\r\n";
+    let lines = || vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)];
+
+    // TLS, ALPN h2: stated from `begin`, and on every yield after it.
+    let mut h = AcceptHost::open_on(
+        ops,
+        lines(),
+        Script::default(),
+        |f| f.agreed_protocol = s("h2"),
+        SCHEME_SECURE,
+    );
+    assert_eq!(h.agreed, position(b"h2"), "{label}: ALPN h2, at begin");
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/v1/messages")])),
+        Outcome::Ready
+    );
+    assert_eq!(h.agreed, position(b"h2"), "{label}: ALPN h2, on ingest");
+    h.close();
+
+    // TLS, ALPN http/1.1.
+    let mut h = AcceptHost::open_on(
+        ops,
+        lines(),
+        Script::default(),
+        |f| f.agreed_protocol = s("http/1.1"),
+        SCHEME_SECURE,
+    );
+    assert_eq!(
+        h.agreed,
+        position(b"http/1.1"),
+        "{label}: ALPN http/1.1, at begin"
+    );
+    assert_eq!(h.ingest(h1), Outcome::Ready);
+    assert_eq!(
+        h.agreed,
+        position(b"http/1.1"),
+        "{label}: ALPN http/1.1, on ingest"
+    );
+    h.close();
+
+    // Cleartext HTTP/1.1: nothing to state before the first bytes, then HTTP/1.1.
+    let mut h = AcceptHost::open_with(ops, lines(), Script::default());
+    assert_eq!(h.agreed, 0, "{label}: cleartext, no byte yet");
+    assert_eq!(h.ingest(h1), Outcome::Ready);
+    assert_eq!(h.agreed, position(b"http/1.1"), "{label}: cleartext h1");
+    h.close();
+
+    // Cleartext h2 by prior knowledge: the preface.
+    let mut h = AcceptHost::open_with(ops, lines(), Script::default());
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/v1/messages")])),
+        Outcome::Ready
+    );
+    assert_eq!(h.agreed, position(b"h2"), "{label}: h2c by prior knowledge");
+    h.close();
+}
+
 /// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
@@ -3193,4 +3281,9 @@ fn a_host_framed_refusal_arrives_byte_identical_linked_and_dropped_in() {
 #[test]
 fn an_answer_ending_with_the_body_unread_ends_the_stream_as_hyper_did_linked_and_dropped_in() {
     both(answer_ends_with_the_body_unread);
+}
+
+#[test]
+fn the_accepted_side_states_the_protocol_it_agreed_linked_and_dropped_in() {
+    both(states_the_protocol_it_agreed);
 }
