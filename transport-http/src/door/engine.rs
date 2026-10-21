@@ -405,24 +405,39 @@ impl Owed for Framing {
     }
 }
 
-/// The dial target with an IPv4 spelling in its host written as the dotted quad it names
-/// ([`super::offered_name`]), so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2)
-/// carry the address 1.5.5's client sent: its URL parser canonicalized the host before the
-/// request was built (`https://127.1:4318/` went out as `host: 127.0.0.1:4318`). Any other host is
-/// kept as written.
+/// The dial target's authority as 1.5.5's client wrote it: its URL parser (WHATWG, the `url` crate
+/// reqwest 0.12 parsed every upstream URL with) canonicalized the host before the request was
+/// built, so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2, which h2 copies from
+/// the request URI verbatim) carry
+/// - the host in lower case (`https://API.Example.com/` went out as `api.example.com`);
+/// - no port where the target spells the scheme's own (`:443` for `https`, `:80` for `http`);
+/// - an IPv4 spelling as the dotted quad it names ([`super::offered_name`]:
+///   `https://127.1:4318/` went out as `127.0.0.1:4318`).
 fn canonical_host(dial: http::Uri) -> http::Uri {
-    let Some(host) = dial.host() else {
+    let Some(authority) = dial.authority() else {
         return dial;
     };
-    let name = super::offered_name(host);
-    if name == host {
+    let host = authority.host();
+    let name = super::offered_name(host).to_ascii_lowercase();
+    let own = match dial.scheme_str() {
+        Some("https") => Some(443),
+        Some("http") => Some(80),
+        _ => None,
+    };
+    let port = authority.port_u16().filter(|p| Some(*p) != own);
+    // Userinfo is no part of the host: it is kept as written.
+    let userinfo = authority
+        .as_str()
+        .rsplit_once('@')
+        .map_or(String::new(), |(u, _)| format!("{u}@"));
+    let written = match port {
+        Some(p) => format!("{userinfo}{name}:{p}"),
+        None => format!("{userinfo}{name}"),
+    };
+    if written == authority.as_str() {
         return dial;
     }
-    let authority = match dial.port_u16() {
-        Some(p) => format!("{name}:{p}"),
-        None => name,
-    };
-    let Ok(authority) = authority.parse::<http::uri::Authority>() else {
+    let Ok(authority) = written.parse::<http::uri::Authority>() else {
         return dial;
     };
     let mut parts = dial.clone().into_parts();
@@ -430,30 +445,62 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
     http::Uri::from_parts(parts).unwrap_or(dial)
 }
 
+/// The `host` value for `uri` (canonical, [`canonical_host`]): the host, and the port only when it
+/// is not the scheme's own, as hyper-util's client wrote it for 1.5.5.
+fn host_value(uri: &http::Uri) -> Option<String> {
+    let host = uri.host()?;
+    let secure = matches!(uri.scheme_str(), Some("https"));
+    Some(match uri.port_u16() {
+        Some(443) if secure => host.to_owned(),
+        Some(80) if !secure => host.to_owned(),
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_owned(),
+    })
+}
+
+/// THE FRAMER'S OWN HEAD LINES on a request to `dial` (`LocateIn::defaults_buf`), as `locate`
+/// states them: 1.5.5's client defaults in 1.5.5's order, `accept: */*` then `host`, field lines
+/// `name: value` CRLF each. The host puts each one a request does not carry in the head BEFORE the
+/// auth signs it (THE DESIGN §6 "Auth points and guest lists", item 5), so what a signing style
+/// signs is what goes out: [`client_posture`] then finds them stated and adds neither. `None`: not
+/// a target this framer reads.
+pub(super) fn head_lines(dial: &str) -> Option<String> {
+    let uri = canonical_host(dial.parse().ok()?);
+    let host = host_value(&uri)?;
+    Some(format!("accept: */*\r\nhost: {host}\r\n"))
+}
+
 /// The client defaults the http transport owns (THE DESIGN §5: "When the caller sets none, the
 /// http door adds `accept: */*`, and on h1 the host header and origin-form target: the http
 /// transport owns the client defaults"), so the bytes on the wire are the bytes 1.5.5 sent:
 /// `accept: */*` after the caller's fields where it set none, as reqwest added its default; on
-/// HTTP/1.1, hyper-util's `host` field (the port only when it is not the scheme's own) with the
-/// target rewritten to origin form. On HTTP/2 the target stays absolute: it becomes `:scheme`,
-/// `:authority` and `:path`. The target's path is origin form already (`request_target` refuses
-/// any other); one that is not fails the request rather than going somewhere else.
+/// HTTP/1.1, hyper-util's `host` field ([`host_value`]) with the target rewritten to origin form.
+/// On HTTP/2 the target stays absolute: it becomes `:scheme`, `:authority` and `:path`, and a
+/// `host` the head states IS the `:authority` (HTTP/2 carries no `host` field beside it, and
+/// 1.5.5's client sent none). Each default is added only where the head does not state it: a host
+/// that put `locate`'s lines in the head before the auth signed it ([`head_lines`]) finds nothing
+/// added here. The target's path is origin form already (`request_target` refuses any other); one
+/// that is not fails the request rather than going somewhere else.
 fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
     req.headers_mut()
         .entry(http::header::ACCEPT)
         .or_insert(http::HeaderValue::from_static("*/*"));
     if proto == Proto::H2 {
+        if let Some(stated) = req.headers_mut().remove(http::header::HOST) {
+            let authority = stated
+                .to_str()
+                .ok()
+                .and_then(|h| h.parse::<http::uri::Authority>().ok())
+                .ok_or_else(|| Failure("the stated host is not an authority".into()))?;
+            let mut parts = req.uri().clone().into_parts();
+            parts.authority = Some(authority);
+            *req.uri_mut() =
+                http::Uri::from_parts(parts).map_err(|e| Failure(format!("request: {e}")))?;
+        }
         return Ok(());
     }
     let uri = req.uri().clone();
-    if let Some(host) = uri.host() {
-        let secure = matches!(uri.scheme_str(), Some("https"));
-        let value = match uri.port_u16() {
-            Some(443) if secure => host.to_owned(),
-            Some(80) if !secure => host.to_owned(),
-            Some(p) => format!("{host}:{p}"),
-            None => host.to_owned(),
-        };
+    if let Some(value) = host_value(&uri) {
         if let Ok(v) = http::HeaderValue::from_str(&value) {
             req.headers_mut().entry(http::header::HOST).or_insert(v);
         }

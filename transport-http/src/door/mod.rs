@@ -532,7 +532,8 @@ impl SafeSlot for Locate {
         i: Lent<'_, LocateIn>,
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
-        let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
+        let target = i.field(|x| &x.target).bytes();
+        let (secure, authority, name) = match located(target) {
             Ok(l) => l,
             Err(why) => {
                 o.error(why);
@@ -545,21 +546,37 @@ impl SafeSlot for Locate {
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
+        // THE FRAMER'S OWN HEAD LINES (`engine::head_lines`): stated here, so the host puts them in
+        // the head before the auth signs it and `emit` adds none (THE DESIGN §6, item 5). A host
+        // that lends no buffer for them is answered none, and `emit` adds them as before.
+        let lines = if i.defaults_cap == 0 {
+            String::new()
+        } else {
+            std::str::from_utf8(target)
+                .ok()
+                .and_then(engine::head_lines)
+                .unwrap_or_default()
+        };
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut h = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(name.as_bytes());
         l.extend(offer);
-        // One short answer for all three buffers, each at its full size.
-        let short = !(a.fits() && n.fits() && l.fits());
+        h.extend(lines.as_bytes());
+        // One short answer for all four buffers, each at its full size.
+        let short = !(a.fits() && n.fits() && l.fits() && h.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
+        let (hw, hnd) = h.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
+        o.set(|x| &x.defaults_written, hw as u64);
+        o.set(|x| &x.defaults_needed, hnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;
