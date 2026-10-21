@@ -143,7 +143,9 @@ pub(crate) fn complete_message(
     max_body_bytes: usize,
 ) -> Result<Option<raw::RawMessage>, TransportError> {
     if cache.head.is_none() {
-        let Some(header_end) = find_header_end(buffered) else {
+        let (found, scanned) = find_header_end_from(buffered, 0);
+        cache.scanned += scanned;
+        let Some(header_end) = found else {
             return Ok(None);
         };
         let message = raw::parse_message(&buffered[..header_end]).ok_or(TransportError::Framing)?;
@@ -255,6 +257,9 @@ pub(crate) struct EgressHead {
     /// This connection's own tally of bytes fed to a decoder, per instance for the same reason
     /// `parses` is: a test reading it back sees only its own connection's work.
     pub(crate) feeds: usize,
+    /// This connection's own tally of bytes the header-end search examined, per instance for the
+    /// same reason.
+    pub(crate) scanned: usize,
 }
 
 /// The offset just past the blank line that ends a header block, searching from `start`, alongside
@@ -281,6 +286,3 @@ pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> (Option<usize>, 
     (found, scanned)
 }
 
-pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    find_header_end_from(buf, 0).0
-}
