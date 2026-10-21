@@ -27,7 +27,7 @@ crate-type = ["rlib"]
 # true.
 [dependencies]
 memchr = "2"
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "1b0b0d02dc824acaa3777855a1a8c8a8fb239780" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "f6d76bb399c916ead1c2262d2d4a01111f8a0c06" }
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
 http-body-util = "0.1"
 http = "1"
@@ -46,7 +46,7 @@ url = "2"
 # The TEST-ONLY seal (#65). `busbar_contract::plugin::TestKernelSeal` is the one blessed
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "1b0b0d02dc824acaa3777855a1a8c8a8fb239780", features = ["test-seal"] }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "f6d76bb399c916ead1c2262d2d4a01111f8a0c06", features = ["test-seal"] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 # THE FAR END THAT READS THE HEAD (`door/tests`, ruling 23): an HTTP/2 server reading the door's
 # own wire, so the cell compares the head the auth saw with every line a far end receives. Already
