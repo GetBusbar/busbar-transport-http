@@ -61,7 +61,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9edf1246447c2be3605861a1efe11da60c05ca3c#9edf1246447c2be3605861a1efe11da60c05ca3c"
+source = "git+https://github.com/GetBusbar/busbar?rev=9dc981a19fae06cf05a088e7365e12807cc7f99d#9dc981a19fae06cf05a088e7365e12807cc7f99d"
 dependencies = [
  "async-trait",
  "base64",
@@ -84,7 +84,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=9edf1246447c2be3605861a1efe11da60c05ca3c#9edf1246447c2be3605861a1efe11da60c05ca3c"
+source = "git+https://github.com/GetBusbar/busbar?rev=9dc981a19fae06cf05a088e7365e12807cc7f99d#9dc981a19fae06cf05a088e7365e12807cc7f99d"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -107,15 +107,19 @@ version = "1.6.0"
 dependencies = [
  "busbar-contract",
  "bytes",
+ "futures",
+ "futures-channel",
  "h2",
  "http",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "memchr",
  "reqwest",
  "serde_json",
  "tokio",
  "url",
+ "zeroize",
 ]
 
 [[package]]

@@ -937,3 +937,35 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     }
     assert_eq!(seen, 4 * 16_000, "the whole body arrives");
 }
+
+/// THE `sse` CLAIM IS FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584; Q128 reader B, coordinator
+/// ruling): a dial to an `sse` target puts on the wire, HTTP/1.1 and HTTP/2 alike, the bytes the
+/// same dial to its `http` twin puts there (the scheme's own port 80 dropped from the authority, an
+/// `http` `:scheme`). RED before the fix: the HTTP/2 request went out as `:scheme: sse` with the
+/// port kept.
+#[test]
+fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
+    let message =
+        b"GET /events?alt=sse HTTP/1.1\r\naccept: text/event-stream\r\nhost: peer.test\r\n\r\n";
+    for (label, proto) in [("h1", Proto::H1), ("h2", Proto::H2)] {
+        let wire = |target: &str| {
+            let mut f = Framing::dial(target, proto, posture(30), 0).expect("dial");
+            f.drive(0, 0);
+            let mut wire = f.take_wire(usize::MAX);
+            if proto == Proto::H2 {
+                f.ingest(&h2(4, 0, 0, &[]), false);
+                f.drive(0, 0);
+                wire.extend(f.take_wire(usize::MAX));
+            }
+            f.emit(1, message, true, 0, 0).expect("emit");
+            f.drive(0, 0);
+            wire.extend(f.take_wire(usize::MAX));
+            wire
+        };
+        assert_eq!(
+            wire("sse://peer.test:80/events"),
+            wire("http://peer.test:80/events"),
+            "{label}"
+        );
+    }
+}

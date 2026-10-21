@@ -96,7 +96,7 @@ enum Stage {
 /// The most a request's head (its request line and fields) may add to its body in one emitted
 /// message: hyper's own HTTP/1 read-buffer ceiling (`8192 + 4096 * 100`), the largest head hyper
 /// would read back.
-const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
+pub(crate) const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
 
 /// How far an HTTP/2 stream's body may run ahead of the host: once this many queued bytes stand
 /// ahead of (and including) its last one, its body is not polled again until the host has taken
@@ -459,6 +459,8 @@ impl Owed for Framing {
 /// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
 /// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
 fn canonical_host(dial: http::Uri) -> http::Uri {
+    // An `sse` target is its `http` twin (`super::as_http`).
+    let dial = super::as_http(dial);
     let Some(host) = dial.host() else {
         return dial;
     };

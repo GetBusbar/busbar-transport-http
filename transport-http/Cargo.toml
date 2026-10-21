@@ -32,8 +32,21 @@ hyper = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+# THE ACCEPTED SIDE (`door::accept`): hyper-util's auto server, as v1.5.5's data listener served
+# (h2 by prior knowledge, HTTP/1.1 otherwise), driven over the host's bytes. No `tokio` feature: the
+# executor and timer are the sans-IO drive's, so no runtime and no socket enter the closure. Not the
+# workspace row, which carries `tokio` and the client: a member can add features, never drop one.
+hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "http1", "http2", "service"] }
+# The one-shot an accepted request's answer is handed to hyper's service through. Already in the
+# lock through hyper: no crate is added.
+futures-channel = "0.3"
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+# THE ACCEPTED SIDE'S CREDENTIAL BYTES (`door::accept`): every buffer of this crate's own that held a
+# request's credential lines (the bytes kept for a hand-over as sent, a held body) is zeroised
+# before it is freed (`BUSBAR-1.6.0.md` §6 item 4: the plane never sees a credential). Already in
+# the lock through `busbar-contract` (its SDK zeroises the auth handle's buffers): no crate is added.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
@@ -52,4 +65,8 @@ busbar-contract = { workspace = true, features = ["test-seal"] }
 # in this lock through hyper's `http2` feature: no crate is added.
 h2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
+# THE ACCEPTED SIDE'S 1.5.5 BYTES (`door/tests/accept_tests.rs`): v1.5.5's exact server builder on a
+# tokio duplex, compared against the door's answer bytes.
+hyper-util = { workspace = true }
+futures = { workspace = true }
 
