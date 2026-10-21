@@ -342,7 +342,8 @@ fn a_field_name_that_is_not_a_token_is_refused() {
 /// buffer (the cap plus the head's allowance).
 #[test]
 fn a_chunked_request_body_is_held_to_the_body_cap() {
-    let whole = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let whole =
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
     let mut cache = EgressHead::default();
     let done = complete_message(whole, &mut cache, 5)
         .unwrap()

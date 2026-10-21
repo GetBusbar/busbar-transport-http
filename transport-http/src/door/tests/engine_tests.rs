@@ -505,7 +505,10 @@ fn a_target_not_in_origin_form_is_refused_not_rewritten() {
         f.drive(0, 0);
         let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned();
         assert!(r.is_err(), "h1 {target}: refused: {wire:?}");
-        assert!(!wire.contains("HTTP/1.1"), "h1 {target}: nothing sent: {wire:?}");
+        assert!(
+            !wire.contains("HTTP/1.1"),
+            "h1 {target}: nothing sent: {wire:?}"
+        );
 
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
         f.drive(0, 0);
