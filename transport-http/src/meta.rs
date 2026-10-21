@@ -7,7 +7,6 @@
 //! describes.
 
 use busbar_contract::abi::mechanism::call::AbiStr;
-use busbar_contract::abi::mechanism::door::KindTailHead;
 use busbar_contract::abi::transport::{
     TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
 };
@@ -35,37 +34,17 @@ pub(crate) const COMPOSES_OVER: &[&str] = &[];
 /// Neither claim carries a session.
 pub(crate) const SESSION: bool = false;
 
-pub(crate) const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
+pub(crate) const NONE: AbiStr = AbiStr::ABSENT;
 
-pub(crate) const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
-    role: ROLE_FRAMER,
-    framing: FRAMING_STREAM,
-    facts: 0,
-    handshake_max_steps: 0,
-    frame_piece_size: FRAME_PIECE_SIZE,
-    _reserved: 0,
+pub(crate) const TAIL: TransportTail = {
     // No transport names another: the carrier is the connector's choice from the target's scheme.
-    composes_over: std::ptr::null(),
-    composes_over_len: 0,
-    claim_rows: crate::door::CLAIMS.as_ptr(),
-    claim_rows_len: crate::door::CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
-    status_rows: crate::door::STATUS_ROWS.as_ptr(),
-    status_rows_len: crate::door::STATUS_ROWS.len(),
-    settings: crate::door::SETTINGS.as_ptr(),
-    settings_len: crate::door::SETTINGS.len(),
-    fault_rows: crate::door::FAULT_ROWS.as_ptr(),
-    fault_rows_len: crate::door::FAULT_ROWS.len(),
+    let mut t = TransportTail::EMPTY
+        .with_claim_rows(crate::door::CLAIMS)
+        .with_status_rows(crate::door::STATUS_ROWS)
+        .with_settings(crate::door::SETTINGS)
+        .with_fault_rows(crate::door::FAULT_ROWS);
+    t.role = ROLE_FRAMER;
+    t.framing = FRAMING_STREAM;
+    t.frame_piece_size = FRAME_PIECE_SIZE;
+    t
 };

@@ -21,9 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_JSON,
-};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
@@ -53,10 +51,7 @@ fn z<T>() -> T {
 }
 
 fn s(text: &'static str) -> AbiStr {
-    AbiStr {
-        ptr: text.as_ptr(),
-        len: text.len(),
-    }
+    AbiStr::of(text)
 }
 
 // ── the far end: a real hyper server ─────────────────────────────────────────────────────────────
@@ -193,23 +188,22 @@ fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u3
         let oh = std::ptr::from_mut(o).cast::<OutHead>();
         (*oh).size = size_of::<O>() as u32;
     }
-    let raw = (op.expect("every slot is filled"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    let raw = unsafe {
+        (op.expect("every slot is filled"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     raw.outcome()
 }
 
 impl Host {
     fn open(ops: &'static Ops, settings: &'static str, sock: Arc<Socket>, caps: Caps) -> Self {
         let mut i: OpenIn = z();
-        i.settings = Blob {
-            ptr: settings.as_ptr(),
-            len: settings.len(),
-            fmt: BLOB_JSON,
-            flags: 0,
-        };
+        i.settings = Blob::json(settings.as_bytes());
         let mut o: OpenOut = z();
         assert_eq!(
             call(
@@ -635,7 +629,9 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_http_plugin::door::door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d = unsafe { busbar_transport_http_plugin::door::door() };
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
@@ -658,9 +654,11 @@ fn dropped() -> (&'static Ops, &'static libloading::Library) {
         unsafe { libloading::Library::new(path) }.expect("load"),
     ));
     // SAFETY: the one exported symbol, a `DoorFn`.
-    let door: libloading::Symbol<'_, extern "C" fn() -> *const Door> =
+    let door: libloading::Symbol<'_, unsafe extern "C" fn() -> *const Door> =
         unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
-    let d = door();
+    // SAFETY: the exported door takes no argument and answers a `'static` door.
+    #[allow(unused_unsafe)]
+    let d = unsafe { door() };
     // SAFETY: the dropped-in door's `'static` table.
     (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
 }
