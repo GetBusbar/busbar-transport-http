@@ -42,8 +42,8 @@ use std::path::PathBuf;
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, Field, InHead, Op, OutHead, BLOB_JSON};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::{
-    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, IngestIn, Ops,
-    SIDE_DIAL,
+    slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, IngestIn,
+    LocateIn, LocateOut, Ops, SIDE_DIAL,
 };
 use serde_json::Value;
 
@@ -135,6 +135,7 @@ struct Recorded {
     body: Vec<u8>,
     raw: Option<String>,
     h2: Option<Value>,
+    sigv4: Option<Value>,
 }
 
 fn recorded() -> Vec<Recorded> {
@@ -186,6 +187,7 @@ fn recorded() -> Vec<Recorded> {
                 body: u["body"].as_str().unwrap_or_default().as_bytes().to_vec(),
                 raw: u.get("raw").and_then(Value::as_str).map(str::to_string),
                 h2: u.get("h2").filter(|x| !x.is_null()).cloned(),
+                sigv4: u.get("sigv4").filter(|x| !x.is_null()).cloned(),
             });
         }
     }
@@ -276,6 +278,29 @@ impl Door {
         door
     }
 
+    /// The head lines `locate` states for `target`, as the host reads them off its buffer.
+    fn locate_lines(&mut self, target: &str) -> String {
+        let (mut authority, mut name, mut alpn, mut defaults) = (
+            vec![0_u8; 256],
+            vec![0_u8; 256],
+            vec![0_u8; 256],
+            vec![0_u8; 256],
+        );
+        let mut l: LocateIn = z();
+        l.target = s(target);
+        l.authority_buf = authority.as_mut_ptr();
+        l.authority_cap = authority.len();
+        l.name_buf = name.as_mut_ptr();
+        l.name_cap = name.len();
+        l.alpn_buf = alpn.as_mut_ptr();
+        l.alpn_cap = alpn.len();
+        l.defaults_buf = defaults.as_mut_ptr();
+        l.defaults_cap = defaults.len();
+        let mut lo: LocateOut = z();
+        call(self.ops.locate, self.inst, &mut l, &mut lo, slot::LOCATE);
+        String::from_utf8_lossy(&defaults[..lo.defaults_written as usize]).into_owned()
+    }
+
     fn sink(&mut self) -> FramerSink {
         FramerSink {
             wire: self.wire.as_mut_ptr(),
@@ -364,11 +389,39 @@ impl Drop for Door {
 // ── h1 ───────────────────────────────────────────────────────────────────────────────────────────
 
 fn door_h1(r: &Recorded) -> String {
+    door_h1_with(r, None)
+}
+
+/// What a host does with the lines `locate` states: each one the request does not carry (by name,
+/// any case) joins its fields, in the stated order, BEFORE the auth signs the head.
+fn with_stated(mut fields: Vec<(String, String)>, lines: &str) -> Vec<(String, String)> {
+    for line in lines.split("\r\n").filter(|l| !l.is_empty()) {
+        let (n, v) = line
+            .split_once(": ")
+            .expect("a stated line is `name: value`");
+        if !fields.iter().any(|(f, _)| f.eq_ignore_ascii_case(n)) {
+            fields.push((n.to_string(), v.to_string()));
+        }
+    }
+    fields
+}
+
+/// [`door_h1`], where `host_states` (when set) reshapes the request's fields from what `locate`
+/// stated for the target, as the host does; `None` leaves the door to add its own defaults.
+fn door_h1_with(
+    r: &Recorded,
+    host_states: Option<&dyn Fn(Vec<(String, String)>, &str) -> Vec<(String, String)>>,
+) -> String {
     let settings = r#"{"advanced.upstream_http1_only":true}"#;
     let pinned = recorded_port(r);
     let port = pinned.unwrap_or(PORT);
     let mut door = Door::open_at(settings, "http/1.1", &format!("http://127.0.0.1:{port}"));
-    door.request(1, &r.method, &r.path, &plane_fields(r), &r.body);
+    let mut fields = plane_fields(r);
+    if let Some(shape) = host_states {
+        let lines = door.locate_lines(&format!("http://127.0.0.1:{port}"));
+        fields = shape(fields, &lines);
+    }
+    door.request(1, &r.method, &r.path, &fields, &r.body);
     let sent = String::from_utf8_lossy(&door.sent).into_owned();
     match pinned {
         Some(_) => sent,
@@ -654,6 +707,24 @@ fn has_mask(body: &[u8]) -> bool {
     false
 }
 
+/// Where the recording masked part of the BODY (a signed assertion, a PKCE verifier, a run-varying
+/// id), the door is handed the masked body, so its `content-length` counts the mask; the
+/// recording's own (numeric, or `<LEN>`) stands. Only that header's value is taken over: its name,
+/// case and position are still the door's to get right. True where it did.
+fn settle_length(want: &str, got: &mut String, r: &Recorded) -> bool {
+    if let (Some(w), Some(g)) = (content_length(want), content_length(got)) {
+        if w != g && (w == "<LEN>" || has_mask(&r.body)) {
+            *got = got.replacen(
+                &format!("content-length: {g}\r\n"),
+                &format!("content-length: {w}\r\n"),
+                1,
+            );
+            return true;
+        }
+    }
+    false
+}
+
 // ── the suite ────────────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -673,19 +744,8 @@ fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
     for r in all.iter().filter(|r| r.proto == "h1") {
         let want = r.raw.as_deref().expect("an h1 capture keeps its raw bytes");
         let mut got = door_h1(r);
-        // Where the recording masked part of the BODY (a signed assertion, a PKCE verifier, a
-        // run-varying id), the door is handed the masked body, so its `content-length` counts the
-        // mask; the recording's own (numeric, or `<LEN>`) stands. Only that header's value is
-        // taken over: its name, case and position are still the door's to get right.
-        if let (Some(w), Some(g)) = (content_length(want), content_length(&got)) {
-            if w != g && (w == "<LEN>" || has_mask(&r.body)) {
-                got = got.replacen(
-                    &format!("content-length: {g}\r\n"),
-                    &format!("content-length: {w}\r\n"),
-                    1,
-                );
-                length_masked += 1;
-            }
+        if settle_length(want, &mut got, r) {
+            length_masked += 1;
         }
         if got == want {
             h1 += 1;
@@ -740,4 +800,125 @@ fn an_h2_request_over_a_secured_connection_says_scheme_https() {
         &[0x83, 0x87],
         ":method POST then :scheme https, both indexed"
     );
+}
+
+// ── THE HEAD THE AUTH SIGNS ──────────────────────────────────────────────────────────────────────
+
+/// 1.5.5's request head, byte for byte, when the HOST puts `locate`'s stated lines in the head
+/// (the path the auth's signature rides on, THE DESIGN §6 "Auth points and guest lists", item 5):
+/// every recorded h1 request, header set, order, casing and value. 1.5.5 sent the plane's fields,
+/// then reqwest's default `accept: */*` (unless the plane set one), then `host`, then
+/// `content-length` (e.g. `egress.auth__sigv4__session-token`: `... user-agent, accept:
+/// application/json, host, content-length`).
+#[test]
+fn the_head_the_host_assembles_from_locates_lines_is_1_5_5_s_head_byte_for_byte() {
+    let mut checked = 0;
+    let mut failures = Vec::new();
+    for r in recorded().iter().filter(|r| r.proto == "h1") {
+        let want = r.raw.as_deref().expect("an h1 capture keeps its raw bytes");
+        let mut got = door_h1_with(r, Some(&with_stated));
+        settle_length(want, &mut got, r);
+        if got == want {
+            checked += 1;
+        } else {
+            failures.push(format!(
+                "{} {} {}:\n  1.5.5: {want:?}\n  door:  {got:?}",
+                r.cell, r.method, r.path
+            ));
+        }
+    }
+    assert!(checked > 0, "no recorded h1 request to compare");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// RED ARM: the stated order is part of the bytes. `host` before `accept` (or a lost `accept`) is
+/// NOT 1.5.5's head, so the comparison above would fail it: this proves the comparison can.
+#[test]
+fn a_head_whose_stated_lines_are_out_of_1_5_5_s_order_is_not_1_5_5_s_head() {
+    let recs = recorded();
+    let r = recs
+        .iter()
+        .find(|r| {
+            r.cell == "egress.fetch__plugins__url"
+                && r.proto == "h1"
+                && r.raw
+                    .as_deref()
+                    .is_some_and(|w| w.contains("accept: */*\r\nhost: "))
+        })
+        .expect("the plugin fetch cell: a request that set no accept");
+    let want = r.raw.as_deref().unwrap();
+    assert!(
+        want.contains("accept: */*\r\nhost: "),
+        "1.5.5 sent accept, then host: {want:?}"
+    );
+    let reversed = |f: Vec<(String, String)>, lines: &str| {
+        let mut l: Vec<&str> = lines.split("\r\n").filter(|x| !x.is_empty()).collect();
+        l.reverse();
+        with_stated(f, &(l.join("\r\n") + "\r\n"))
+    };
+    assert_ne!(
+        door_h1_with(r, Some(&reversed)),
+        want,
+        "host before accept must differ from 1.5.5"
+    );
+}
+
+/// THE SIGNED-HEADER SET. What a signer can sign is the head the door states: for every recorded
+/// signed request, each header 1.5.5's sigv4 signed is a field of the recorded head, `host` is
+/// among them with the value `locate` states for the target (the canonical request's `host:` line is
+/// the stated `host`), and the stated `accept` is NOT signed (1.5.5 sent `accept` but never signed
+/// it: `content-type;host;x-amz-content-sha256;x-amz-date[;x-amz-security-token]`). Which of the
+/// head's fields a signer signs is the auth plugin's (`auth-sigv4` signing.rs, the 1.5.5 writer's
+/// set); this pins the http side: the names and values the head offers it.
+#[test]
+fn the_head_locate_states_offers_the_signer_exactly_the_host_1_5_5_signed() {
+    let mut seen = 0;
+    for r in recorded().iter().filter(|r| r.proto == "h1") {
+        let Some(sig) = &r.sigv4 else { continue };
+        seen += 1;
+        let signed: Vec<&str> = sig["signed_headers"]
+            .as_str()
+            .expect("signed_headers")
+            .split(';')
+            .collect();
+        for name in &signed {
+            assert!(
+                r.headers.iter().any(|(n, _)| n == name),
+                "{}: signed `{name}` is not a field of the head 1.5.5 sent",
+                r.cell
+            );
+        }
+        assert!(signed.contains(&"host"), "{}: host is signed", r.cell);
+        assert!(
+            !signed.contains(&"accept"),
+            "{}: 1.5.5 never signed accept",
+            r.cell
+        );
+        let port = recorded_port(r).unwrap_or(PORT);
+        let mut door = Door::open_at(
+            r#"{"advanced.upstream_http1_only":true}"#,
+            "http/1.1",
+            &format!("http://127.0.0.1:{port}"),
+        );
+        let stated = door.locate_lines(&format!("http://127.0.0.1:{port}"));
+        let host = stated
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix("host: "))
+            .expect("locate states host");
+        let host = host.replace(&format!(":{PORT}"), ":<PORT>");
+        let canonical = sig["canonical_request"]
+            .as_str()
+            .expect("canonical_request");
+        assert!(
+            canonical.contains(&format!("\nhost:{host}\n")),
+            "{}: the signed host is not the stated `{host}`: {canonical:?}",
+            r.cell
+        );
+        assert_eq!(
+            stated.split("\r\n").filter(|l| !l.is_empty()).count(),
+            2,
+            "locate states exactly accept and host"
+        );
+    }
+    assert!(seen > 0, "the golden has no signed (sigv4) h1 request");
 }
