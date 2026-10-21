@@ -586,8 +586,11 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
 /// half-written exchange and a live connection.
 #[test]
 fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
+    // A chunked body alone is decoded and carried, as 1.5.5 carried one (rule 1, row 192:
+    // `a_chunked_request_body_is_held_to_the_cap`); beside a `content-length` it is the smuggling
+    // shape, refused.
     for message in [
-        &b"POST /x HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
+        &b"POST /x HTTP/1.1\r\ncontent-length: 7\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
         b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
     ] {
         let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
