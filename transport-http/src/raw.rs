@@ -4,8 +4,8 @@
 //! A minimal HTTP/1.1 message reader: just enough to split a raw byte blob (request line or
 //! status line, headers, blank line, body) into its parts, and to read a chunked body across
 //! however many reads it arrives in. Not a general-purpose parser — no header folding, and the only
-//! transfer coding it reads is `chunked`. Good enough for the shapes this transport actually needs:
-//! what its own `write` is handed, and what an ingress connection carries.
+//! transfer coding it reads is `chunked`. Good enough for the one shape this transport reads: the
+//! request message `encode` renders and `emit` is handed.
 
 /// The message's first line, kept as whichever of the two shapes it turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +257,8 @@ pub struct ChunkedDecoder {
     current: Vec<u8>,
     chunks: Vec<Vec<u8>>,
     trailers: Vec<(String, String)>,
+    /// The decoded body bytes so far, every chunk's data counted as it arrives.
+    body_len: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -279,28 +281,35 @@ enum ChunkState {
 pub struct ChunkedMalformed;
 
 impl ChunkedDecoder {
-    /// Feed everything that has arrived since the last call.
+    /// Feed everything that has arrived since the last call, answering how many of `bytes` the
+    /// message took: all of them, unless the terminal chunk and its trailer section ended it
+    /// first. What is left after that end is not this message's, and the caller judges it.
     ///
     /// # Errors
     ///
     /// The bytes are not chunked-transfer-encoding: a size line that is not hexadecimal, a chunk
     /// not closed by CRLF, or a trailer line with no colon.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), ChunkedMalformed> {
-        for &b in bytes {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
+        for (i, &b) in bytes.iter().enumerate() {
             if self.state == ChunkState::Done {
-                // Anything after the terminal chunk belongs to the next message on the connection,
-                // which this delivery does not read (one request per connection).
-                break;
+                return Ok(i);
             }
             self.step(b)?;
         }
-        Ok(())
+        Ok(bytes.len())
+    }
+
+    /// The decoded body bytes so far.
+    #[must_use]
+    pub fn body_len(&self) -> usize {
+        self.body_len
     }
 
     fn step(&mut self, b: u8) -> Result<(), ChunkedMalformed> {
         match self.state {
             ChunkState::Data => {
                 self.current.push(b);
+                self.body_len += 1;
                 self.want -= 1;
                 if self.want == 0 {
                     self.chunks.push(std::mem::take(&mut self.current));
