@@ -13,9 +13,7 @@
 
 use std::mem::{size_of, zeroed};
 
-use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, InHead, Op, OutHead, Outcome, BLOB_JSON,
-};
+use busbar_contract::abi::mechanism::call::{AbiStr, Blob, InHead, Op, OutHead, Outcome};
 use busbar_contract::abi::mechanism::lifecycle::{slot as life, OpenIn, OpenOut};
 use busbar_contract::abi::transport::{slot, LocateIn, LocateOut, Ops};
 
@@ -38,27 +36,28 @@ fn call<I, O>(
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    (op.expect("slot"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    )
-    .outcome()
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    let raw = unsafe {
+        (op.expect("slot"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
+    raw.outcome()
 }
 
 /// The lines `locate` states for `target`, as the host reads them off its buffer.
 fn head_lines(target: &str) -> String {
-    let d = busbar_transport_http::door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d = unsafe { busbar_transport_http::door() };
     // SAFETY: the door's `'static` table.
     let ops: &Ops = unsafe { &*(*d).ops.cast::<Ops>() };
     let settings = "{}";
     let mut i: OpenIn = z();
-    i.settings = Blob {
-        ptr: settings.as_ptr(),
-        len: settings.len(),
-        fmt: BLOB_JSON,
-        flags: 0,
-    };
+    i.settings = Blob::json(settings.as_bytes());
     let mut o: OpenOut = z();
     assert_eq!(
         call(
@@ -78,10 +77,8 @@ fn head_lines(target: &str) -> String {
         vec![0_u8; 256],
     );
     let mut l: LocateIn = z();
-    l.target = AbiStr {
-        ptr: target.as_ptr(),
-        len: target.len(),
-    };
+    // SAFETY: `target` is the test's own text, live for every call it is passed to.
+    l.target = unsafe { AbiStr::from_raw_parts(target.as_ptr(), target.len()) };
     l.authority_buf = authority.as_mut_ptr();
     l.authority_cap = authority.len();
     l.name_buf = name.as_mut_ptr();

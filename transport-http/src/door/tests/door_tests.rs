@@ -329,7 +329,7 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
 fn the_entry_claims_http_https_and_sse() {
     // The names' lengths, in claim order: `http`, `sse`, `https` (the crate forbids the unsafe a
     // read of their bytes would take; the Statement's own reader is the published suite).
-    let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
+    let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len()).collect();
     assert_eq!(names, [4, 3, 5]);
     assert_eq!(CLAIMS.len(), names.len());
     assert_eq!(FAULT_CLAIMS, names.len());
