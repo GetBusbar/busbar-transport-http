@@ -565,6 +565,7 @@ impl Accepted {
         if !framed {
             return Err(Failure(format!("refuse: {status} is no answer")));
         }
+        let_unread_body_go(a);
         a.gate = Gate::Refused;
         drop(sh);
         self.let_raw_go();
@@ -624,6 +625,9 @@ impl Accepted {
             a.reply = Some(q);
             // The far side may have gone; its stream's end says so.
             let _ = respond.send(resp);
+            if end {
+                let_unread_body_go(a);
+            }
             return Ok(false);
         }
         let Some(q) = a.reply.as_ref() else {
@@ -650,7 +654,12 @@ impl Accepted {
         if let Some(w) = q.waker.take() {
             w.wake();
         }
-        Ok(q.full)
+        let full = q.full;
+        drop(q);
+        if end {
+            let_unread_body_go(a);
+        }
+        Ok(full)
     }
 
     /// Drive the connection at host time `now_ns` until nothing inside it has more to do.
@@ -1359,6 +1368,24 @@ fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
         *buf = grown;
     }
     buf.extend_from_slice(bytes);
+}
+
+/// THE REQUEST BODY AN ANSWER ENDED BEFORE (row 192): once the host's answer on `a`'s stream is
+/// whole and its request body has not all arrived (the over-cap case: the host answers `413` while
+/// the body is still coming), the body is let go unread, as 1.5.5's server let it go (axum's body
+/// limit answered, and the handler dropped the request). hyper then ends the stream as it did then:
+/// on HTTP/1.1 it closes the connection once the answer is written (it keeps no connection alive
+/// past an unread body); on HTTP/2 the answer goes out whole and h2 resets the stream `NO_ERROR`
+/// (RFC 9113 §8.1: a server done with a request it did not read whole asks the client to stop
+/// sending it), the connection kept. The request side is over: no later body byte goes up.
+fn let_unread_body_go(a: &mut Answer) {
+    if a.asked {
+        return;
+    }
+    if a.body.take().is_some() {
+        a.asked = true;
+        a.told = true;
+    }
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
