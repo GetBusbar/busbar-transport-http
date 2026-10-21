@@ -35,10 +35,8 @@ fn z<T>() -> T {
 }
 
 fn s(text: &str) -> AbiStr {
-    AbiStr {
-        ptr: text.as_ptr(),
-        len: text.len(),
-    }
+    // SAFETY: `text` is the test's own text, live for every call it is passed to.
+    unsafe { AbiStr::from_raw_parts(text.as_ptr(), text.len()) }
 }
 
 fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O, index: u32) {
@@ -49,11 +47,15 @@ fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O,
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    let r = (op.expect("slot"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: the slot is the door's own, called with the `in` and `out` built above.
+    #[allow(unused_unsafe)]
+    let r = unsafe {
+        (op.expect("slot"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     assert_eq!(
         r.outcome(),
         busbar_contract::abi::mechanism::call::Outcome::Ready
@@ -113,7 +115,9 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool) -> (Vec<u8>, u16) {
 
 /// What the door wrote for the same request.
 fn capture_door(port: u16, h2: bool) -> Vec<u8> {
-    let d = busbar_transport_http::door::door();
+    // SAFETY: `door()` answers the `'static` door of this crate.
+    #[allow(unused_unsafe)]
+    let d = unsafe { busbar_transport_http::door() };
     // SAFETY: the door's `'static` table.
     let ops: &Ops = unsafe { &*(*d).ops.cast::<Ops>() };
     let settings = if h2 {
@@ -122,12 +126,8 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
         r#"{"advanced.upstream_http1_only":true}"#
     };
     let mut i: OpenIn = z();
-    i.settings = Blob {
-        ptr: settings.as_ptr(),
-        len: settings.len(),
-        fmt: BLOB_JSON,
-        flags: 0,
-    };
+    // SAFETY: `settings` is the test's own text, live for every call it is passed to.
+    i.settings = unsafe { Blob::from_raw_parts(settings.as_ptr(), settings.len(), BLOB_JSON, 0) };
     let mut o: OpenOut = z();
     call(
         ops.head.open,

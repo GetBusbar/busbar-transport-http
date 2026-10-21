@@ -36,11 +36,6 @@ fn retry_after_parses_both_normative_forms() {
     assert_eq!(crate::message::parse_retry_after("soon", 0), None);
     assert_eq!(crate::message::parse_retry_after("-5", 0), None);
     assert_eq!(crate::message::parse_retry_after("7.5", 0), None);
-    // An obsolete HTTP-date form: parsed by nobody here, so it is absent rather than guessed.
-    assert_eq!(
-        crate::message::parse_retry_after("Sunday, 06-Nov-94 08:49:37 GMT", 0),
-        None
-    );
     // Right length, wrong month.
     assert_eq!(
         crate::message::parse_retry_after("Sun, 06 Xxx 1994 08:49:37 GMT", 0),
@@ -48,9 +43,45 @@ fn retry_after_parses_both_normative_forms() {
     );
 }
 
-/// The egress header block is parsed once per message, not once per `write` call.
+/// RED (row 159 transport-http MEDIUM 2): `Retry-After` is read as 1.5.5's breaker read it
+/// (`httpdate::parse_http_date`, v1.5.5 `crates/busbar/src/breaker.rs:132-149`): all three
+/// HTTP-date forms RFC 9110 §5.6.7 has a recipient accept, IMF-fixdate, the obsolete RFC 850 form
+/// and asctime, each as the instant it names; a date whose fields are out of range is no date.
+/// RED on the reader that took IMF-fixdate alone and computed a timestamp from day 99 or hour 99.
+#[test]
+fn retry_after_reads_every_http_date_form_1_5_5_read() {
+    // 06 Nov 1994 08:49:37 GMT is 784_111_777 in Unix seconds, in each of the three forms.
+    for form in [
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+    ] {
+        assert_eq!(
+            crate::message::parse_retry_after(form, 784_111_777 - 30),
+            Some(30),
+            "{form}"
+        );
+        assert_eq!(
+            crate::message::parse_retry_after(form, 784_111_777 + 90),
+            Some(0),
+            "{form}: a past date is now"
+        );
+    }
+    // Out of range: no date, so no floor, as 1.5.5 had it.
+    for bad in [
+        "Sun, 99 Nov 1994 08:49:37 GMT",
+        "Sun, 31 Nov 1994 08:49:37 GMT",
+        "Sun, 06 Nov 1994 99:49:37 GMT",
+        "Sun, 06 Nov 1994 08:99:37 GMT",
+        "Sun, 06 Nov 1994 08:49:99 GMT",
+    ] {
+        assert_eq!(crate::message::parse_retry_after(bad, 0), None, "{bad}");
+    }
+}
+
+/// The egress header block is parsed once per message, not once per `emit` call.
 ///
-/// `write` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
+/// `emit` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
 /// used to re-run the whole header parse over the same unchanged prefix each time — a fresh Vec and
 /// two Strings per header, allocated and dropped, for every chunk of the body. Same standard the
 /// crate holds its chunked decoding to, now applied here.
@@ -80,13 +111,13 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     );
 }
 
-/// The egress chunked body is decoded once, not once per `write` call.
+/// The egress chunked body is decoded once, not once per `emit` call.
 ///
-/// The sibling of the header-parse cell above, and the same standard: `write` accumulates and asks
+/// The sibling of the header-parse cell above, and the same standard: `emit` accumulates and asks
 /// "is this message whole yet?" on every chunk, and answering that with a FRESH decoder re-decoded
 /// every byte received so far — quadratic in the body, with a full re-allocation of the decoded
-/// chunks each time. The ingress reader already keeps one decoder across reads. This drives the
-/// production `complete_message` and counts the bytes it actually feeds a decoder.
+/// chunks each time. One decoder is kept across the calls instead. This drives the production
+/// `complete_message` and counts the bytes it actually feeds a decoder.
 #[test]
 fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
@@ -133,16 +164,15 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     );
 }
 
-/// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
-/// the ingress reader's own refusal.
+/// The message `emit` accumulates is refused when it carries both a `Transfer-Encoding` and a
+/// `Content-Length`.
 ///
 /// Two headers naming two different lengths for one body is the canonical request-smuggling
 /// primitive. Before this was wired, `complete_message` only refused a `Transfer-Encoding` it
 /// could not read at all (anything but `chunked`); a body that was validly `chunked` AND carried a
 /// `Content-Length` fell through to the chunked branch, was decoded, and was handed back as a
 /// message with both framing headers stripped — a quiet disambiguation forwarded to the next hop,
-/// which may resolve the same ambiguity the other way. This refuses the pair outright, mirroring
-/// the ingress reader's identical check and identical error.
+/// which may resolve the same ambiguity the other way. This refuses the pair outright.
 ///
 /// The second half proves this is not an over-refusal: a normal chunked body with no
 /// `Content-Length` beside it — the exact shape every other egress chunked cell in this file
@@ -202,7 +232,7 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
 ///
 /// The egress unit used to write a neutral layout — every field as `name: value`, a blank line, the
-/// body — and hand it to `write` as if it were a request. It ran the lane cross-check over the same
+/// body — and hand it on as if it were a request. It ran the lane cross-check over the same
 /// buffer, so the check was honest about there being ONE buffer and wrong about what was in it. The
 /// layout is the transport's, and this is the transport.
 #[test]
@@ -420,4 +450,39 @@ fn the_egress_header_search_resumes_where_it_stopped() {
         "a {}-byte head arriving a byte per call cost {scanned} bytes of searching",
         head.len()
     );
+}
+
+/// RED (row 159 transport-http LOWs): the crate's prose says what its code does. The door's
+/// Statement claims `http`, `https` and `sse` (`door::CLAIM_NAMES`), so no doc says it claims two;
+/// and the ingress reader and the `write` op are gone (the framer reads the message `encode`
+/// rendered, through `emit`), so no comment justifies code by them. RED on the comments that
+/// still did.
+#[test]
+fn the_prose_names_the_claims_and_ops_the_code_has() {
+    let files = [
+        ("lib.rs", include_str!("../lib.rs")),
+        ("door/mod.rs", include_str!("../door/mod.rs")),
+        ("message.rs", include_str!("../message.rs")),
+        ("raw.rs", include_str!("../raw.rs")),
+        ("tests/mod.rs", include_str!("mod.rs")),
+    ];
+    // Spelled in pieces so this cell's own text is not what it finds.
+    let stale = [
+        ["claims `http` and", " `sse`"].concat(),
+        ["once per `write`", " call"].concat(),
+        ["`write` accum", "ulates"].concat(),
+        ["the ingress reader al", "ready"].concat(),
+        ["the ingress read", "er's"].concat(),
+        ["own `write`", " is handed"].concat(),
+        ["one request per", " connection"].concat(),
+    ];
+    for (file, text) in files {
+        let text = text.to_ascii_lowercase();
+        for phrase in &stale {
+            assert!(
+                !text.contains(phrase.as_str()),
+                "{file} still says {phrase:?}"
+            );
+        }
+    }
 }

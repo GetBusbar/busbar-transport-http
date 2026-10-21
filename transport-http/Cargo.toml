@@ -34,6 +34,9 @@ http = { workspace = true }
 bytes = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+# `Retry-After`'s HTTP-date, read as 1.5.5's breaker read it (`message::parse_retry_after`). Already
+# in the lock through hyper's own tree: naming it adds no crate to the graph.
+httpdate = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its

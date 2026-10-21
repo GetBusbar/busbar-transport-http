@@ -64,7 +64,7 @@ busbar_contract::hyper_io!(::bytes::Bytes);
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
-use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
+use busbar_contract::abi::mechanism::door::Statement;
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
     ValidateIn,
@@ -77,7 +77,7 @@ use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
+    StatusRow, WriteIn, CANCEL_NOTHING_MOVED, FAULT_CALLER, FAULT_HARD, FAULT_NONE,
     FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG, SIDE_DIAL, STATUS_AT_FIRST_FRAME,
     STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED,
 };
@@ -116,10 +116,7 @@ const FACTS: &[AbiStr] = &[
 ];
 
 const fn bytes_str(b: &'static [u8]) -> AbiStr {
-    AbiStr {
-        ptr: b.as_ptr(),
-        len: b.len(),
-    }
+    AbiStr::of_bytes(b)
 }
 
 /// The schemes this ONE entry claims, by name: the Statement's `claims`, the one place they are
@@ -132,17 +129,16 @@ const CLAIM_NAMES: &[AbiStr] = &[
 ];
 
 /// The `http` claim's row; `https` is the same wire, so it carries the same row.
-const HTTP_ROW: Claim = Claim {
-    selector_forms: bytes_str(&SELECTOR_CODES),
-    egress_selector_forms: abi_str(""),
-    facts: FACTS.as_ptr(),
-    facts_len: FACTS.len(),
-    status_namespace: abi_str(status_ns::HTTP),
-    session: 0,
-    session_bound: 0,
-    unit0_trigger: 0,
-    status_at: STATUS_AT_FIRST_FRAME,
-    _reserved: 0,
+const HTTP_ROW: Claim = {
+    let mut c = Claim::EMPTY.with_facts(FACTS);
+    c.selector_forms = bytes_str(&SELECTOR_CODES);
+    c.egress_selector_forms = abi_str("");
+    c.status_namespace = abi_str(status_ns::HTTP);
+    c.session = 0;
+    c.session_bound = 0;
+    c.unit0_trigger = 0;
+    c.status_at = STATUS_AT_FIRST_FRAME;
+    c
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
@@ -150,17 +146,16 @@ const HTTP_ROW: Claim = Claim {
 /// `http`'s, at the first frame.
 pub(crate) const CLAIMS: &[Claim] = &[
     HTTP_ROW,
-    Claim {
-        selector_forms: bytes_str(&SSE_SELECTOR_CODES),
-        egress_selector_forms: abi_str(""),
-        facts: std::ptr::null(),
-        facts_len: 0,
-        status_namespace: abi_str(status_ns::HTTP),
-        session: 0,
-        session_bound: 0,
-        unit0_trigger: 0,
-        status_at: STATUS_AT_FIRST_FRAME,
-        _reserved: 0,
+    {
+        let mut c = Claim::EMPTY;
+        c.selector_forms = bytes_str(&SSE_SELECTOR_CODES);
+        c.egress_selector_forms = abi_str("");
+        c.status_namespace = abi_str(status_ns::HTTP);
+        c.session = 0;
+        c.session_bound = 0;
+        c.unit0_trigger = 0;
+        c.status_at = STATUS_AT_FIRST_FRAME;
+        c
     },
     HTTP_ROW,
 ];
@@ -252,6 +247,14 @@ const SETTING_ROWS: [(&str, u32, &str); 4] = [
     (setting::BODY_MAX_BYTES, SETTING_COUNT, "33554432"),
 ];
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../../declares.json")
+    )]
+);
+
 /// [`SETTING_ROWS`] as the Statement's setting declarations.
 const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
     let mut out = [SettingDecl {
@@ -277,11 +280,12 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
-pub const STATEMENT: Statement = Statement {
-    kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
-    claims: CLAIM_NAMES.as_ptr(),
-    claims_len: CLAIM_NAMES.len(),
-    ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
+pub const STATEMENT: Statement = {
+    let mut s = statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
+        .with_kind_tail(&crate::meta::TAIL)
+        .with_claims(CLAIM_NAMES);
+    s.extensions = EXTENSIONS;
+    s
 };
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
@@ -365,7 +369,7 @@ macro_rules! slot {
 slot!(
     /// `validate`.
     Validate, ValidateIn, OutHead, |_, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
+        match read_settings(i.settings().bytes()) {
             Ok(_) => Outcome::Ready,
             // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
             Err(e) => o.fail(Refusal::failed(e)),
@@ -376,7 +380,7 @@ slot!(
 slot!(
     /// `open`.
     Open, OpenIn, OpenOut, |instance, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
+        match read_settings(i.settings().bytes()) {
             Ok((posture, prior_knowledge, http1_only)) => {
                 instance.open(Instance {
                     posture,
@@ -504,10 +508,12 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// offered as written.
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
-    if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
-        return v4.to_string();
+    // The contract's literal reader (`net::host_ip`): a dotted quad and every alternate spelling
+    // read as the IPv4 address they name; a DNS name or an IPv6 literal is offered as written.
+    match sdk::net::host_ip(bare) {
+        Some(ip) if ip.is_ipv4() && !bare.contains(':') => ip.to_string(),
+        _ => host.to_owned(),
     }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
 }
 
 /// `locate`.
@@ -521,7 +527,8 @@ impl SafeSlot for Locate {
         i: Lent<'_, LocateIn>,
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
-        let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
+        let target = i.target().bytes();
+        let (secure, authority, name) = match located(target) {
             Ok(l) => l,
             Err(why) => {
                 o.error(why);
@@ -534,21 +541,39 @@ impl SafeSlot for Locate {
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
+        // THE FRAMER'S OWN HEAD LINES (`engine::head_lines`), stated for a host that reads them
+        // (`Located.defaults`, THE DESIGN §6, item 5): such a host puts them in the head before the
+        // auth signs it, and `emit` then finds them stated and adds none. No busbar host reads
+        // `Located.defaults` yet, so today `emit` adds both defaults itself. A host that lends no
+        // buffer for them is answered none, and `emit` adds them as before.
+        let lines = if i.defaults_cap() == 0 {
+            String::new()
+        } else {
+            std::str::from_utf8(target)
+                .ok()
+                .and_then(engine::head_lines)
+                .unwrap_or_default()
+        };
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut h = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(name.as_bytes());
         l.extend(offer);
-        // One short answer for all three buffers, each at its full size.
-        let short = !(a.fits() && n.fits() && l.fits());
+        h.extend(lines.as_bytes());
+        // One short answer for all four buffers, each at its full size.
+        let short = !(a.fits() && n.fits() && l.fits() && h.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
+        let (hw, hnd) = h.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
+        o.set(|x| &x.defaults_written, hw as u64);
+        o.set(|x| &x.defaults_needed, hnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;
@@ -571,13 +596,11 @@ impl SafeSlot for Begin {
         let Some(inst) = p.get() else {
             return Outcome::Failed;
         };
-        if i.side != SIDE_DIAL {
+        if i.side() != SIDE_DIAL {
             o.error("begin: http frames dialled connections only");
             return Outcome::Refused;
         }
-        let agreed = i
-            .facts()
-            .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
+        let agreed = i.facts().map_or(&[][..], |f| f.agreed_protocol().bytes());
         let proto = match agreed {
             b"h2" => Proto::H2,
             b"http/1.1" => Proto::H1,
@@ -588,11 +611,11 @@ impl SafeSlot for Begin {
                 return Outcome::Refused;
             }
         };
-        let Ok(target) = std::str::from_utf8(i.field(|x| &x.target).bytes()) else {
+        let Ok(target) = std::str::from_utf8(i.target().bytes()) else {
             o.error("begin: the target is not text");
             return Outcome::Failed;
         };
-        let Ok(framing) = Framing::dial(target, proto, inst.posture, i.sink.now_monotonic_ns)
+        let Ok(framing) = Framing::dial(target, proto, inst.posture, i.sink().now_monotonic_ns())
         else {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
@@ -606,7 +629,7 @@ impl SafeSlot for Begin {
             Ok(s) => s,
             Err(why) => return failed(&mut o, why.why().into()),
         };
-        step(slot.held(), i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        step(slot.held(), i.sink(), &mut o, |_| Ok(()))
     }
 }
 
@@ -622,8 +645,8 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.ingest(bytes, i.end != 0);
+        with(&p, i.framing(), i.sink(), &mut o, |f| {
+            f.ingest(bytes, i.end() != 0);
             Ok(())
         })
     }
@@ -641,9 +664,9 @@ impl SafeSlot for Emit {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.emit(i.stream, bytes, now, deadline)
+        let (now, deadline) = (i.sink().now_monotonic_ns(), i.deadline_ns());
+        with(&p, i.framing(), i.sink(), &mut o, |f| {
+            f.emit(i.stream(), bytes, now, deadline)
         })
     }
 }
@@ -659,7 +682,7 @@ impl SafeSlot for Timer {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        with(&p, i.framing(), i.sink(), &mut o, |_| Ok(()))
     }
 }
 
@@ -675,7 +698,7 @@ impl SafeSlot for Finish {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
-            inst.framings.remove(i.framing)
+            inst.framings.remove(i.framing())
         });
         match removed {
             Ok(()) => {
@@ -702,12 +725,12 @@ impl SafeSlot for Encode {
         let mut pairs = Vec::with_capacity(fields.len() + 2);
         // The head words, where the host states them, ARE the request line: they lead, so they win
         // over any same-named envelope field.
-        let method = i.field(|x| &x.method).bytes();
-        let word = i.field(|x| &x.target).bytes();
+        let method = i.method().bytes();
+        let word = i.target().bytes();
         let envelope_path = fields.iter().find_map(|f| {
-            let name = f.field(|x| &x.name).bytes();
+            let name = f.name().bytes();
             name.eq_ignore_ascii_case(b"path")
-                .then(|| f.field(|x| &x.value).bytes())
+                .then(|| f.value().bytes())
         });
         // The target goes out as 1.5.5's client wrote it: percent-encoded, never refused for a
         // space (`dest_head::encode_target`).
@@ -730,17 +753,17 @@ impl SafeSlot for Encode {
             pairs.push(("path", target));
         }
         for f in fields.iter() {
-            let Ok(name) = f.field(|x| &x.name).as_str() else {
+            let Ok(name) = f.name().as_str() else {
                 o.error("encode: a field name is not text");
                 return Outcome::Failed;
             };
-            pairs.push((name, f.field(|x| &x.value).bytes()));
+            pairs.push((name, f.value().bytes()));
         }
         let Ok(bytes) = crate::transport::render_envelope(&pairs, i.body()) else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
         };
-        let mut wire = i.field(|x| &x.sink).wire();
+        let mut wire = i.sink().wire();
         if bytes.len() > wire.cap() {
             o.error("encode: the rendered message is larger than the wire buffer");
             return Outcome::Failed;
@@ -781,7 +804,7 @@ fn step(
     if let Err(e) = f(&mut h.framing) {
         return failed(o, e.0);
     }
-    h.framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
+    h.framing.drive(sink.now_monotonic_ns(), sink.now_unix_ns());
     let pending = h.framing.wire_pending() || !h.framing.pieces().is_empty();
     if let Some(e) = h.framing.failure().cloned() {
         if !pending {
