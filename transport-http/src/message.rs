@@ -192,6 +192,11 @@ pub(crate) fn complete_message(
         let fresh = &rest[cache.fed.min(rest.len())..];
         cache.feeds += fresh.len();
         decoder.feed(fresh).map_err(|_| TransportError::Framing)?;
+        // The cap is the BODY's, chunked or declared: past it the message is refused as the
+        // Content-Length branch below refuses a declared length past it.
+        if decoder.decoded_len() > max_body_bytes {
+            return Err(TransportError::Framing);
+        }
         cache.fed = rest.len();
         if !decoder.is_done() {
             return Ok(None);

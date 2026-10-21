@@ -39,7 +39,8 @@ pub(crate) use message::{complete_message, request_target, retry_after_secs, Egr
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this row: its key, the
 /// layers it declares (none: the carrier is the connector's choice) and its door. The root names
-/// none of them. The door's Statement claims `http` and `sse`; the root registers both from it.
+/// none of them. The door's Statement claims `http`, `https` and `sse`; the root registers each
+/// from it.
 pub mod linked {
     /// The row's registry key: the entry's first claim.
     pub const KEY: &str = crate::meta::KEY;

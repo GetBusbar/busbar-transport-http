@@ -257,6 +257,8 @@ pub struct ChunkedDecoder {
     current: Vec<u8>,
     chunks: Vec<Vec<u8>>,
     trailers: Vec<(String, String)>,
+    /// How many body bytes the chunks have decoded so far.
+    decoded: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -301,6 +303,7 @@ impl ChunkedDecoder {
         match self.state {
             ChunkState::Data => {
                 self.current.push(b);
+                self.decoded += 1;
                 self.want -= 1;
                 if self.want == 0 {
                     self.chunks.push(std::mem::take(&mut self.current));
@@ -345,6 +348,12 @@ impl ChunkedDecoder {
             ChunkState::Done => {}
         }
         Ok(())
+    }
+
+    /// How many body bytes the chunks fed so far decoded to.
+    #[must_use]
+    pub fn decoded_len(&self) -> usize {
+        self.decoded
     }
 
     /// Whether the terminal chunk and its trailer section have both arrived.
