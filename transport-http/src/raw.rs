@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A minimal HTTP/1.1 message reader: just enough to split the envelope the door's `emit` is handed
-//! (request line, headers, blank line, body) into its parts and read its framing fields. Not a
-//! general-purpose parser — no header folding, and no transfer coding is read: a message that
-//! names one is refused by `complete_message`, since the host states the length line before the
-//! auth (THE DESIGN §6 step 5). The door's responses are read by hyper, never by this.
+//! A minimal HTTP/1.1 message reader: just enough to split the request envelope the door's `emit`
+//! is handed (request line, headers, blank line, body) into its parts, read its framing fields, and
+//! read a chunked body across however many `emit` calls it arrives in, as 1.5.5's server decoded a
+//! chunked request body before its client sent it on with its length. Not a general-purpose parser —
+//! no header folding, and the only transfer coding it reads is `chunked`. The door's responses are
+//! read by hyper, never by this.
 
 /// The message's request line, `METHOD path HTTP/version`: the only start line this reader takes.
 /// The envelope `emit` is handed is a request; a status line is not one and does not parse.
@@ -122,6 +123,15 @@ fn is_http1(version: &str) -> bool {
     matches!(version, "1.0" | "1.1")
 }
 
+/// Find a header's value, case-insensitively, as the wire allows any casing.
+#[must_use]
+pub fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_slice())
+}
+
 /// A field's WHOLE value: every line carrying that name, joined with `", "`, or `None` when no
 /// line carries it.
 ///
@@ -150,11 +160,37 @@ pub fn field_list(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
     out
 }
 
-/// Whether a header block declares a transfer coding at all, on any of its lines and in any case.
+/// Whether a header block declares a chunked body, and one this transport can actually undo.
 ///
-/// The question `complete_message` refuses on: a request framed by any coding, `chunked` included,
-/// is a framing the host never states, and telling it apart from a message that names none is what
-/// lets the door refuse the first without refusing the second.
+/// `Transfer-Encoding` names a list — across as many lines as the sender chose, which is why the
+/// whole field is read rather than its first line — and this asks the wire's own two questions of
+/// it. `chunked` must be the FINAL coding (RFC 9112 6.1): a sender applying any other coding applies
+/// `chunked` last so the message stays framable, and a list where it is not last leaves the body
+/// length undeterminable, so `chunked, gzip` is not a chunked body but a message to refuse. And
+/// `chunked` may be applied only ONCE: `chunked, chunked` describes a body wrapped twice, of which
+/// undoing one layer would hand up a framing still on the bytes as though it were the body.
+#[must_use]
+pub fn is_chunked(headers: &[(String, Vec<u8>)]) -> bool {
+    let Some(list) = field_list(headers, "transfer-encoding") else {
+        return false;
+    };
+    let codings: Vec<&str> = list.split(',').map(str::trim).collect();
+    let applied = codings
+        .iter()
+        .filter(|c| c.eq_ignore_ascii_case("chunked"))
+        .count();
+    applied == 1
+        && codings
+            .last()
+            .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+}
+
+/// Whether a header block declares a transfer coding at all, chunked or otherwise, on any of its
+/// lines and in any case.
+///
+/// The companion question to [`is_chunked`]: a message that names a coding this transport cannot
+/// frame is a framing error, and telling that apart from a message that names none is what lets a
+/// caller refuse the first without refusing the second.
 #[must_use]
 pub fn has_transfer_encoding(headers: &[(String, Vec<u8>)]) -> bool {
     field_list(headers, "transfer-encoding").is_some()
@@ -191,6 +227,136 @@ pub fn content_length(headers: &[(String, Vec<u8>)]) -> Result<Option<usize>, ()
         return Err(());
     }
     first.parse::<usize>().map(Some).map_err(|_| ())
+}
+
+/// A chunked-transfer-encoding reader, fed whatever bytes have arrived so far.
+///
+/// Incremental and byte-at-a-time on purpose. A body arrives across as many reads as the network
+/// chooses, and a chunk boundary is free to fall in the middle of a size line, in the middle of the
+/// CRLF after one, or between the terminal chunk and its trailers. A decoder that re-scanned the
+/// whole buffer on every read would be quadratic in the body size, which for the megabyte bodies
+/// this path exists to carry is the difference between a transport and a stall.
+#[derive(Debug, Default)]
+pub struct ChunkedDecoder {
+    state: ChunkState,
+    line: Vec<u8>,
+    want: usize,
+    current: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
+    trailers: Vec<(String, String)>,
+    /// The decoded body bytes so far, every chunk's data counted as it arrives.
+    body_len: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum ChunkState {
+    /// Reading the hexadecimal size line that opens a chunk.
+    #[default]
+    Size,
+    /// Reading `want` more bytes of the current chunk's data.
+    Data,
+    /// Reading the CRLF that closes a chunk's data.
+    AfterData,
+    /// Reading trailer lines, terminated by an empty one.
+    Trailers,
+    /// The terminal chunk and its trailers have both arrived.
+    Done,
+}
+
+/// The bytes did not follow the chunked grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkedMalformed;
+
+impl ChunkedDecoder {
+    /// Feed everything that has arrived since the last call, answering how many of `bytes` the
+    /// message took: all of them, unless the terminal chunk and its trailer section ended it
+    /// first. What is left after that end is not this message's, and the caller judges it.
+    ///
+    /// # Errors
+    ///
+    /// The bytes are not chunked-transfer-encoding: a size line that is not hexadecimal, a chunk
+    /// not closed by CRLF, or a trailer line with no colon.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
+        for (i, &b) in bytes.iter().enumerate() {
+            if self.state == ChunkState::Done {
+                return Ok(i);
+            }
+            self.step(b)?;
+        }
+        Ok(bytes.len())
+    }
+
+    /// The decoded body bytes so far.
+    #[must_use]
+    pub fn body_len(&self) -> usize {
+        self.body_len
+    }
+
+    fn step(&mut self, b: u8) -> Result<(), ChunkedMalformed> {
+        match self.state {
+            ChunkState::Data => {
+                self.current.push(b);
+                self.body_len += 1;
+                self.want -= 1;
+                if self.want == 0 {
+                    self.chunks.push(std::mem::take(&mut self.current));
+                    self.state = ChunkState::AfterData;
+                }
+            }
+            ChunkState::AfterData => {
+                if b == b'\n' {
+                    self.state = ChunkState::Size;
+                } else if b != b'\r' {
+                    return Err(ChunkedMalformed);
+                }
+            }
+            ChunkState::Size | ChunkState::Trailers => {
+                if b != b'\n' {
+                    if b != b'\r' {
+                        self.line.push(b);
+                    }
+                    return Ok(());
+                }
+                let line = String::from_utf8(std::mem::take(&mut self.line))
+                    .map_err(|_| ChunkedMalformed)?;
+                if self.state == ChunkState::Size {
+                    // A size line may carry chunk extensions after a semicolon; none is read.
+                    let size_text = line.split(';').next().unwrap_or("").trim();
+                    let size =
+                        usize::from_str_radix(size_text, 16).map_err(|_| ChunkedMalformed)?;
+                    self.state = if size == 0 {
+                        ChunkState::Trailers
+                    } else {
+                        self.want = size;
+                        ChunkState::Data
+                    };
+                } else if line.is_empty() {
+                    self.state = ChunkState::Done;
+                } else {
+                    let (name, value) = line.split_once(':').ok_or(ChunkedMalformed)?;
+                    self.trailers
+                        .push((name.trim().to_string(), value.trim().to_string()));
+                }
+            }
+            ChunkState::Done => {}
+        }
+        Ok(())
+    }
+
+    /// Whether the terminal chunk and its trailer section have both arrived.
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        self.state == ChunkState::Done
+    }
+
+    /// The decoded chunks, in the order the sender wrote them, and the trailers that followed.
+    ///
+    /// The chunking is kept rather than flattened: a sender's chunk is the unit it chose to send,
+    /// and a reader that concatenated them would be reporting a framing the wire never had.
+    #[must_use]
+    pub fn take(self) -> (Vec<Vec<u8>>, Vec<(String, String)>) {
+        (self.chunks, self.trailers)
+    }
 }
 
 #[cfg(test)]
