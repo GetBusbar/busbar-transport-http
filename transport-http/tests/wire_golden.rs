@@ -409,9 +409,12 @@ fn with_stated(mut fields: Vec<(String, String)>, lines: &str) -> Vec<(String, S
 /// A request's `(name, value)` fields.
 type Fields = Vec<(String, String)>;
 
+/// What a host does to a request's fields from what `locate` stated for the target.
+type HostStates<'a> = &'a dyn Fn(Fields, &str) -> Fields;
+
 /// [`door_h1`], where `host_states` (when set) reshapes the request's fields from what `locate`
 /// stated for the target, as the host does; `None` leaves the door to add its own defaults.
-fn door_h1_with(r: &Recorded, host_states: Option<&dyn Fn(Fields, &str) -> Fields>) -> String {
+fn door_h1_with(r: &Recorded, host_states: Option<HostStates<'_>>) -> String {
     let settings = r#"{"advanced.upstream_http1_only":true}"#;
     let pinned = recorded_port(r);
     let port = pinned.unwrap_or(PORT);
