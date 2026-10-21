@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **ONE `http` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_http::door::door`) and this
+//! **ONE `http` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_http::door`) and this
 //! crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
 //! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
 //! Statement and the same wire bytes for one request. Run against the busbar rev this repo pins
@@ -58,7 +58,7 @@ fn cdylib() -> std::path::PathBuf {
 
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_http::door::door).expect("the door states itself")
+    LinkedRow::of(busbar_transport_http::door).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -153,7 +153,7 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
     let linked: Plugin<Transport> = load_linked(&row(), bind(&d)).expect("the linked door loads");
     let dropped: Plugin<Transport> =
         load_dropped(&cdylib(), &row().statement, bind(&d)).expect("the dropped-in door loads");
-    assert_eq!(linked.name(), busbar_transport_http::linked::KEY);
+    assert_eq!(linked.name(), "http");
     assert_eq!(dropped.name(), linked.name());
     open(&linked);
     open(&dropped);
@@ -189,7 +189,17 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_transport_http::door::door,
+    door: busbar_transport_http::door,
     cdylib: "busbar_transport_http_plugin",
     inputs: include_str!("conformance.json"),
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = row();
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../transport-http/declares.json")[..]),
+    );
 }

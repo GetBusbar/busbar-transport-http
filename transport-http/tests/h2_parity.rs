@@ -113,7 +113,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool) -> (Vec<u8>, u16) {
 
 /// What the door wrote for the same request.
 fn capture_door(port: u16, h2: bool) -> Vec<u8> {
-    let d = busbar_transport_http::door::door();
+    let d = busbar_transport_http::door();
     // SAFETY: the door's `'static` table.
     let ops: &Ops = unsafe { &*(*d).ops.cast::<Ops>() };
     let settings = if h2 {

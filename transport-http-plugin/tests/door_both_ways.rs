@@ -635,7 +635,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_http_plugin::door::door();
+    let d = busbar_transport_http::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops.cast::<Ops>() }
 }
