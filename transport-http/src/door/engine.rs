@@ -301,7 +301,7 @@ impl Framing {
         }
         let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
             .map_err(|e| Failure(format!("request message: {e}")))?;
-        let Some(raw) = raw else { return Ok(()) };
+        let Some(mut raw) = raw else { return Ok(()) };
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
@@ -320,7 +320,7 @@ impl Framing {
             b = b.header(k.as_str(), v.as_slice());
         }
         let mut req = b
-            .body(Full::new(Bytes::from(raw.body)))
+            .body(Full::new(Bytes::from(std::mem::take(&mut raw.body))))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
         // Spent only by a request that was built: one the builder refuses leaves the dial path to
