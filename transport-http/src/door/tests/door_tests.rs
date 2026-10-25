@@ -30,13 +30,45 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
     assert_eq!(
         refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
-        Some("advanced.upstream_http1_only: not of its declared kind")
+        Some("settings: advanced.upstream_http1_only must be true or false")
     );
     assert_eq!(
         refused(r#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
-        Some("limits.request_body_max_bytes: not of its declared kind")
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
     );
-    assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
+    assert_eq!(
+        refused("[").as_deref(),
+        Some("settings: must be a JSON object")
+    );
+}
+
+/// RED: an undeclared key was read past, a zero limit was taken (a zero body cap refuses every
+/// body, a zero timeout every exchange) and a bad value was named `<key>: not of its declared
+/// kind`. The canon: an undeclared key is refused by name, zero is a bad value, and each bad value
+/// says what the key must be.
+#[test]
+fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":false,"limits.nope":1}"#).as_deref(),
+        Some("settings: limits.nope is not a setting this transport reads")
+    );
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":0}"#).as_deref(),
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":0}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":"7"}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":1}"#).as_deref(),
+        Some("settings: advanced.upstream_h2_prior_knowledge must be true or false")
+    );
 }
 
 /// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
@@ -55,7 +87,7 @@ fn locate_offers_a_dns_name_lower_cased() {
 fn a_settings_blob_that_is_not_an_object_is_refused() {
     for s in ["null", "[]", "\"x\"", "5", "true"] {
         let r = read_settings(blob(s)).err().map(|e| e.to_string());
-        assert_eq!(r.as_deref(), Some("settings: not a JSON object"), "{s}");
+        assert_eq!(r.as_deref(), Some("settings: must be a JSON object"), "{s}");
     }
     assert!(read_settings(blob("")).is_ok());
 }
