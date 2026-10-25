@@ -655,4 +655,116 @@ fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
         f.pieces().iter().all(|p| !p.failed),
         "no failure piece: nothing was owed"
     );
+
+/// RED (codeaudit D1; THE DESIGN: every refusal explained): a refused request message names its
+/// cause. A `Content-Length` over `limits.request_body_max_bytes` and a target not in origin form
+/// each fail with text an operator can act on, not the bare word "Framing".
+#[test]
+fn a_refused_request_message_names_its_cause() {
+    let capped = Posture {
+        max_body_bytes: 4,
+        ..posture(30)
+    };
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
+    f.drive(0, 0);
+    let over = f
+        .emit(
+            1,
+            b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\n123456789",
+            0,
+            0,
+        )
+        .expect_err("a body over the cap is refused");
+    assert!(over.0.contains("body cap"), "{over:?}");
+
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let target = f
+        .emit(1, b"GET v1/chat HTTP/1.1\r\n\r\n", 0, 0)
+        .expect_err("a target not in origin form is refused");
+    assert!(target.0.contains("origin form"), "{target:?}");
+    assert!(target.0.contains("v1/chat"), "{target:?}");
+}
+
+/// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a
+/// request that was built. On HTTP/2 a first request whose builder refuses (a field value carrying
+/// byte 0x01, which the raw reader takes and `http` does not) fails its own stream; the next
+/// request naming no target is still the connection's first sent, so it goes to the dial's path,
+/// not `/`. The wire of that request equals the wire of the same request sent first on a fresh
+/// connection (same HPACK state, same frames), so no header block need be decoded.
+#[test]
+fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
+    let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
+    let dial = || {
+        let mut f =
+            Framing::dial("http://127.0.0.1:9/card", Proto::H2, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        f.take_wire(usize::MAX);
+        f
+    };
+
+    let mut reference = dial();
+    reference.emit(3, &unnamed, 0, 0).expect("emit");
+    reference.drive(0, 0);
+    let expected = reference.take_wire(usize::MAX);
+    assert!(!expected.is_empty(), "the reference request went out");
+
+    let mut f = dial();
+    f.emit(1, b"GET /x HTTP/1.1\r\nx-a: \x01\r\n\r\n", 0, 0)
+        .expect("h2 answers per stream");
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 1 && p.failed),
+        "the first request fails to build"
+    );
+    f.emit(3, &unnamed, 0, 0).expect("emit");
+    f.drive(0, 0);
+    assert_eq!(
+        f.take_wire(usize::MAX),
+        expected,
+        "the next request naming no target goes to the dial's path"
+    );
+}
+
+/// RED (codeaudit D3; RFC 9112 6.3: a `Transfer-Encoding` overrides `Content-Length`): an h1
+/// answer carrying both is framed chunked by hyper, so its `Content-Length` states a length the
+/// body does not have. The head piece states none, as 1.5.5's `content_length()` was `None` for a
+/// chunked body; the host's pre-body download cap must not read a length the body is not.
+#[test]
+fn a_transfer_encoding_answer_states_no_declared_length() {
+    let mut f = asked(Proto::H1, 300);
+    f.ingest(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 50000000\r\n\r\n\
+          5\r\nhello\r\n0\r\n\r\n",
+        false,
+    );
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(None), "chunked beats content-length");
+}
+
+/// RED (codeaudit D4): the head allowance bounds the head itself, not only the buffer a body
+/// shares with it. A message whose header block runs past `HEAD_MAX_BYTES` is refused, whether its
+/// terminator has arrived or not, rather than parsed into millions of fields and handed to hyper.
+#[test]
+fn a_request_head_over_its_allowance_is_refused() {
+    let mut head = b"GET /x HTTP/1.1\r\n".to_vec();
+    while head.len() <= HEAD_MAX_BYTES {
+        head.extend_from_slice(b"x-pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    let mut open = head.clone();
+    let mut whole = head;
+    whole.extend_from_slice(b"\r\n");
+
+    for (what, message) in [("terminated", &mut whole), ("unterminated", &mut open)] {
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message, 0, 0).expect_err(what);
+        assert!(
+            r.0.contains("request head over its allowance"),
+            "{what}: {r:?}"
+        );
+        assert!(
+            f.failure().is_some(),
+            "{what}: the refusal fails the framing"
+        );
+    }
 }
