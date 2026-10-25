@@ -39,6 +39,27 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
 }
 
+/// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
+/// built, so the offered name is lower-case; the dial authority stays as written.
+#[test]
+fn locate_offers_a_dns_name_lower_cased() {
+    let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
+    assert_eq!(name, "api.example.com");
+    assert_eq!(authority, "API.Example.com:443");
+    let (_, _, name) = located(b"https://[FE80::1]:4318/").expect("located");
+    assert_eq!(name, "fe80::1");
+}
+
+/// A settings blob that is not a JSON object reads nothing, so it is refused, not defaulted.
+#[test]
+fn a_settings_blob_that_is_not_an_object_is_refused() {
+    for s in ["null", "[]", "\"x\"", "5", "true"] {
+        let r = read_settings(blob(s)).err().map(|e| e.to_string());
+        assert_eq!(r.as_deref(), Some("settings: not a JSON object"), "{s}");
+    }
+    assert!(read_settings(blob("")).is_ok());
+}
+
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
 /// the host read one figure for each.
 #[test]
@@ -63,6 +84,21 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(429), STATUS_CALLER_FAULT);
     assert_eq!(class_of(503), STATUS_FAR_END_FAULT);
     assert_eq!(class_of(101), STATUS_OTHER);
+    // The band edges, each side of each.
+    for (code, class) in [
+        (199, STATUS_OTHER),
+        (200, STATUS_SUCCESS),
+        (299, STATUS_SUCCESS),
+        (300, STATUS_OTHER),
+        (399, STATUS_OTHER),
+        (400, STATUS_CALLER_FAULT),
+        (499, STATUS_CALLER_FAULT),
+        (500, STATUS_FAR_END_FAULT),
+        (599, STATUS_FAR_END_FAULT),
+        (600, STATUS_OTHER),
+    ] {
+        assert_eq!(class_of(code), class, "status {code}");
+    }
 }
 
 /// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of

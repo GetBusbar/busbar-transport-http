@@ -313,6 +313,9 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
     let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
     let v: serde_json::Value =
         serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
+    if !v.is_object() {
+        return Err("settings: not a JSON object".to_owned());
+    }
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
         Some(x) => x.as_bool().ok_or(k),
@@ -500,14 +503,15 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
 /// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
 /// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal, a dotted quad) is
-/// offered as written.
+/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal) is offered ASCII
+/// lower-cased, as WHATWG lower-cases it (`https://API.Example.com/` went out as `api.example.com`).
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
     if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
         return v4.to_string();
     }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
+    sdk::net::expand_alternate_ipv4(bare)
+        .map_or_else(|| host.to_ascii_lowercase(), |v4| v4.to_string())
 }
 
 /// `locate`.
@@ -718,10 +722,7 @@ impl SafeSlot for Encode {
         .map(dest_head::encode_target)
         .transpose();
         let Ok(target) = target else {
-            return failed(
-                &mut o,
-                "encode: a request target holds CR, LF or NUL".into(),
-            );
+            return failed(&mut o, format!("encode: {}", dest_head::REFUSED));
         };
         if !method.is_empty() {
             pairs.push(("method", method));

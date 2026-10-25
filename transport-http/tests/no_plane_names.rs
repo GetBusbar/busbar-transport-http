@@ -262,12 +262,10 @@ fn the_scan_would_catch_a_planted_name() {
     // bound to a local name, because a local named after the dialect (`let a2a = ...`) would be
     // exactly the same leak in a different guise: the word-boundary scan reads identifiers, not
     // just string contents, so `a2a` the variable trips the scan as surely as `"a2a"` the literal.
-    assert!(
-        contains_word(vocab.text("NEEDLE_1_HAYSTACK"), vocab.word("DIALECT_1"))
-            || vocab
-                .text("NEEDLE_1_BARE")
-                .contains(vocab.text("NEEDLE_1_SUBSTR"))
-    );
+    assert!(contains_word(
+        vocab.text("NEEDLE_1_HAYSTACK"),
+        vocab.word("DIALECT_1")
+    ));
     assert!(contains_word(
         vocab.text("NEEDLE_2_HAYSTACK"),
         vocab.word("DIALECT_1")

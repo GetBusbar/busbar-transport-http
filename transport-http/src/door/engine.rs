@@ -229,13 +229,13 @@ impl Framing {
     /// A message that cannot be sent fails its STREAM on HTTP/2 (a failure piece, its siblings
     /// untouched), and the framing on HTTP/1.1, where the connection carries one exchange.
     ///
-    /// # Errors
-    ///
-    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
-    ///
     /// `deadline_ns` is the attempt's deadline as the caller stamped it at the attempt's start (the
     /// connect spent part of it); `0` counts the configured request timeout from `now_ns`. Only a
     /// stream's first `emit` reads it.
+    ///
+    /// # Errors
+    ///
+    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
     pub fn emit(
         &mut self,
         stream: u64,
@@ -293,15 +293,23 @@ impl Framing {
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
             return Err(Failure("request message over the body cap".into()));
         }
-        let raw = complete_message(buf, head, max)
-            .map_err(|e| Failure(format!("request message: {e:?}")))?;
+        let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
+            .map_err(|e| Failure(format!("request message: {e}")))?;
         let Some(raw) = raw else { return Ok(()) };
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
-        let target = request_target(&self.dial, path.as_deref(), !self.carried)
-            .map_err(|e| Failure(format!("{e:?}")))?;
-        self.carried = true;
+        let target = request_target(&self.dial, path.as_deref(), !self.carried).map_err(|e| {
+            Failure(format!(
+                "request target {:?}: {e}",
+                // The query is not repeated: it may carry a credential.
+                path.as_deref()
+                    .unwrap_or_default()
+                    .split('?')
+                    .next()
+                    .unwrap_or_default()
+            ))
+        })?;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // hyper frames the body below; a length or coding the message carried describes the
@@ -317,13 +325,18 @@ impl Framing {
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
+        // Spent only by a request that was built: one the builder refuses leaves the dial path to
+        // the next that names no target.
+        self.carried = true;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
     }
 
     /// Drive the connection at host time (`now_ns` monotonic, `now_unix_ns` wall) until nothing
-    /// inside it has more to do.
+    /// inside it has more to do. A framing failure with output still owed is also stated on each
+    /// live stream (a failure piece after that output): the host never calls an ended connection
+    /// again. With nothing owed no piece is pushed and the door answers the failure at once.
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
@@ -334,14 +347,33 @@ impl Framing {
         let io = self.io.clone();
         if let Err(f) = io.rounds(|cx| self.step(cx)) {
             self.failed = Some(f);
+            self.fail_streams();
             return;
         }
         let err = self.conn_err.lock().expect("err").clone();
         if let Some(e) = err {
             if !self.exchanges.is_empty() {
                 self.failed = Some(Failure(e));
+                self.fail_streams();
             }
         }
+    }
+
+    /// With output pending, state the recorded failure on every stream not already finished, then
+    /// drop the exchanges (so a later call pushes nothing).
+    fn fail_streams(&mut self) {
+        if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
+            return;
+        }
+        let Some(Failure(why)) = &self.failed else {
+            return;
+        };
+        for (id, stage) in &self.exchanges {
+            if !matches!(stage, Stage::Done) {
+                self.out.push(Piece::failure(*id, why));
+            }
+        }
+        self.exchanges.clear();
     }
 
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
@@ -599,9 +631,15 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
 /// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6). `None` where the head
-/// names none, or names one that is not a single valid length (the field block never carries it,
-/// so a head without one states nothing).
+/// carries a `Transfer-Encoding` (the coding frames the body), names none, or names one that is
+/// not a single valid length (the field block never carries it, so a head without one states
+/// nothing).
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
+    // A coding overrides the length (RFC 9112 6.3): hyper frames such a body by the coding, so a
+    // `Content-Length` beside it states a length the body does not have.
+    if headers.contains_key(http::header::TRANSFER_ENCODING) {
+        return None;
+    }
     let mut one: Option<u64> = None;
     for v in headers.get_all(http::header::CONTENT_LENGTH) {
         for s in v.to_str().ok()?.split(',').map(str::trim) {

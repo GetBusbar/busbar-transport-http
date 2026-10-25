@@ -51,6 +51,20 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
+/// RED: the size is `1*HEXDIG` (RFC 9112 7.1): no sign, no surrounding whitespace.
+#[test]
+fn a_signed_or_padded_chunk_size_is_a_framing_error() {
+    for line in [
+        &b"+5\r\nhello\r\n0\r\n\r\n"[..],
+        b" 5\r\nhello\r\n0\r\n\r\n",
+        b"5 \r\nhello\r\n0\r\n\r\n",
+        b"\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(decoder.feed(line), Err(ChunkedMalformed), "{line:?}");
+    }
+}
+
 #[test]
 fn chunk_extensions_are_ignored_rather_than_read() {
     let mut decoder = ChunkedDecoder::default();
@@ -132,4 +146,16 @@ fn parses_a_status_line() {
         }
     );
     assert!(msg.body.is_empty());
+}
+
+/// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
+/// size may be followed by whitespace before its extensions (codeaudit review of D8).
+#[test]
+fn whitespace_before_a_chunk_extension_is_allowed() {
+    let mut decoder = ChunkedDecoder::default();
+    decoder
+        .feed(b"3 \t;name=value\r\nabc\r\n0\r\n\r\n")
+        .unwrap();
+    assert!(decoder.is_done());
+    assert_eq!(decoder.take().0, vec![b"abc".to_vec()]);
 }
