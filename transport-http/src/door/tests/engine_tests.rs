@@ -688,3 +688,31 @@ fn a_transfer_encoding_answer_states_no_declared_length() {
     f.drive(SEC, 0);
     assert_eq!(declared(&mut f), Some(None), "chunked beats content-length");
 }
+
+/// RED (codeaudit D4): the head allowance bounds the head itself, not only the buffer a body
+/// shares with it. A message whose header block runs past `HEAD_MAX_BYTES` is refused, whether its
+/// terminator has arrived or not, rather than parsed into millions of fields and handed to hyper.
+#[test]
+fn a_request_head_over_its_allowance_is_refused() {
+    let mut head = b"GET /x HTTP/1.1\r\n".to_vec();
+    while head.len() <= HEAD_MAX_BYTES {
+        head.extend_from_slice(b"x-pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    let mut open = head.clone();
+    let mut whole = head;
+    whole.extend_from_slice(b"\r\n");
+
+    for (what, message) in [("terminated", &mut whole), ("unterminated", &mut open)] {
+        let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        let r = f.emit(1, message, 0, 0).expect_err(what);
+        assert!(
+            r.0.contains("request head over its allowance"),
+            "{what}: {r:?}"
+        );
+        assert!(
+            f.failure().is_some(),
+            "{what}: the refusal fails the framing"
+        );
+    }
+}

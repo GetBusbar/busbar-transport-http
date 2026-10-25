@@ -293,7 +293,7 @@ impl Framing {
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
             return Err(Failure("request message over the body cap".into()));
         }
-        let raw = complete_message(buf, head, max)
+        let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
             .map_err(|e| Failure(format!("request message: {e}")))?;
         let Some(raw) = raw else { return Ok(()) };
         let RawStartLine::Request { method, path } = &raw.start else {
