@@ -421,3 +421,26 @@ fn the_egress_header_search_resumes_where_it_stopped() {
         head.len()
     );
 }
+
+/// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a list
+/// whose members disagree, two lines that disagree, a sign, non-digits. Each is refused, never read
+/// as a body-less message.
+#[test]
+fn a_content_length_that_names_no_single_length_is_refused() {
+    for head in [
+        "Content-Length: 3, 4\r\n",
+        "Content-Length: 3\r\nContent-Length: 4\r\n",
+        "Content-Length: +5\r\n",
+        "Content-Length: abc\r\n",
+    ] {
+        // With no body yet and with a body a lenient reader would accept: neither is a message.
+        for body in ["", "abc"] {
+            let msg = format!("POST / HTTP/1.1\r\n{head}\r\n{body}");
+            let mut cache = EgressHead::default();
+            assert!(
+                complete_message(msg.as_bytes(), &mut cache, 1024).is_err(),
+                "{head:?} with body {body:?}"
+            );
+        }
+    }
+}
