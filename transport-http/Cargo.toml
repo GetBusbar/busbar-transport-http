@@ -32,6 +32,8 @@ hyper = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+# `Retry-After` HTTP-date forms (`message::parse_retry_after`), the parser 1.5.5 used.
+httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
 
