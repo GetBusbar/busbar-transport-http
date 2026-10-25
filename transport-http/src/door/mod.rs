@@ -500,14 +500,15 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 /// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
 /// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
 /// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal, a dotted quad) is
-/// offered as written.
+/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal) is offered ASCII
+/// lower-cased, as WHATWG lower-cases it (`https://API.Example.com/` went out as `api.example.com`).
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
     if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
         return v4.to_string();
     }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
+    sdk::net::expand_alternate_ipv4(bare)
+        .map_or_else(|| host.to_ascii_lowercase(), |v4| v4.to_string())
 }
 
 /// `locate`.

@@ -39,6 +39,17 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
 }
 
+/// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
+/// built, so the offered name is lower-case; the dial authority stays as written.
+#[test]
+fn locate_offers_a_dns_name_lower_cased() {
+    let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
+    assert_eq!(name, "api.example.com");
+    assert_eq!(authority, "API.Example.com:443");
+    let (_, _, name) = located(b"https://[FE80::1]:4318/").expect("located");
+    assert_eq!(name, "fe80::1");
+}
+
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
 /// the host read one figure for each.
 #[test]
