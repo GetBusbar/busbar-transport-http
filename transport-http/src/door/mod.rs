@@ -494,19 +494,37 @@ answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
 answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
 
+/// A stub for an op of the role this framer does not play: REFUSED, naming the op.
+macro_rules! not_served {
+    ($name:ident, $in:ty, $out:ty, $op:literal) => {
+        slot!(
+            #[doc = concat!("`", $op, "`: REFUSED, the http framer does not serve it.")]
+            $name,
+            $in,
+            $out,
+            |_, _, o| {
+                o.fail(Refusal::refused(concat!(
+                    $op,
+                    ": the http framer does not serve this op"
+                )))
+            }
+        );
+    };
+}
+
 // A framer is not a carrier: every carrier op is refused.
-answer!(Listen, ListenIn, ListenOut, Outcome::Refused);
-answer!(Accept, AcceptIn, AcceptOut, Outcome::Refused);
-answer!(Dial, DialIn, ConnOut, Outcome::Refused);
-answer!(Read, ReadIn, IoOut, Outcome::Refused);
-answer!(Write, WriteIn, IoOut, Outcome::Refused);
-answer!(Flush, ConnIn, OutHead, Outcome::Refused);
-answer!(Shut, ShutIn, OutHead, Outcome::Refused);
-answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
+not_served!(Listen, ListenIn, ListenOut, "listen");
+not_served!(Accept, AcceptIn, AcceptOut, "accept");
+not_served!(Dial, DialIn, ConnOut, "dial");
+not_served!(Read, ReadIn, IoOut, "read");
+not_served!(Write, WriteIn, IoOut, "write");
+not_served!(Flush, ConnIn, OutHead, "flush");
+not_served!(Shut, ShutIn, OutHead, "shut");
+not_served!(Arrival, ArrivalIn, ArrivalOut, "arrival");
 // No refusal, detach or adoption on a dialled HTTP connection.
-answer!(Refuse, RefuseIn, FramerOut, Outcome::Refused);
-answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
-answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
+not_served!(Refuse, RefuseIn, FramerOut, "refuse");
+not_served!(Detach, FramingIn, FramerOut, "detach");
+not_served!(Adopt, AdoptIn, FramerOut, "adopt");
 
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
@@ -638,6 +656,7 @@ impl SafeSlot for Begin {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let Some(inst) = p.get() else {
+            o.error("begin: no open instance");
             return Outcome::Failed;
         };
         let settings = inst.settings();
@@ -674,9 +693,11 @@ impl SafeSlot for Begin {
         o.set(|x| &x.framing, token);
         let mut slot = match inst.framings.reach(token) {
             Ok(s) => s,
-            Err(why) => return failed(&mut o, why.why().into()),
+            Err(why) => return failed(&mut o, format!("begin: {}", why.why())),
         };
-        step(slot.held(), i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        step("begin", slot.held(), i.field(|x| &x.sink), &mut o, |_| {
+            Ok(())
+        })
     }
 }
 
@@ -692,7 +713,7 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
+        with("ingest", &p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
             f.ingest(bytes, i.end != 0);
             Ok(())
         })
@@ -712,7 +733,7 @@ impl SafeSlot for Emit {
     ) -> Outcome {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
+        with("emit", &p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
             f.emit(i.stream, bytes, now, deadline)
         })
     }
@@ -729,7 +750,9 @@ impl SafeSlot for Timer {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        with("timer", &p, i.framing, i.field(|x| &x.sink), &mut o, |_| {
+            Ok(())
+        })
     }
 }
 
@@ -744,10 +767,11 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
-            inst.framings.remove(i.framing)
-        });
-        match removed {
+        let Some(inst) = p.get() else {
+            o.error("finish: no open instance");
+            return Outcome::Failed;
+        };
+        match inst.framings.remove(i.framing) {
             Ok(()) => {
                 o.set(|x| &x.yielded.flags, YIELD_ENDED);
                 Outcome::Ready
@@ -818,8 +842,9 @@ impl SafeSlot for Encode {
     }
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink.
+/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with `op`.
 fn with(
+    op: &'static str,
     p: &sdk::Instance<'_, Instance>,
     token: u64,
     sink: Lent<'_, FramerSink>,
@@ -827,32 +852,41 @@ fn with(
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(inst) = p.get() else {
-        o.error("no such framing");
+        // A static text: with no instance there is nowhere to keep an owned one.
+        o.error(no_open_instance(op));
         return Outcome::Failed;
     };
     match inst.framings.reach(token) {
-        Ok(mut slot) => step(slot.held(), sink, o, f),
-        Err(why) => {
-            o.error(why.why());
-            Outcome::Failed
-        }
+        Ok(mut slot) => step(op, slot.held(), sink, o, f),
+        Err(why) => failed(o, format!("{op}: {}", why.why())),
     }
 }
 
+/// `<op>: no open instance`, for each op [`with`] runs.
+fn no_open_instance(op: &str) -> &'static str {
+    match op {
+        "ingest" => "ingest: no open instance",
+        "emit" => "emit: no open instance",
+        _ => "timer: no open instance",
+    }
+}
+
+/// Run `f` on `h`'s framing, drive it and fill the sink; a failure text leads with `op`.
 fn step(
+    op: &'static str,
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(&mut h.framing) {
-        return failed(o, e.0);
+        return failed(o, format!("{op}: {}", e.0));
     }
     h.framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
     let pending = h.framing.wire_pending() || !h.framing.pieces().is_empty();
     if let Some(e) = h.framing.failure().cloned() {
         if !pending {
-            return failed(o, e.0);
+            return failed(o, format!("{op}: {}", e.0));
         }
     }
     fill(&mut h.framing, sink, o, class_of, fault_of);
