@@ -323,7 +323,9 @@ impl Framing {
     }
 
     /// Drive the connection at host time (`now_ns` monotonic, `now_unix_ns` wall) until nothing
-    /// inside it has more to do.
+    /// inside it has more to do. A framing failure with output still owed is also stated on each
+    /// live stream (a failure piece after that output): the host never calls an ended connection
+    /// again. With nothing owed no piece is pushed and the door answers the failure at once.
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
@@ -334,14 +336,33 @@ impl Framing {
         let io = self.io.clone();
         if let Err(f) = io.rounds(|cx| self.step(cx)) {
             self.failed = Some(f);
+            self.fail_streams();
             return;
         }
         let err = self.conn_err.lock().expect("err").clone();
         if let Some(e) = err {
             if !self.exchanges.is_empty() {
                 self.failed = Some(Failure(e));
+                self.fail_streams();
             }
         }
+    }
+
+    /// With output pending, state the recorded failure on every stream not already finished, then
+    /// drop the exchanges (so a later call pushes nothing).
+    fn fail_streams(&mut self) {
+        if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
+            return;
+        }
+        let Some(Failure(why)) = &self.failed else {
+            return;
+        };
+        for (id, stage) in &self.exchanges {
+            if !matches!(stage, Stage::Done) {
+                self.out.push(Piece::failure(*id, why));
+            }
+        }
+        self.exchanges.clear();
     }
 
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
