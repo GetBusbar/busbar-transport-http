@@ -229,13 +229,13 @@ impl Framing {
     /// A message that cannot be sent fails its STREAM on HTTP/2 (a failure piece, its siblings
     /// untouched), and the framing on HTTP/1.1, where the connection carries one exchange.
     ///
-    /// # Errors
-    ///
-    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
-    ///
     /// `deadline_ns` is the attempt's deadline as the caller stamped it at the attempt's start (the
     /// connect spent part of it); `0` counts the configured request timeout from `now_ns`. Only a
     /// stream's first `emit` reads it.
+    ///
+    /// # Errors
+    ///
+    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
     pub fn emit(
         &mut self,
         stream: u64,
