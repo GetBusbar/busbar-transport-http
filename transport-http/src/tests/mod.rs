@@ -456,7 +456,7 @@ fn a_content_length_that_names_no_single_length_is_refused() {
             let msg = format!("POST / HTTP/1.1\r\n{head}\r\n{body}");
             let mut cache = EgressHead::default();
             assert!(
-                complete_message(msg.as_bytes(), &mut cache, 1024).is_err(),
+                complete_message(msg.as_bytes(), &mut cache, 1024, usize::MAX).is_err(),
                 "{head:?} with body {body:?}"
             );
         }
@@ -471,7 +471,7 @@ fn a_transfer_encoding_other_than_chunked_is_refused() {
         let msg = format!("POST / HTTP/1.1\r\ntransfer-encoding: {te}\r\n\r\n");
         let mut cache = EgressHead::default();
         assert!(
-            complete_message(msg.as_bytes(), &mut cache, 1024).is_err(),
+            complete_message(msg.as_bytes(), &mut cache, 1024, usize::MAX).is_err(),
             "{te:?}"
         );
     }
