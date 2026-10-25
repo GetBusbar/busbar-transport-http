@@ -633,3 +633,42 @@ fn a_refused_request_message_names_its_cause() {
     assert!(target.0.contains("origin form"), "{target:?}");
     assert!(target.0.contains("v1/chat"), "{target:?}");
 }
+
+/// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a
+/// request that was built. On HTTP/2 a first request whose builder refuses (a field value carrying
+/// byte 0x01, which the raw reader takes and `http` does not) fails its own stream; the next
+/// request naming no target is still the connection's first sent, so it goes to the dial's path,
+/// not `/`. The wire of that request equals the wire of the same request sent first on a fresh
+/// connection (same HPACK state, same frames), so no header block need be decoded.
+#[test]
+fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
+    let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
+    let dial = || {
+        let mut f =
+            Framing::dial("http://127.0.0.1:9/card", Proto::H2, posture(30), 0).expect("dial");
+        f.drive(0, 0);
+        f.take_wire(usize::MAX);
+        f
+    };
+
+    let mut reference = dial();
+    reference.emit(3, &unnamed, 0, 0).expect("emit");
+    reference.drive(0, 0);
+    let expected = reference.take_wire(usize::MAX);
+    assert!(!expected.is_empty(), "the reference request went out");
+
+    let mut f = dial();
+    f.emit(1, b"GET /x HTTP/1.1\r\nx-a: \x01\r\n\r\n", 0, 0)
+        .expect("h2 answers per stream");
+    assert!(
+        f.pieces().iter().any(|p| p.stream == 1 && p.failed),
+        "the first request fails to build"
+    );
+    f.emit(3, &unnamed, 0, 0).expect("emit");
+    f.drive(0, 0);
+    assert_eq!(
+        f.take_wire(usize::MAX),
+        expected,
+        "the next request naming no target goes to the dial's path"
+    );
+}
