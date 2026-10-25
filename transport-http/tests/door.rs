@@ -337,3 +337,34 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
         gone("finish")
     );
 }
+
+// ── what a target may carry ──────────────────────────────────────────────────────────────────────
+
+/// RED: `locate` and `begin` took a target carrying userinfo and dropped it silently (`locate`
+/// answered its authority, `begin` opened a framing). A credential never rides a URL: each is
+/// FAILED in the canon's words, which repeat no byte of the target.
+#[test]
+fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
+    let inst = open("");
+    let target = "https://user:SECRET@a.test/";
+    let (r, _, why) = locate(inst, target);
+    assert_eq!(
+        (r, why.as_str()),
+        (
+            Outcome::Failed,
+            "locate: the target carries userinfo; credentials never ride a URL"
+        )
+    );
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.target = s(target);
+    let mut out: FramerOut = z();
+    let r = call(ops().begin, inst, &mut i, &mut out, slot::BEGIN);
+    assert_eq!(
+        (r, text(out.head.error).as_str()),
+        (
+            Outcome::Failed,
+            "begin: the target carries userinfo; credentials never ride a URL"
+        )
+    );
+}

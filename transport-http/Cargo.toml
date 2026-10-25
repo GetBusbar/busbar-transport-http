@@ -36,6 +36,8 @@ bytes = { workspace = true }
 httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+# The request message `emit` collects is zeroed as it is dropped (`door::engine::Stage::Writing`).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its

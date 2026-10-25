@@ -7,8 +7,9 @@
 //! transfer coding it reads is `chunked`. Good enough for the one shape this transport reads: the
 //! request message `encode` renders and `emit` is handed.
 
-/// The message's first line, kept as whichever of the two shapes it turned out to be.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The message's first line, kept as whichever of the two shapes it turned out to be. Its `Debug`
+/// shows a request's method and never its target (a path may carry a token).
+#[derive(Clone, PartialEq, Eq)]
 pub enum RawStartLine {
     /// `METHOD path HTTP/version`.
     Request {
@@ -27,8 +28,9 @@ pub enum RawStartLine {
     },
 }
 
-/// One parsed message: its start line, its headers in wire order, and its body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One parsed message: its start line, its headers in wire order, and its body. Its `Debug` shows
+/// the header NAMES only, each value `<redacted>`, and the body as its length.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawMessage {
     /// The request or status line.
     pub start: RawStartLine,
@@ -37,6 +39,53 @@ pub struct RawMessage {
     pub headers: Vec<(String, Vec<u8>)>,
     /// Everything after the blank line.
     pub body: Vec<u8>,
+}
+
+/// A header value or a target, as a `Debug` shows it: `<redacted>`.
+struct Hidden;
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// `name: <redacted>`, for a `Debug` of header pairs.
+struct Redacted<'a, N>(&'a [(String, N)]);
+
+impl<N> std::fmt::Debug for Redacted<'_, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(k, _)| (k, Hidden)))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RawStartLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request { method, path } => f
+                .debug_struct("Request")
+                .field("method", method)
+                .field("path", &path.as_ref().map(|_| Hidden))
+                .finish(),
+            Self::Status { code, reason } => f
+                .debug_struct("Status")
+                .field("code", code)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RawMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawMessage")
+            .field("start", &self.start)
+            .field("headers", &Redacted(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Split `bytes` into a start line, headers and body. `bytes` may end exactly at the header
@@ -249,7 +298,8 @@ pub fn content_length(headers: &[(String, Vec<u8>)]) -> Result<Option<usize>, ()
 /// CRLF after one, or between the terminal chunk and its trailers. A decoder that re-scanned the
 /// whole buffer on every read would be quadratic in the body size, which for the megabyte bodies
 /// this path exists to carry is the difference between a transport and a stall.
-#[derive(Debug, Default)]
+/// Its `Debug` shows where it stands, the trailer NAMES and byte counts, never a byte of a chunk.
+#[derive(Default)]
 pub struct ChunkedDecoder {
     state: ChunkState,
     line: Vec<u8>,
@@ -274,6 +324,18 @@ enum ChunkState {
     Trailers,
     /// The terminal chunk and its trailers have both arrived.
     Done,
+}
+
+impl std::fmt::Debug for ChunkedDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedDecoder")
+            .field("state", &self.state)
+            .field("want", &self.want)
+            .field("chunks", &self.chunks.len())
+            .field("trailers", &Redacted(&self.trailers))
+            .field("body_len", &self.body_len)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The bytes did not follow the chunked grammar.
