@@ -851,6 +851,16 @@ fn a_yield_more_recall_answers_nothing_twice() {
             recall_continues(&dup, &roomy).is_err(),
             "a duplicated piece is caught"
         );
+        // RED, the wire half: a framer that wrote the first wire bytes twice is caught too.
+        let mut dup = tight.clone();
+        assert!(!dup.0.is_empty(), "the exchange wrote wire bytes");
+        let at = dup.0.len().min(5);
+        let first = dup.0[..at].to_vec();
+        dup.0.splice(at..at, first);
+        assert!(
+            recall_continues(&dup, &roomy).is_err(),
+            "a duplicated run of wire bytes is caught"
+        );
     }
 }
 
