@@ -672,3 +672,19 @@ fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
         "the next request naming no target goes to the dial's path"
     );
 }
+
+/// RED (codeaudit D3; RFC 9112 6.3: a `Transfer-Encoding` overrides `Content-Length`): an h1
+/// answer carrying both is framed chunked by hyper, so its `Content-Length` states a length the
+/// body does not have. The head piece states none, as 1.5.5's `content_length()` was `None` for a
+/// chunked body; the host's pre-body download cap must not read a length the body is not.
+#[test]
+fn a_transfer_encoding_answer_states_no_declared_length() {
+    let mut f = asked(Proto::H1, 300);
+    f.ingest(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ncontent-length: 50000000\r\n\r\n\
+          5\r\nhello\r\n0\r\n\r\n",
+        false,
+    );
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(None), "chunked beats content-length");
+}
