@@ -293,15 +293,18 @@ impl Framing {
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
             return Err(Failure("request message over the body cap".into()));
         }
-        let raw = complete_message(buf, head, max)
-            .map_err(|e| Failure(format!("request message: {e:?}")))?;
+        let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
+            .map_err(|e| Failure(format!("request message: {e}")))?;
         let Some(raw) = raw else { return Ok(()) };
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
-        let target = request_target(&self.dial, path.as_deref(), !self.carried)
-            .map_err(|e| Failure(format!("{e:?}")))?;
-        self.carried = true;
+        let target = request_target(&self.dial, path.as_deref(), !self.carried).map_err(|e| {
+            Failure(format!(
+                "request target {:?}: {e}",
+                path.as_deref().unwrap_or_default()
+            ))
+        })?;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // hyper frames the body below; a length or coding the message carried describes the
@@ -317,6 +320,9 @@ impl Framing {
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
+        // Spent only by a request that was built: one the builder refuses leaves the dial path to
+        // the next that names no target.
+        self.carried = true;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
@@ -620,9 +626,15 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
 /// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6). `None` where the head
-/// names none, or names one that is not a single valid length (the field block never carries it,
-/// so a head without one states nothing).
+/// carries a `Transfer-Encoding` (the coding frames the body), names none, or names one that is
+/// not a single valid length (the field block never carries it, so a head without one states
+/// nothing).
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
+    // A coding overrides the length (RFC 9112 6.3): hyper frames such a body by the coding, so a
+    // `Content-Length` beside it states a length the body does not have.
+    if headers.contains_key(http::header::TRANSFER_ENCODING) {
+        return None;
+    }
     let mut one: Option<u64> = None;
     for v in headers.get_all(http::header::CONTENT_LENGTH) {
         for s in v.to_str().ok()?.split(',').map(str::trim) {
