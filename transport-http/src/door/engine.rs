@@ -605,9 +605,15 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
 /// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6). `None` where the head
-/// names none, or names one that is not a single valid length (the field block never carries it,
-/// so a head without one states nothing).
+/// carries a `Transfer-Encoding` (the coding frames the body), names none, or names one that is
+/// not a single valid length (the field block never carries it, so a head without one states
+/// nothing).
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
+    // A coding overrides the length (RFC 9112 6.3): hyper frames such a body by the coding, so a
+    // `Content-Length` beside it states a length the body does not have.
+    if headers.contains_key(http::header::TRANSFER_ENCODING) {
+        return None;
+    }
     let mut one: Option<u64> = None;
     for v in headers.get_all(http::header::CONTENT_LENGTH) {
         for s in v.to_str().ok()?.split(',').map(str::trim) {
