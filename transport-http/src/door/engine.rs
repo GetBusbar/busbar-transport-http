@@ -302,7 +302,12 @@ impl Framing {
         let target = request_target(&self.dial, path.as_deref(), !self.carried).map_err(|e| {
             Failure(format!(
                 "request target {:?}: {e}",
-                path.as_deref().unwrap_or_default()
+                // The query is not repeated: it may carry a credential.
+                path.as_deref()
+                    .unwrap_or_default()
+                    .split('?')
+                    .next()
+                    .unwrap_or_default()
             ))
         })?;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);

@@ -698,6 +698,15 @@ fn a_refused_request_message_names_its_cause() {
         .expect_err("a target not in origin form is refused");
     assert!(target.0.contains("origin form"), "{target:?}");
     assert!(target.0.contains("v1/chat"), "{target:?}");
+
+    // The query is not repeated: it may carry a credential (an `?api_key=`).
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let keyed = f
+        .emit(1, b"GET v1/chat?key=SECRET HTTP/1.1\r\n\r\n", 0, 0)
+        .expect_err("a target not in origin form is refused");
+    assert!(keyed.0.contains("v1/chat"), "{keyed:?}");
+    assert!(!keyed.0.contains("SECRET"), "{keyed:?}");
 }
 
 /// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a
