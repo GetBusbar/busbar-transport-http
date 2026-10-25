@@ -603,3 +603,56 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     }
     assert_eq!(seen, 4 * 16_000, "the whole body arrives");
 }
+
+/// A framing that fails in the same drive that queued output (a body shorter than its declared
+/// length, the far end closing) states the failure on the stream after what was handed up: the
+/// host never calls a connection again once it ended, so the failure text rides a piece.
+#[test]
+fn a_framing_failing_with_output_owed_fails_each_live_stream_after_it() {
+    let mut f = asked(Proto::H1, 300);
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello", true);
+    f.drive(0, 0);
+    let why = f.failure().expect("the framing failed").0.clone();
+    assert!(why.contains("error reading a body"), "{why}");
+    let ps: Vec<_> = f.pieces().iter().filter(|p| p.stream == 1).collect();
+    let last = ps.last().expect("pieces on stream 1");
+    assert!(last.failed, "the last piece is the failure");
+    assert!(
+        String::from_utf8_lossy(&last.bytes).contains("error reading a body"),
+        "the failure piece carries the text"
+    );
+    assert!(ps.iter().all(|p| !p.end), "the stream did not end whole");
+    assert_eq!(ps.iter().filter(|p| p.failed).count(), 1, "stated once");
+    assert_eq!(body(&mut f).0, b"hello", "the body went up before it");
+}
+
+/// The request timeout firing in the drive that queued body data does the same.
+#[test]
+fn a_request_timeout_with_body_queued_fails_the_stream_after_it() {
+    let mut f = asked(Proto::H1, 1);
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello", false);
+    f.drive(2 * SEC, 0);
+    assert!(f.failure().is_some(), "the framing failed");
+    let ps: Vec<_> = f.pieces().iter().filter(|p| p.stream == 1).collect();
+    let last = ps.last().expect("pieces on stream 1");
+    assert!(last.failed, "the last piece is the failure");
+    assert!(ps.iter().all(|p| !p.end));
+}
+
+/// With nothing owed, no piece is pushed: the door answers FAILED at once.
+#[test]
+fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
+    let mut f = asked(Proto::H1, 5);
+    f.ingest(
+        b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+        false,
+    );
+    f.drive(SEC, 0);
+    assert_eq!(body(&mut f).0, b"hello");
+    f.drive(5 * SEC, 0);
+    assert!(f.failure().is_some(), "the framing failed");
+    assert!(
+        f.pieces().iter().all(|p| !p.failed),
+        "no failure piece: nothing was owed"
+    );
+}
