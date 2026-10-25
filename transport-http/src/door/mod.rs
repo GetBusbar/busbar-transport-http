@@ -313,6 +313,9 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
     let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
     let v: serde_json::Value =
         serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
+    if !v.is_object() {
+        return Err("settings: not a JSON object".to_owned());
+    }
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
         Some(x) => x.as_bool().ok_or(k),
