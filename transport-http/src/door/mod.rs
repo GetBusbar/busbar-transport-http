@@ -561,6 +561,9 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     else {
         return Err("locate: the target is not a URL");
     };
+    if carries_userinfo(&uri) {
+        return Err("locate: the target carries userinfo; credentials never ride a URL");
+    }
     let secure = match uri.scheme_str() {
         Some("https") => true,
         Some("http") => false,
@@ -577,6 +580,12 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
         format!("{host}:{port}")
     };
     Ok((secure, authority, offered_name(host)))
+}
+
+/// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a
+/// URL, so `locate` and `begin` refuse it rather than drop it.
+fn carries_userinfo(uri: &http::Uri) -> bool {
+    uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
@@ -681,6 +690,13 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not text");
             return Outcome::Failed;
         };
+        if target
+            .parse::<http::Uri>()
+            .is_ok_and(|u| carries_userinfo(&u))
+        {
+            o.error("begin: the target carries userinfo; credentials never ride a URL");
+            return Outcome::Failed;
+        }
         let Ok(framing) = Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
         else {
             o.error("begin: the target is not a URL");

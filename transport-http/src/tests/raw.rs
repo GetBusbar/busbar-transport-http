@@ -159,3 +159,32 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
     assert!(decoder.is_done());
     assert_eq!(decoder.take().0, vec![b"abc".to_vec()]);
 }
+
+/// RED: `RawMessage` and `ChunkedDecoder` derived `Debug`, so a message logged with `{:?}` printed
+/// its target, every header value (an `authorization` among them) and its body, and a decoder
+/// printed the chunks it held. A Debug now shows the method, header NAMES, `<redacted>` values and
+/// the body as a length.
+#[test]
+fn a_message_debug_shows_names_and_lengths_never_values() {
+    let msg = parse_message(
+        b"POST /v1/SECRETP?key=SECRETQ HTTP/1.1\r\nAuthorization: Bearer SECRETH\r\n\
+          Content-Length: 7\r\n\r\nSECRETB",
+    )
+    .unwrap();
+    let d = format!("{msg:?}");
+    assert!(d.contains("POST"), "{d}");
+    assert!(d.contains("Authorization"), "{d}");
+    assert!(d.contains("<redacted>"), "{d}");
+    assert!(d.contains("body_len: 7"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"7\r\nSECRETB\r\n0\r\nX-T: SECRETT\r\n\r\n")
+        .unwrap();
+    let d = format!("{c:?}");
+    assert!(d.contains("X-T"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"9\r\nSECR").unwrap();
+    assert!(!format!("{c:?}").contains("SECR"), "{c:?}");
+}
