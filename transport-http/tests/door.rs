@@ -368,3 +368,19 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
         )
     );
 }
+
+// ── the statement ────────────────────────────────────────────────────────────────────────────────
+
+/// RED: the Statement carried no extensions, so the plugin's `declares.json` never reached the
+/// host. It rides the Statement's extensions under `EXT_DECLARES`, byte for byte.
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let ext = door::STATEMENT.extensions;
+    assert!(!ext.ptr.is_null(), "the Statement carries extensions");
+    // SAFETY: the Statement's extensions are a `'static` blob of `len` bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(bytes),
+        Some(include_bytes!("../declares.json").as_slice())
+    );
+}
