@@ -7,7 +7,6 @@
 //! are proven in `door/tests` and the crate's integration tests.
 
 use super::*;
-use busbar_contract::transport::wire::TransportError;
 
 /// Both RFC 9110 forms, and nothing else. A value nobody can read is a value nobody asked for.
 #[test]
@@ -153,7 +152,7 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(smuggled, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        "transfer-encoding with content-length",
         "a chunked body naming a Content-Length beside it is the smuggling shape, refused rather \
          than silently disambiguated and forwarded"
     );
@@ -352,14 +351,14 @@ fn a_chunked_request_body_is_held_to_the_body_cap() {
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(whole, &mut cache, 4).unwrap_err(),
-        TransportError::Framing,
+        "decoded chunked body over the body cap",
         "one byte over the cap"
     );
     let open = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n";
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(open, &mut cache, 4).unwrap_err(),
-        TransportError::Framing,
+        "decoded chunked body over the body cap",
         "refused once the decoded bytes pass the cap, before the terminal chunk"
     );
 }
@@ -373,7 +372,7 @@ fn bytes_past_the_end_of_a_request_message_are_refused() {
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(past_length, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        "bytes past the end of the message",
         "a byte past the declared length"
     );
     let past_chunks =
@@ -381,14 +380,14 @@ fn bytes_past_the_end_of_a_request_message_are_refused() {
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(past_chunks, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        "bytes past the end of the message",
         "a byte past the terminal chunk"
     );
     let past_head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(past_head, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        "bytes past the end of the message",
         "a byte after a message that declares no body"
     );
     let exact = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";

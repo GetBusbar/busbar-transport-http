@@ -5,8 +5,6 @@
 //! carried so far are one whole message yet (the egress cross-check's framing), the request target
 //! a dialled exchange goes to, and the upstream's `Retry-After` read off a response head.
 
-use busbar_contract::transport::wire::TransportError;
-
 use crate::raw;
 
 /// Read the upstream's `Retry-After` off a response head and resolve it to whole seconds.
@@ -123,19 +121,19 @@ pub(crate) fn request_target(
     dial: &http::Uri,
     path: Option<&str>,
     first: bool,
-) -> Result<http::Uri, TransportError> {
+) -> Result<http::Uri, &'static str> {
     let path = match path {
         Some(stated) if stated.starts_with('/') => stated,
-        Some(_) => return Err(TransportError::Framing),
+        Some(_) => return Err("target not in origin form"),
         None if first => return Ok(dial.clone()),
         None => "/",
     };
     let mut parts = dial.clone().into_parts();
     parts.path_and_query = Some(
         path.parse::<http::uri::PathAndQuery>()
-            .map_err(|_| TransportError::Framing)?,
+            .map_err(|_| "target not a valid path")?,
     );
-    http::Uri::from_parts(parts).map_err(|_| TransportError::Framing)
+    http::Uri::from_parts(parts).map_err(|_| "target not a valid path")
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
@@ -148,7 +146,7 @@ pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
     max_body_bytes: usize,
-) -> Result<Option<raw::RawMessage>, TransportError> {
+) -> Result<Option<raw::RawMessage>, &'static str> {
     if cache.head.is_none() {
         // Resumed where the last call stopped: the bytes before it hold no terminator, and the
         // search looks back from each line feed it finds, so nothing is missed.
@@ -158,20 +156,21 @@ pub(crate) fn complete_message(
         let Some(header_end) = found else {
             return Ok(None);
         };
-        let message = raw::parse_message(&buffered[..header_end]).ok_or(TransportError::Framing)?;
+        let message =
+            raw::parse_message(&buffered[..header_end]).ok_or("unparsable request head")?;
         cache.parses += 1;
         if raw::has_transfer_encoding(&message.headers) {
             if !raw::is_chunked(&message.headers) {
                 // A declared coding this transport cannot frame. Falling through to
                 // `Content-Length` would be answering a question the sender did not ask.
-                return Err(TransportError::Framing);
+                return Err("unsupported transfer coding");
             }
             if raw::header(&message.headers, "content-length").is_some() {
                 // Two headers describing two framings of the same bytes. The coding wins the
                 // reading, but forwarding the pair on — as this used to do — hands the next hop a
                 // length the bytes do not have, the smuggling shape itself. Refused rather than
                 // silently disambiguated.
-                return Err(TransportError::Framing);
+                return Err("transfer-encoding with content-length");
             }
         }
         cache.head = Some(CachedHead {
@@ -202,12 +201,12 @@ pub(crate) fn complete_message(
             .get_or_insert_with(|| Box::new(raw::ChunkedDecoder::default()));
         let fresh = &rest[cache.fed.min(rest.len())..];
         cache.feeds += fresh.len();
-        let used = decoder.feed(fresh).map_err(|_| TransportError::Framing)?;
+        let used = decoder.feed(fresh).map_err(|_| "malformed chunked body")?;
         cache.fed = rest.len();
         // The body cap is the decoded body's, as it is a declared length's, and it is held as the
         // chunks arrive rather than once the message is whole.
         if decoder.body_len() > max_body_bytes {
-            return Err(TransportError::Framing);
+            return Err("decoded chunked body over the body cap");
         }
         if !decoder.is_done() {
             return Ok(None);
@@ -215,7 +214,7 @@ pub(crate) fn complete_message(
         // Bytes after the terminal chunk's trailer section belong to no message this stream
         // carries: a mis-framed writer, refused rather than dropped.
         if used < fresh.len() {
-            return Err(TransportError::Framing);
+            return Err("bytes past the end of the message");
         }
         // The trailer section is discarded: RFC 9110 §6.5.1 lets a recipient that removes the
         // chunked coding discard its trailers, and forbids merging them into the header section
@@ -225,9 +224,11 @@ pub(crate) fn complete_message(
         let (chunks, _trailers) = cache.decoder.take().expect("set just above").take();
         chunks.concat()
     } else {
-        let declared = declared.map_err(|()| TransportError::Framing)?.unwrap_or(0);
+        let declared = declared
+            .map_err(|()| "invalid content-length")?
+            .unwrap_or(0);
         if declared > max_body_bytes {
-            return Err(TransportError::Framing);
+            return Err("declared body over the body cap");
         }
         if rest.len() < declared {
             return Ok(None);
@@ -235,7 +236,7 @@ pub(crate) fn complete_message(
         // Bytes past the declared length (or past a head that declares no body) are a mis-framed
         // writer's, refused rather than dropped.
         if rest.len() > declared {
-            return Err(TransportError::Framing);
+            return Err("bytes past the end of the message");
         }
         rest.to_vec()
     };

@@ -294,13 +294,17 @@ impl Framing {
             return Err(Failure("request message over the body cap".into()));
         }
         let raw = complete_message(buf, head, max)
-            .map_err(|e| Failure(format!("request message: {e:?}")))?;
+            .map_err(|e| Failure(format!("request message: {e}")))?;
         let Some(raw) = raw else { return Ok(()) };
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
-        let target = request_target(&self.dial, path.as_deref(), !self.carried)
-            .map_err(|e| Failure(format!("{e:?}")))?;
+        let target = request_target(&self.dial, path.as_deref(), !self.carried).map_err(|e| {
+            Failure(format!(
+                "request target {:?}: {e}",
+                path.as_deref().unwrap_or_default()
+            ))
+        })?;
         self.carried = true;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
