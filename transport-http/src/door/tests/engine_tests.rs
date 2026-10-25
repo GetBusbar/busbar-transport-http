@@ -668,6 +668,7 @@ fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
         f.pieces().iter().all(|p| !p.failed),
         "no failure piece: nothing was owed"
     );
+}
 
 /// RED (codeaudit D1; THE DESIGN: every refusal explained): a refused request message names its
 /// cause. A `Content-Length` over `limits.request_body_max_bytes` and a target not in origin form
