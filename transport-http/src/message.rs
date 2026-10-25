@@ -141,11 +141,12 @@ pub(crate) fn request_target(
 /// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
 /// a chunked body seen, or a message that declares neither coding and therefore carries no body at
 /// all. A chunked message is decoded here, so what comes back always carries the body itself rather
-/// than a framing of it.
+/// than a framing of it. The head is held to `max_head_bytes` and the body to `max_body_bytes`.
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
     max_body_bytes: usize,
+    max_head_bytes: usize,
 ) -> Result<Option<raw::RawMessage>, &'static str> {
     if cache.head.is_none() {
         // Resumed where the last call stopped: the bytes before it hold no terminator, and the
@@ -154,8 +155,16 @@ pub(crate) fn complete_message(
         cache.scanned += scanned;
         cache.searched = buffered.len();
         let Some(header_end) = found else {
+            // No terminator yet, so every buffered byte is head: past the allowance it is one the
+            // sender will not end in bounds.
+            if buffered.len() > max_head_bytes {
+                return Err("request head over its allowance");
+            }
             return Ok(None);
         };
+        if header_end > max_head_bytes {
+            return Err("request head over its allowance");
+        }
         let message =
             raw::parse_message(&buffered[..header_end]).ok_or("unparsable request head")?;
         cache.parses += 1;
