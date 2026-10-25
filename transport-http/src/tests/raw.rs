@@ -147,3 +147,15 @@ fn parses_a_status_line() {
     );
     assert!(msg.body.is_empty());
 }
+
+/// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
+/// size may be followed by whitespace before its extensions (codeaudit review of D8).
+#[test]
+fn whitespace_before_a_chunk_extension_is_allowed() {
+    let mut decoder = ChunkedDecoder::default();
+    decoder
+        .feed(b"3 \t;name=value\r\nabc\r\n0\r\n\r\n")
+        .unwrap();
+    assert!(decoder.is_done());
+    assert_eq!(decoder.take().0, vec![b"abc".to_vec()]);
+}
