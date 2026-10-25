@@ -75,8 +75,10 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// the wait for the connection, the head and every byte of the body spend the same clock.
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
-    /// The buffer is zeroed when it is dropped (the message complete, refused, or the framing
-    /// gone), and when it grows (`append_zeroizing`): it holds the request's credentials.
+    /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
+    /// gone), and when it grows (`append_zeroizing`). Only this buffer is wiped: the parsed head
+    /// (`EgressHead`), the `RawMessage` and the `http::Request` built from it still hold header
+    /// values in ordinary memory, until credentials stop reaching the framer as plaintext.
     Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
