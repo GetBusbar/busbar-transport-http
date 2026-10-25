@@ -305,7 +305,6 @@ impl Framing {
                 path.as_deref().unwrap_or_default()
             ))
         })?;
-        self.carried = true;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // hyper frames the body below; a length or coding the message carried describes the
@@ -321,6 +320,9 @@ impl Framing {
             .body(Full::new(Bytes::from(raw.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
+        // Spent only by a request that was built: one the builder refuses leaves the dial path to
+        // the next that names no target.
+        self.carried = true;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
