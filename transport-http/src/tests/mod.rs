@@ -36,14 +36,31 @@ fn retry_after_parses_both_normative_forms() {
     assert_eq!(crate::message::parse_retry_after("soon", 0), None);
     assert_eq!(crate::message::parse_retry_after("-5", 0), None);
     assert_eq!(crate::message::parse_retry_after("7.5", 0), None);
-    // An obsolete HTTP-date form: parsed by nobody here, so it is absent rather than guessed.
-    assert_eq!(
-        crate::message::parse_retry_after("Sunday, 06-Nov-94 08:49:37 GMT", 0),
-        None
-    );
     // Right length, wrong month.
     assert_eq!(
         crate::message::parse_retry_after("Sun, 06 Xxx 1994 08:49:37 GMT", 0),
+        None
+    );
+}
+
+/// RFC 9110 5.6.7: a recipient MUST accept all three HTTP-date forms, and a date with an
+/// out-of-range field is no date at all (1.5.5 parsed with `httpdate` and read it the same way).
+#[test]
+fn retry_after_reads_every_http_date_form() {
+    let now = 784_111_777 - 120;
+    for form in [
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+    ] {
+        assert_eq!(
+            crate::message::parse_retry_after(form, now),
+            Some(120),
+            "{form}"
+        );
+    }
+    assert_eq!(
+        crate::message::parse_retry_after("Sun, 06 Nov 1994 99:99:99 GMT", now),
         None
     );
 }
