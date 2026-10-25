@@ -697,7 +697,8 @@ fn a_refused_request_message_names_its_cause() {
         .emit(1, b"GET v1/chat HTTP/1.1\r\n\r\n", 0, 0)
         .expect_err("a target not in origin form is refused");
     assert!(target.0.contains("origin form"), "{target:?}");
-    assert!(target.0.contains("v1/chat"), "{target:?}");
+    // The path is not repeated either: a path may carry a token.
+    assert!(!target.0.contains("v1/chat"), "{target:?}");
 
     // The query is not repeated: it may carry a credential (an `?api_key=`).
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
@@ -705,8 +706,25 @@ fn a_refused_request_message_names_its_cause() {
     let keyed = f
         .emit(1, b"GET v1/chat?key=SECRET HTTP/1.1\r\n\r\n", 0, 0)
         .expect_err("a target not in origin form is refused");
-    assert!(keyed.0.contains("v1/chat"), "{keyed:?}");
+    assert!(!keyed.0.contains("v1/chat"), "{keyed:?}");
     assert!(!keyed.0.contains("SECRET"), "{keyed:?}");
+}
+
+/// RED: a failure text repeated the target: `Framing::dial` answered `not a target: <dial>` and a
+/// target not in origin form was named, path and all (a path may carry a token). No failure text
+/// repeats a byte of a dial or a path now.
+#[test]
+fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
+    let Err(dial) = Framing::dial("http://SECRETD host/", Proto::H1, posture(30), 0) else {
+        panic!("a dial that is not a URI is refused");
+    };
+    assert!(!dial.0.contains("SECRETD"), "{dial:?}");
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let path = f
+        .emit(1, b"GET v1/SECRETP HTTP/1.1\r\n\r\n", 0, 0)
+        .expect_err("a target not in origin form is refused");
+    assert!(!path.0.contains("SECRETP"), "{path:?}");
 }
 
 /// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a

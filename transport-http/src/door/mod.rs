@@ -61,6 +61,8 @@ mod framings;
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
+use std::borrow::Cow;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome};
@@ -70,7 +72,7 @@ use busbar_contract::abi::mechanism::lifecycle::{
     ValidateIn,
 };
 use busbar_contract::abi::sdk::door::{abi_str, statement};
-use busbar_contract::abi::sdk::life::Refusal;
+use busbar_contract::abi::sdk::life::{settings_object, Refusal};
 use busbar_contract::abi::sdk::transport::form_codes;
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::{
@@ -276,22 +278,47 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../../declares.json")
+    )]
+);
+
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
 pub const STATEMENT: Statement = Statement {
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
+    extensions: EXTENSIONS,
     ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
-/// What `open` read from the settings, and the framings it holds.
+/// What `open` read from the settings (and the last good `refresh` replaced), and the framings it
+/// holds.
 pub struct Instance {
+    settings: Mutex<Settings>,
+    framings: Framings,
+}
+
+/// The settings as read: the posture every framing begun under them carries, and the two keys
+/// that choose the protocol offer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Settings {
     posture: Posture,
     prior_knowledge: bool,
     http1_only: bool,
-    framings: Framings,
+}
+
+impl Instance {
+    /// The settings in force: what `open` read, or the last good `refresh`. Held only to copy them,
+    /// by `locate` and `begin` (per connection, never per chunk).
+    fn settings(&self) -> Settings {
+        *self.settings.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// The default the count setting `path` declares ([`SETTING_ROWS`]).
@@ -307,29 +334,51 @@ fn declared_count(path: &str) -> u64 {
         .expect("a declared count setting with a numeric default")
 }
 
-/// The settings blob's bytes, parsed; `Err` names, by its path, the first one that is not what its
-/// declaration says (the host renders the path instance-relative). An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
-    let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
-    let v: serde_json::Value =
-        serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
-    if !v.is_object() {
-        return Err("settings: not a JSON object".to_owned());
+/// What a bad value of the count setting `path` is told (zero is a bad value).
+fn bad_count(path: &str) -> &'static str {
+    if path == setting::BODY_MAX_BYTES {
+        "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+    } else {
+        "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0"
+    }
+}
+
+/// The settings blob's bytes, parsed (`validate`, `open` and `refresh` alike); `Err` is the first
+/// thing wrong with it, in the words the settings texts share: a blob that is not a JSON object, a
+/// key this transport does not declare, a value its declaration refuses. An absent blob reads as
+/// `{}`.
+fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Cow<'static, str>> {
+    let v = settings_object(bytes).map_err(|r| {
+        Cow::Owned(
+            r.text()
+                .unwrap_or("settings: must be a JSON object")
+                .to_owned(),
+        )
+    })?;
+    if let Some(k) = v
+        .keys()
+        .find(|k| !SETTING_ROWS.iter().any(|(p, _, _)| p == k))
+    {
+        return Err(format!("settings: {k} is not a setting this transport reads").into());
     }
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
-        Some(x) => x.as_bool().ok_or(k),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| Cow::Owned(format!("settings: {k} must be true or false"))),
     };
     // An absent count reads as the default its declaration states (`SETTINGS`): one source.
     let count = |k: &'static str| match v.get(k) {
         None => Ok(declared_count(k)),
-        Some(x) => x.as_u64().ok_or(k),
+        Some(x) => x
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or(Cow::Borrowed(bad_count(k))),
     };
-    let err = |k: &str| format!("{k}: not of its declared kind");
-    let prior = flag(setting::H2_PRIOR_KNOWLEDGE).map_err(err)?;
-    let h1 = flag(setting::HTTP1_ONLY).map_err(err)?;
-    let secs = count(setting::REQUEST_TIMEOUT_SECS).map_err(err)?;
-    let max = count(setting::BODY_MAX_BYTES).map_err(err)?;
+    let prior = flag(setting::H2_PRIOR_KNOWLEDGE)?;
+    let h1 = flag(setting::HTTP1_ONLY)?;
+    let secs = count(setting::REQUEST_TIMEOUT_SECS)?;
+    let max = count(setting::BODY_MAX_BYTES)?;
     Ok((
         Posture {
             // 1.5.5's egress client: keep-alive ping every 30s, 10s to answer, adaptive window on.
@@ -342,6 +391,15 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), String> {
         prior,
         h1,
     ))
+}
+
+/// [`read_settings`], as the instance holds them.
+fn settings_of(bytes: &[u8]) -> Result<Settings, Cow<'static, str>> {
+    read_settings(bytes).map(|(posture, prior_knowledge, http1_only)| Settings {
+        posture,
+        prior_knowledge,
+        http1_only,
+    })
 }
 
 /// One slot body on the SDK's safe surface, over this framer's [`Instance`].
@@ -379,17 +437,33 @@ slot!(
 slot!(
     /// `open`.
     Open, OpenIn, OpenOut, |instance, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
-            Ok((posture, prior_knowledge, http1_only)) => {
+        match settings_of(i.field(|x| &x.settings).bytes()) {
+            Ok(settings) => {
                 instance.open(Instance {
-                    posture,
-                    prior_knowledge,
-                    http1_only,
+                    settings: Mutex::new(settings),
                     framings: Framings::default(),
                 });
                 Outcome::Ready
             }
             // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
+        }
+    }
+);
+
+slot!(
+    /// `refresh`: the new settings, read with `validate`'s texts. A bad blob is FAILED and the
+    /// settings in force stay; good ones apply to every framing begun after it (a framing already
+    /// begun keeps the posture it began under).
+    Refresh, RefreshIn, OutHead, |instance, i, o| {
+        let Some(inst) = instance.get() else {
+            return o.fail(Refusal::failed("refresh: no open instance"));
+        };
+        match settings_of(i.field(|x| &x.settings).bytes()) {
+            Ok(s) => {
+                *inst.settings.lock().unwrap_or_else(PoisonError::into_inner) = s;
+                Outcome::Ready
+            }
             Err(e) => o.fail(Refusal::failed(e)),
         }
     }
@@ -425,24 +499,41 @@ macro_rules! answer {
     };
 }
 
-answer!(Refresh, RefreshIn, OutHead, Outcome::Ready);
 answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
 answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
 
+/// A stub for an op of the role this framer does not play: REFUSED, naming the op.
+macro_rules! not_served {
+    ($name:ident, $in:ty, $out:ty, $op:literal) => {
+        slot!(
+            #[doc = concat!("`", $op, "`: REFUSED, the http framer does not serve it.")]
+            $name,
+            $in,
+            $out,
+            |_, _, o| {
+                o.fail(Refusal::refused(concat!(
+                    $op,
+                    ": the http framer does not serve this op"
+                )))
+            }
+        );
+    };
+}
+
 // A framer is not a carrier: every carrier op is refused.
-answer!(Listen, ListenIn, ListenOut, Outcome::Refused);
-answer!(Accept, AcceptIn, AcceptOut, Outcome::Refused);
-answer!(Dial, DialIn, ConnOut, Outcome::Refused);
-answer!(Read, ReadIn, IoOut, Outcome::Refused);
-answer!(Write, WriteIn, IoOut, Outcome::Refused);
-answer!(Flush, ConnIn, OutHead, Outcome::Refused);
-answer!(Shut, ShutIn, OutHead, Outcome::Refused);
-answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
+not_served!(Listen, ListenIn, ListenOut, "listen");
+not_served!(Accept, AcceptIn, AcceptOut, "accept");
+not_served!(Dial, DialIn, ConnOut, "dial");
+not_served!(Read, ReadIn, IoOut, "read");
+not_served!(Write, WriteIn, IoOut, "write");
+not_served!(Flush, ConnIn, OutHead, "flush");
+not_served!(Shut, ShutIn, OutHead, "shut");
+not_served!(Arrival, ArrivalIn, ArrivalOut, "arrival");
 // No refusal, detach or adoption on a dialled HTTP connection.
-answer!(Refuse, RefuseIn, FramerOut, Outcome::Refused);
-answer!(Detach, FramingIn, FramerOut, Outcome::Refused);
-answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
+not_served!(Refuse, RefuseIn, FramerOut, "refuse");
+not_served!(Detach, FramingIn, FramerOut, "detach");
+not_served!(Adopt, AdoptIn, FramerOut, "adopt");
 
 // ── the framer ───────────────────────────────────────────────────────────────────────────────────
 
@@ -479,6 +570,9 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     else {
         return Err("locate: the target is not a URL");
     };
+    if carries_userinfo(&uri) {
+        return Err("locate: the target carries userinfo; credentials never ride a URL");
+    }
     let secure = match uri.scheme_str() {
         Some("https") => true,
         Some("http") => false,
@@ -495,6 +589,12 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
         format!("{host}:{port}")
     };
     Ok((secure, authority, offered_name(host)))
+}
+
+/// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a
+/// URL, so `locate` and `begin` refuse it rather than drop it.
+fn carries_userinfo(uri: &http::Uri) -> bool {
+    uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
@@ -534,7 +634,8 @@ impl SafeSlot for Locate {
         };
         // The offer exists only where a handshake does: on a secured connection.
         let offer = p.get().map_or(offer_for(secure, false, false), |x| {
-            offer_for(secure, x.prior_knowledge, x.http1_only)
+            let s = x.settings();
+            offer_for(secure, s.prior_knowledge, s.http1_only)
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
@@ -573,8 +674,10 @@ impl SafeSlot for Begin {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let Some(inst) = p.get() else {
+            o.error("begin: no open instance");
             return Outcome::Failed;
         };
+        let settings = inst.settings();
         if i.side != SIDE_DIAL {
             o.error("begin: http frames dialled connections only");
             return Outcome::Refused;
@@ -585,7 +688,7 @@ impl SafeSlot for Begin {
         let proto = match agreed {
             b"h2" => Proto::H2,
             b"http/1.1" => Proto::H1,
-            b"" if inst.prior_knowledge && !inst.http1_only => Proto::H2,
+            b"" if settings.prior_knowledge && !settings.http1_only => Proto::H2,
             b"" => Proto::H1,
             _ => {
                 o.error("begin: the agreed protocol is not http/1.1 or h2");
@@ -596,7 +699,14 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not text");
             return Outcome::Failed;
         };
-        let Ok(framing) = Framing::dial(target, proto, inst.posture, i.sink.now_monotonic_ns)
+        if target
+            .parse::<http::Uri>()
+            .is_ok_and(|u| carries_userinfo(&u))
+        {
+            o.error("begin: the target carries userinfo; credentials never ride a URL");
+            return Outcome::Failed;
+        }
+        let Ok(framing) = Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
         else {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
@@ -608,9 +718,11 @@ impl SafeSlot for Begin {
         o.set(|x| &x.framing, token);
         let mut slot = match inst.framings.reach(token) {
             Ok(s) => s,
-            Err(why) => return failed(&mut o, why.why().into()),
+            Err(why) => return failed(&mut o, format!("begin: {}", why.why())),
         };
-        step(slot.held(), i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        step("begin", slot.held(), i.field(|x| &x.sink), &mut o, |_| {
+            Ok(())
+        })
     }
 }
 
@@ -626,7 +738,7 @@ impl SafeSlot for Ingest {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let bytes = i.bytes();
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
+        with("ingest", &p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
             f.ingest(bytes, i.end != 0);
             Ok(())
         })
@@ -646,7 +758,7 @@ impl SafeSlot for Emit {
     ) -> Outcome {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
+        with("emit", &p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
             f.emit(i.stream, bytes, now, deadline)
         })
     }
@@ -663,7 +775,9 @@ impl SafeSlot for Timer {
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        with(&p, i.framing, i.field(|x| &x.sink), &mut o, |_| Ok(()))
+        with("timer", &p, i.framing, i.field(|x| &x.sink), &mut o, |_| {
+            Ok(())
+        })
     }
 }
 
@@ -678,10 +792,11 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
-            inst.framings.remove(i.framing)
-        });
-        match removed {
+        let Some(inst) = p.get() else {
+            o.error("finish: no open instance");
+            return Outcome::Failed;
+        };
+        match inst.framings.remove(i.framing) {
             Ok(()) => {
                 o.set(|x| &x.yielded.flags, YIELD_ENDED);
                 Outcome::Ready
@@ -752,8 +867,9 @@ impl SafeSlot for Encode {
     }
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink.
+/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with `op`.
 fn with(
+    op: &'static str,
     p: &sdk::Instance<'_, Instance>,
     token: u64,
     sink: Lent<'_, FramerSink>,
@@ -761,32 +877,41 @@ fn with(
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(inst) = p.get() else {
-        o.error("no such framing");
+        // A static text: with no instance there is nowhere to keep an owned one.
+        o.error(no_open_instance(op));
         return Outcome::Failed;
     };
     match inst.framings.reach(token) {
-        Ok(mut slot) => step(slot.held(), sink, o, f),
-        Err(why) => {
-            o.error(why.why());
-            Outcome::Failed
-        }
+        Ok(mut slot) => step(op, slot.held(), sink, o, f),
+        Err(why) => failed(o, format!("{op}: {}", why.why())),
     }
 }
 
+/// `<op>: no open instance`, for each op [`with`] runs.
+fn no_open_instance(op: &str) -> &'static str {
+    match op {
+        "ingest" => "ingest: no open instance",
+        "emit" => "emit: no open instance",
+        _ => "timer: no open instance",
+    }
+}
+
+/// Run `f` on `h`'s framing, drive it and fill the sink; a failure text leads with `op`.
 fn step(
+    op: &'static str,
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
     f: impl FnOnce(&mut Framing) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(&mut h.framing) {
-        return failed(o, e.0);
+        return failed(o, format!("{op}: {}", e.0));
     }
     h.framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
     let pending = h.framing.wire_pending() || !h.framing.pieces().is_empty();
     if let Some(e) = h.framing.failure().cloned() {
         if !pending {
-            return failed(o, e.0);
+            return failed(o, format!("{op}: {}", e.0));
         }
     }
     fill(&mut h.framing, sink, o, class_of, fault_of);
