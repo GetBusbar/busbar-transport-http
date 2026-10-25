@@ -374,6 +374,19 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
     }
 }
 
+/// RED: 1.5.5's client lowercased a DNS host, so an h1 request dialled at a mixed-case name
+/// carries the lower-case `host`.
+#[test]
+fn a_dns_host_goes_out_lower_case() {
+    let mut f =
+        Framing::dial("http://API.Example.com:8080/x", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", 0, 0).expect("emit");
+    f.drive(0, 0);
+    let wire = String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned();
+    assert!(wire.contains("host: api.example.com:8080\r\n"), "{wire:?}");
+}
+
 /// What one emit of an envelope rendered by `encode` does on a fresh HTTP/1.1 framing whose body
 /// cap is `cap`: the emit's answer and the bytes the connection wrote.
 fn rendered_and_sent(
