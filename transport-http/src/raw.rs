@@ -334,7 +334,11 @@ impl ChunkedDecoder {
                     .map_err(|_| ChunkedMalformed)?;
                 if self.state == ChunkState::Size {
                     // A size line may carry chunk extensions after a semicolon; none is read.
-                    let size_text = line.split(';').next().unwrap_or("").trim();
+                    let size_text = line.split(';').next().unwrap_or("");
+                    // `1*HEXDIG` (RFC 9112 7.1): no sign, no whitespace, not empty.
+                    if size_text.is_empty() || !size_text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(ChunkedMalformed);
+                    }
                     let size =
                         usize::from_str_radix(size_text, 16).map_err(|_| ChunkedMalformed)?;
                     self.state = if size == 0 {
