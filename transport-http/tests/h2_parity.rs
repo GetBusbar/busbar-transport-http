@@ -15,6 +15,8 @@
 //! the two captures are compared frame by frame: the connection preface, SETTINGS, WINDOW_UPDATE,
 //! then the request's HEADERS (the HPACK block, byte for byte) and DATA.
 
+mod common;
+
 use std::mem::{size_of, zeroed};
 use std::time::Duration;
 
@@ -24,6 +26,8 @@ use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, Ops, SIDE_DIAL,
 };
 use tokio::io::AsyncReadExt;
+
+use common::{frame_name, h2_frames};
 
 const BODY: &str =
     r#"{"model":"claude-x","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
@@ -209,33 +213,6 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
     out
 }
 
-/// One HTTP/2 frame: `(type, flags, stream, payload)`.
-type H2Frame = (u8, u8, u32, Vec<u8>);
-
-/// The 24-byte preface, and each frame after it.
-fn frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
-    let mut out = Vec::new();
-    let mut i = 24.min(b.len());
-    while i + 9 <= b.len() {
-        let len = usize::from(b[i]) << 16 | usize::from(b[i + 1]) << 8 | usize::from(b[i + 2]);
-        let stream = u32::from_be_bytes([b[i + 5], b[i + 6], b[i + 7], b[i + 8]]) & 0x7fff_ffff;
-        out.push((b[i + 3], b[i + 4], stream, b[i + 9..i + 9 + len].to_vec()));
-        i += 9 + len;
-    }
-    (b[..24.min(b.len())].to_vec(), out)
-}
-
-fn name(t: u8) -> &'static str {
-    match t {
-        0 => "DATA",
-        1 => "HEADERS",
-        4 => "SETTINGS",
-        6 => "PING",
-        8 => "WINDOW_UPDATE",
-        _ => "OTHER",
-    }
-}
-
 #[test]
 fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -245,13 +222,17 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
         .expect("runtime");
     let (old, port) = capture_155(&rt, true);
     // The port is part of `:authority`; the door dials the one the capture listened on.
-    let (old_preface, old_frames) = frames(&old);
-    let (new_preface, new_frames) = frames(&capture_door(port, true));
+    let (old_preface, old_frames) = h2_frames(&old);
+    let (new_preface, new_frames) = h2_frames(&capture_door(port, true));
     for (label, f) in [("1.5.5", &old_frames), ("door", &new_frames)] {
         let line: Vec<String> = f
             .iter()
             .map(|(t, fl, st, p)| {
-                format!("{}(flags={fl:#x},stream={st},len={})", name(*t), p.len())
+                format!(
+                    "{}(flags={fl:#x},stream={st},len={})",
+                    frame_name(*t),
+                    p.len()
+                )
             })
             .collect();
         println!("PROOF {label}: {}", line.join(" "));
