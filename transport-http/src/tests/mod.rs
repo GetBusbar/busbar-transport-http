@@ -7,7 +7,6 @@
 //! are proven in `door/tests` and the crate's integration tests.
 
 use super::*;
-use busbar_contract::transport::wire::TransportError;
 
 /// Both RFC 9110 forms, and nothing else. A value nobody can read is a value nobody asked for.
 #[test]
@@ -36,14 +35,31 @@ fn retry_after_parses_both_normative_forms() {
     assert_eq!(crate::message::parse_retry_after("soon", 0), None);
     assert_eq!(crate::message::parse_retry_after("-5", 0), None);
     assert_eq!(crate::message::parse_retry_after("7.5", 0), None);
-    // An obsolete HTTP-date form: parsed by nobody here, so it is absent rather than guessed.
-    assert_eq!(
-        crate::message::parse_retry_after("Sunday, 06-Nov-94 08:49:37 GMT", 0),
-        None
-    );
     // Right length, wrong month.
     assert_eq!(
         crate::message::parse_retry_after("Sun, 06 Xxx 1994 08:49:37 GMT", 0),
+        None
+    );
+}
+
+/// RFC 9110 5.6.7: a recipient MUST accept all three HTTP-date forms, and a date with an
+/// out-of-range field is no date at all (1.5.5 parsed with `httpdate` and read it the same way).
+#[test]
+fn retry_after_reads_every_http_date_form() {
+    let now = 784_111_777 - 120;
+    for form in [
+        "Sun, 06 Nov 1994 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+    ] {
+        assert_eq!(
+            crate::message::parse_retry_after(form, now),
+            Some(120),
+            "{form}"
+        );
+    }
+    assert_eq!(
+        crate::message::parse_retry_after("Sun, 06 Nov 1994 99:99:99 GMT", now),
         None
     );
 }
@@ -61,7 +77,7 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
 
     for i in 0..100 {
         buffered.push(b'a');
-        let done = complete_message(&buffered, &mut cache, usize::MAX).unwrap();
+        let done = complete_message(&buffered, &mut cache, usize::MAX, usize::MAX).unwrap();
         assert_eq!(
             done.is_some(),
             i == 99,
@@ -91,9 +107,11 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
 fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     let mut cache = EgressHead::default();
-    assert!(complete_message(&buffered, &mut cache, usize::MAX)
-        .unwrap()
-        .is_none());
+    assert!(
+        complete_message(&buffered, &mut cache, usize::MAX, usize::MAX)
+            .unwrap()
+            .is_none()
+    );
 
     const CALLS: usize = 200;
     const PIECE: &[u8] = b"10\r\naaaaaaaaaaaaaaaa\r\n";
@@ -102,7 +120,7 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
         buffered.extend_from_slice(PIECE);
         wire_bytes += PIECE.len();
         assert!(
-            complete_message(&buffered, &mut cache, usize::MAX)
+            complete_message(&buffered, &mut cache, usize::MAX, usize::MAX)
                 .unwrap()
                 .is_none(),
             "no terminal chunk yet, so the message is not whole"
@@ -110,7 +128,7 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     }
     buffered.extend_from_slice(b"0\r\n\r\n");
     wire_bytes += 5;
-    let done = complete_message(&buffered, &mut cache, usize::MAX)
+    let done = complete_message(&buffered, &mut cache, usize::MAX, usize::MAX)
         .unwrap()
         .expect("the terminal chunk completes the message");
     assert_eq!(
@@ -152,8 +170,8 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let smuggled = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(smuggled, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        complete_message(smuggled, &mut cache, usize::MAX, usize::MAX).unwrap_err(),
+        "transfer-encoding with content-length",
         "a chunked body naming a Content-Length beside it is the smuggling shape, refused rather \
          than silently disambiguated and forwarded"
     );
@@ -161,7 +179,7 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let clean =
         b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
     let mut clean_cache = EgressHead::default();
-    let done = complete_message(clean, &mut clean_cache, usize::MAX)
+    let done = complete_message(clean, &mut clean_cache, usize::MAX, usize::MAX)
         .unwrap()
         .expect(
             "a normal chunked body with no Content-Length still completes — this refuses the \
@@ -345,21 +363,21 @@ fn a_chunked_request_body_is_held_to_the_body_cap() {
     let whole =
         b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
     let mut cache = EgressHead::default();
-    let done = complete_message(whole, &mut cache, 5)
+    let done = complete_message(whole, &mut cache, 5, usize::MAX)
         .unwrap()
         .expect("a body at the cap is whole");
     assert_eq!(done.body, b"abcde");
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(whole, &mut cache, 4).unwrap_err(),
-        TransportError::Framing,
+        complete_message(whole, &mut cache, 4, usize::MAX).unwrap_err(),
+        "decoded chunked body over the body cap",
         "one byte over the cap"
     );
     let open = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n";
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(open, &mut cache, 4).unwrap_err(),
-        TransportError::Framing,
+        complete_message(open, &mut cache, 4, usize::MAX).unwrap_err(),
+        "decoded chunked body over the body cap",
         "refused once the decoded bytes pass the cap, before the terminal chunk"
     );
 }
@@ -372,28 +390,28 @@ fn bytes_past_the_end_of_a_request_message_are_refused() {
     let past_length = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcX";
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(past_length, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        complete_message(past_length, &mut cache, usize::MAX, usize::MAX).unwrap_err(),
+        "bytes past the end of the message",
         "a byte past the declared length"
     );
     let past_chunks =
         b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nX";
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(past_chunks, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        complete_message(past_chunks, &mut cache, usize::MAX, usize::MAX).unwrap_err(),
+        "bytes past the end of the message",
         "a byte past the terminal chunk"
     );
     let past_head = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nX";
     let mut cache = EgressHead::default();
     assert_eq!(
-        complete_message(past_head, &mut cache, usize::MAX).unwrap_err(),
-        TransportError::Framing,
+        complete_message(past_head, &mut cache, usize::MAX, usize::MAX).unwrap_err(),
+        "bytes past the end of the message",
         "a byte after a message that declares no body"
     );
     let exact = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
     let mut cache = EgressHead::default();
-    assert!(complete_message(exact, &mut cache, usize::MAX)
+    assert!(complete_message(exact, &mut cache, usize::MAX, usize::MAX)
         .unwrap()
         .is_some());
 }
@@ -411,7 +429,7 @@ fn the_egress_header_search_resumes_where_it_stopped() {
     let mut buffered = Vec::new();
     for (i, b) in head.iter().enumerate() {
         buffered.push(*b);
-        let done = complete_message(&buffered, &mut cache, usize::MAX).unwrap();
+        let done = complete_message(&buffered, &mut cache, usize::MAX, usize::MAX).unwrap();
         assert_eq!(done.is_some(), i == head.len() - 1);
     }
     let scanned = cache.scanned;
@@ -420,4 +438,41 @@ fn the_egress_header_search_resumes_where_it_stopped() {
         "a {}-byte head arriving a byte per call cost {scanned} bytes of searching",
         head.len()
     );
+}
+
+/// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a list
+/// whose members disagree, two lines that disagree, a sign, non-digits. Each is refused, never read
+/// as a body-less message.
+#[test]
+fn a_content_length_that_names_no_single_length_is_refused() {
+    for head in [
+        "Content-Length: 3, 4\r\n",
+        "Content-Length: 3\r\nContent-Length: 4\r\n",
+        "Content-Length: +5\r\n",
+        "Content-Length: abc\r\n",
+    ] {
+        // With no body yet and with a body a lenient reader would accept: neither is a message.
+        for body in ["", "abc"] {
+            let msg = format!("POST / HTTP/1.1\r\n{head}\r\n{body}");
+            let mut cache = EgressHead::default();
+            assert!(
+                complete_message(msg.as_bytes(), &mut cache, 1024, usize::MAX).is_err(),
+                "{head:?} with body {body:?}"
+            );
+        }
+    }
+}
+
+/// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame; the
+/// message is refused rather than read by its `Content-Length`.
+#[test]
+fn a_transfer_encoding_other_than_chunked_is_refused() {
+    for te in ["gzip", "chunked, gzip"] {
+        let msg = format!("POST / HTTP/1.1\r\ntransfer-encoding: {te}\r\n\r\n");
+        let mut cache = EgressHead::default();
+        assert!(
+            complete_message(msg.as_bytes(), &mut cache, 1024, usize::MAX).is_err(),
+            "{te:?}"
+        );
+    }
 }
