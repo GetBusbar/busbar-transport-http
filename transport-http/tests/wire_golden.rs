@@ -36,6 +36,8 @@
 //! A missing golden is a FAILURE, never a skip: a wire suite that found nothing to compare proves
 //! nothing.
 
+mod common;
+
 use std::mem::{size_of, zeroed};
 use std::path::PathBuf;
 
@@ -46,6 +48,8 @@ use busbar_contract::abi::transport::{
     SIDE_DIAL,
 };
 use serde_json::Value;
+
+use common::{frame_name, h2_frames, H2Frame};
 
 /// The port the door is handed; the recording's `<PORT>` stands for whatever port the run bound.
 const PORT: u16 = 40123;
@@ -376,37 +380,6 @@ fn door_h1(r: &Recorded) -> String {
 }
 
 // ── h2 ───────────────────────────────────────────────────────────────────────────────────────────
-
-/// One HTTP/2 frame: `(type, flags, stream, payload)`.
-type H2Frame = (u8, u8, u32, Vec<u8>);
-
-fn h2_frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
-    let mut out = Vec::new();
-    let mut i = 24.min(b.len());
-    while i + 9 <= b.len() {
-        let len = usize::from(b[i]) << 16 | usize::from(b[i + 1]) << 8 | usize::from(b[i + 2]);
-        let stream = u32::from_be_bytes([b[i + 5], b[i + 6], b[i + 7], b[i + 8]]) & 0x7fff_ffff;
-        out.push((b[i + 3], b[i + 4], stream, b[i + 9..i + 9 + len].to_vec()));
-        i += 9 + len;
-    }
-    (b[..24.min(b.len())].to_vec(), out)
-}
-
-fn frame_name(t: u8) -> &'static str {
-    match t {
-        0 => "DATA",
-        1 => "HEADERS",
-        2 => "PRIORITY",
-        3 => "RST_STREAM",
-        4 => "SETTINGS",
-        5 => "PUSH_PROMISE",
-        6 => "PING",
-        7 => "GOAWAY",
-        8 => "WINDOW_UPDATE",
-        9 => "CONTINUATION",
-        _ => "OTHER",
-    }
-}
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
