@@ -108,7 +108,7 @@ pub(crate) fn complete_message(
         if header_end > max_head_bytes {
             return Err("request head over its allowance");
         }
-        let message =
+        let mut message =
             raw::parse_message(&buffered[..header_end]).ok_or("unparsable request head")?;
         cache.parses += 1;
         if raw::has_transfer_encoding(&message.headers) {
@@ -127,8 +127,14 @@ pub(crate) fn complete_message(
         }
         cache.head = Some(CachedHead {
             end: header_end,
-            start: message.start,
-            headers: message.headers,
+            start: std::mem::replace(
+                &mut message.start,
+                crate::raw::RawStartLine::Status {
+                    code: 0,
+                    reason: String::new(),
+                },
+            ),
+            headers: std::mem::take(&mut message.headers),
         });
     }
     // Read what the head says before touching the cache again: the decoder lives beside it, and

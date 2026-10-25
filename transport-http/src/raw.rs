@@ -41,6 +41,17 @@ pub struct RawMessage {
     pub body: Vec<u8>,
 }
 
+/// A parsed message's header values and body can carry credentials (an `authorization` line, a
+/// captured token in a reply): wiped when the message goes.
+impl Drop for RawMessage {
+    fn drop(&mut self) {
+        for (_, v) in &mut self.headers {
+            zeroize::Zeroize::zeroize(v);
+        }
+        zeroize::Zeroize::zeroize(&mut self.body);
+    }
+}
+
 /// A header value or a target, as a `Debug` shows it: `<redacted>`.
 struct Hidden;
 
