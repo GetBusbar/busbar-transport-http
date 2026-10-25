@@ -444,3 +444,17 @@ fn a_content_length_that_names_no_single_length_is_refused() {
         }
     }
 }
+
+/// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame; the
+/// message is refused rather than read by its `Content-Length`.
+#[test]
+fn a_transfer_encoding_other_than_chunked_is_refused() {
+    for te in ["gzip", "chunked, gzip"] {
+        let msg = format!("POST / HTTP/1.1\r\ntransfer-encoding: {te}\r\n\r\n");
+        let mut cache = EgressHead::default();
+        assert!(
+            complete_message(msg.as_bytes(), &mut cache, 1024).is_err(),
+            "{te:?}"
+        );
+    }
+}
