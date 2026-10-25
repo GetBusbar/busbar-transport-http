@@ -603,3 +603,33 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     }
     assert_eq!(seen, 4 * 16_000, "the whole body arrives");
 }
+
+/// RED (codeaudit D1; THE DESIGN: every refusal explained): a refused request message names its
+/// cause. A `Content-Length` over `limits.request_body_max_bytes` and a target not in origin form
+/// each fail with text an operator can act on, not the bare word "Framing".
+#[test]
+fn a_refused_request_message_names_its_cause() {
+    let capped = Posture {
+        max_body_bytes: 4,
+        ..posture(30)
+    };
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
+    f.drive(0, 0);
+    let over = f
+        .emit(
+            1,
+            b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\n123456789",
+            0,
+            0,
+        )
+        .expect_err("a body over the cap is refused");
+    assert!(over.0.contains("body cap"), "{over:?}");
+
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    let target = f
+        .emit(1, b"GET v1/chat HTTP/1.1\r\n\r\n", 0, 0)
+        .expect_err("a target not in origin form is refused");
+    assert!(target.0.contains("origin form"), "{target:?}");
+    assert!(target.0.contains("v1/chat"), "{target:?}");
+}
