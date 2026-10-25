@@ -63,6 +63,21 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(429), STATUS_CALLER_FAULT);
     assert_eq!(class_of(503), STATUS_FAR_END_FAULT);
     assert_eq!(class_of(101), STATUS_OTHER);
+    // The band edges, each side of each.
+    for (code, class) in [
+        (199, STATUS_OTHER),
+        (200, STATUS_SUCCESS),
+        (299, STATUS_SUCCESS),
+        (300, STATUS_OTHER),
+        (399, STATUS_OTHER),
+        (400, STATUS_CALLER_FAULT),
+        (499, STATUS_CALLER_FAULT),
+        (500, STATUS_FAR_END_FAULT),
+        (599, STATUS_FAR_END_FAULT),
+        (600, STATUS_OTHER),
+    ] {
+        assert_eq!(class_of(code), class, "status {code}");
+    }
 }
 
 /// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
