@@ -50,6 +50,16 @@ fn locate_offers_a_dns_name_lower_cased() {
     assert_eq!(name, "fe80::1");
 }
 
+/// A settings blob that is not a JSON object reads nothing, so it is refused, not defaulted.
+#[test]
+fn a_settings_blob_that_is_not_an_object_is_refused() {
+    for s in ["null", "[]", "\"x\"", "5", "true"] {
+        let r = read_settings(blob(s)).err().map(|e| e.to_string());
+        assert_eq!(r.as_deref(), Some("settings: not a JSON object"), "{s}");
+    }
+    assert!(read_settings(blob("")).is_ok());
+}
+
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
 /// the host read one figure for each.
 #[test]
