@@ -17,7 +17,11 @@ use busbar_contract::abi::mechanism::lifecycle::{
     slot as life, OpenIn, OpenOut, RefreshIn, ValidateIn,
 };
 use busbar_contract::abi::mechanism::ticket::Ticket;
-use busbar_contract::abi::transport::{slot, LocateIn, LocateOut, Ops};
+use busbar_contract::abi::transport::{
+    slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn,
+    EmitIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut, ListenIn, ListenOut, LocateIn,
+    LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, SIDE_DIAL,
+};
 use busbar_transport_http::door;
 
 fn z<T>() -> T {
@@ -205,5 +209,131 @@ fn validate_answers_the_canon_settings_texts() {
             "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0"
                 .to_owned()
         )
+    );
+}
+
+// ── the role stubs and the missing instance ──────────────────────────────────────────────────────
+
+/// One op of `inst` over all-zero `in` and `out`: its outcome and its text.
+fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, String) {
+    let mut i: I = z();
+    let mut o: O = z();
+    let r = call(f, inst, &mut i, &mut o, index);
+    // SAFETY: every `out` leads with an `OutHead`.
+    let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
+    (r, text(head.error))
+}
+
+/// RED: every op of the role this framer does not play answered a bare REFUSED, with no words.
+/// Each is now REFUSED in the canon's words, naming the op.
+#[test]
+fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words() {
+    let inst = open("");
+    let o = ops();
+    let refused = |op: &str| {
+        (
+            Outcome::Refused,
+            format!("{op}: the http framer does not serve this op"),
+        )
+    };
+    assert_eq!(
+        op::<ListenIn, ListenOut>(o.listen, inst, slot::LISTEN),
+        refused("listen")
+    );
+    assert_eq!(
+        op::<AcceptIn, AcceptOut>(o.accept, inst, slot::ACCEPT),
+        refused("accept")
+    );
+    assert_eq!(
+        op::<DialIn, ConnOut>(o.dial, inst, slot::DIAL),
+        refused("dial")
+    );
+    assert_eq!(
+        op::<ReadIn, IoOut>(o.read, inst, slot::READ),
+        refused("read")
+    );
+    assert_eq!(
+        op::<WriteIn, IoOut>(o.write, inst, slot::WRITE),
+        refused("write")
+    );
+    assert_eq!(
+        op::<ConnIn, OutHead>(o.flush, inst, slot::FLUSH),
+        refused("flush")
+    );
+    assert_eq!(
+        op::<ShutIn, OutHead>(o.shut, inst, slot::SHUT),
+        refused("shut")
+    );
+    assert_eq!(
+        op::<ArrivalIn, ArrivalOut>(o.arrival, inst, slot::ARRIVAL),
+        refused("arrival")
+    );
+    assert_eq!(
+        op::<RefuseIn, FramerOut>(o.refuse, inst, slot::REFUSE),
+        refused("refuse")
+    );
+    assert_eq!(
+        op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH),
+        refused("detach")
+    );
+    assert_eq!(
+        op::<AdoptIn, FramerOut>(o.adopt, inst, slot::ADOPT),
+        refused("adopt")
+    );
+}
+
+/// RED: `begin` with no open instance answered a bare FAILED, and `ingest`, `emit`, `timer` and
+/// `finish` answered `no such framing` with no op named. Each is now `<op>: no open instance`.
+#[test]
+fn a_framer_op_with_no_open_instance_is_failed_in_words() {
+    let none = std::ptr::null_mut();
+    let o = ops();
+    let failed = |op: &str| (Outcome::Failed, format!("{op}: no open instance"));
+    let mut i: BeginIn = z();
+    i.side = SIDE_DIAL;
+    i.target = s("http://a.test/");
+    let mut out: FramerOut = z();
+    let r = call(o.begin, none, &mut i, &mut out, slot::BEGIN);
+    assert_eq!((r, text(out.head.error)), failed("begin"));
+    assert_eq!(
+        op::<IngestIn, FramerOut>(o.ingest, none, slot::INGEST),
+        failed("ingest")
+    );
+    assert_eq!(
+        op::<EmitIn, FramerOut>(o.emit, none, slot::EMIT),
+        failed("emit")
+    );
+    assert_eq!(
+        op::<FramingIn, FramerOut>(o.timer, none, slot::TIMER),
+        failed("timer")
+    );
+    assert_eq!(
+        op::<FinishIn, FramerOut>(o.finish, none, slot::FINISH),
+        failed("finish")
+    );
+}
+
+/// RED: an op on a framing the instance does not hold answered `no such framing`, naming no op.
+/// Every kind-op text now leads with its op.
+#[test]
+fn a_framer_op_on_an_unknown_framing_names_its_op() {
+    let inst = open("");
+    let o = ops();
+    let gone = |op: &str| (Outcome::Failed, format!("{op}: no such framing"));
+    assert_eq!(
+        op::<IngestIn, FramerOut>(o.ingest, inst, slot::INGEST),
+        gone("ingest")
+    );
+    assert_eq!(
+        op::<EmitIn, FramerOut>(o.emit, inst, slot::EMIT),
+        gone("emit")
+    );
+    assert_eq!(
+        op::<FramingIn, FramerOut>(o.timer, inst, slot::TIMER),
+        gone("timer")
+    );
+    assert_eq!(
+        op::<FinishIn, FramerOut>(o.finish, inst, slot::FINISH),
+        gone("finish")
     );
 }
