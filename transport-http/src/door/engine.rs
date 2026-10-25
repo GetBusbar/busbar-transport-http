@@ -31,6 +31,7 @@ use http_body_util::Full;
 use hyper::body::{Body, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::rt::{Executor, Sleep};
+use zeroize::Zeroizing;
 
 use crate::raw::RawStartLine;
 use crate::{complete_message, request_target, retry_after_secs, EgressHead};
@@ -74,7 +75,11 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// the wait for the connection, the head and every byte of the body spend the same clock.
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
-    Writing(Vec<u8>, EgressHead, u64),
+    /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
+    /// gone), and when it grows (`append_zeroizing`). Only this buffer is wiped: the parsed head
+    /// (`EgressHead`), the `RawMessage` and the `http::Request` built from it still hold header
+    /// values in ordinary memory, until credentials stop reaching the framer as plaintext.
+    Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
     /// Sent; waiting for the response head.
@@ -161,7 +166,8 @@ impl Framing {
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let dial = canonical_host(
             dial.parse()
-                .map_err(|_| Failure(format!("not a target: {dial}")))?,
+                // The dial is not repeated: a target may carry a credential.
+                .map_err(|_| Failure("the target is not a URL".into()))?,
         );
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
@@ -277,7 +283,7 @@ impl Framing {
             None => {
                 self.exchanges.push((
                     stream,
-                    Stage::Writing(Vec::new(), EgressHead::default(), deadline),
+                    Stage::Writing(Zeroizing::default(), EgressHead::default(), deadline),
                 ));
                 self.exchanges.len() - 1
             }
@@ -287,7 +293,7 @@ impl Framing {
                 "stream {stream} already carries a request"
             )));
         };
-        buf.extend_from_slice(bytes);
+        append_zeroizing(buf, bytes);
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
@@ -299,17 +305,9 @@ impl Framing {
         let RawStartLine::Request { method, path } = &raw.start else {
             return Err(Failure("a status line is not a request".into()));
         };
-        let target = request_target(&self.dial, path.as_deref(), !self.carried).map_err(|e| {
-            Failure(format!(
-                "request target {:?}: {e}",
-                // The query is not repeated: it may carry a credential.
-                path.as_deref()
-                    .unwrap_or_default()
-                    .split('?')
-                    .next()
-                    .unwrap_or_default()
-            ))
-        })?;
+        // The path is not repeated: a path (and its query) may carry a token.
+        let target = request_target(&self.dial, path.as_deref(), !self.carried)
+            .map_err(|e| Failure(format!("request target: {e}")))?;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // hyper frames the body below; a length or coding the message carried describes the
@@ -437,6 +435,19 @@ impl Owed for Framing {
     }
 }
 
+/// Append `bytes` to `buf`, never leaving a copy of what it held behind: where it must grow, the
+/// bytes move to a new allocation and the old one is zeroed as it drops (a `Vec`'s own growth
+/// frees the old allocation as it was).
+fn append_zeroizing(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    let need = buf.len().saturating_add(bytes.len());
+    if need > buf.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity(need.max(buf.capacity() * 2)));
+        grown.extend_from_slice(buf);
+        *buf = grown;
+    }
+    buf.extend_from_slice(bytes);
+}
+
 /// The dial target with an IPv4 spelling in its host written as the dotted quad it names
 /// ([`super::offered_name`]), so the request's `host` field (HTTP/1.1) and `:authority` (HTTP/2)
 /// carry the address 1.5.5's client sent: its URL parser canonicalized the host before the
@@ -494,7 +505,7 @@ fn client_posture(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<
         Some(p) if p.as_str() != "/" => p
             .as_str()
             .parse()
-            .map_err(|_| Failure(format!("not an origin-form target: {p}")))?,
+            .map_err(|_| Failure("request target: not an origin-form target".into()))?,
         _ => http::Uri::default(),
     };
     Ok(())

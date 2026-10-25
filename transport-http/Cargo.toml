@@ -4,7 +4,7 @@ name = "busbar-transport-http"
 version = "1.6.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "The http transport: a sans-IO http framer door that composes over nothing."
 license = "Apache-2.0"
 
@@ -36,6 +36,8 @@ bytes = { workspace = true }
 httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+# The request message `emit` collects is zeroed as it is dropped (`door::engine::Stage::Writing`).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
@@ -51,3 +53,6 @@ url = { workspace = true }
 busbar-contract = { workspace = true, features = ["test-seal"] }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
+
+[lints]
+workspace = true
