@@ -109,6 +109,7 @@ dependencies = [
  "bytes",
  "http",
  "http-body-util",
+ "httpdate",
  "hyper",
  "memchr",
  "reqwest",

@@ -19,14 +19,16 @@ pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Opti
 
 /// Parse an RFC 9110 `Retry-After` header VALUE against `now` (a Unix timestamp in seconds). Both
 /// normative forms are accepted: `delay-seconds` (an integer, which ignores `now`) and an
-/// HTTP-date, converted to the seconds remaining until that instant and floored at 0 when it is
-/// already in the past.
+/// HTTP-date in any of the three forms RFC 9110 5.6.7 requires a recipient to accept (IMF-fixdate,
+/// obsolete RFC 850, asctime), converted to the seconds remaining until that instant and floored
+/// at 0 when it is already in the past. A date with an out-of-range field is absent.
 ///
-/// The arithmetic is the one the breaker's own classifier does, and it is duplicated here rather
-/// than shared: this crate sits on the transport axis and may not name a unit crate, and the unit
-/// crate's own dependency policy names the capability crate as the only workspace crate it may see.
-/// Neither can reach the other, so there is no shared home for four lines of date parsing. The forms
-/// accepted and the flooring rule are pinned by the tests below against the same values.
+/// The date is read by `httpdate`, the parser 1.5.5's breaker used. The arithmetic after it is the
+/// breaker's own classifier's, and it is duplicated here rather than shared: this crate sits on the
+/// transport axis and may not name a unit crate, and the unit crate's own dependency policy names
+/// the capability crate as the only workspace crate it may see. Neither can reach the other, so
+/// there is no shared home for it. The forms accepted and the flooring rule are pinned by the tests
+/// below against the same values.
 ///
 /// (The capability crate is deliberately not spelled here. `tests/no_plane_names.rs` refuses that
 /// name anywhere in this crate's source, and a rule with an exception for prose is a rule with an
@@ -36,68 +38,9 @@ pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
     if let Ok(n) = s.parse::<u64>() {
         return Some(n);
     }
-    parse_imf_fixdate_retry_after(s, now)
-}
-
-/// Parse the value as an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, the sole HTTP-date form RFC
-/// 9110 recommends generating) and return the whole seconds remaining until it, floored at 0 for a
-/// date already in the past.
-fn parse_imf_fixdate_retry_after(s: &str, now: u64) -> Option<u64> {
-    // "Www, dd Mon yyyy HH:MM:SS GMT" — fixed-width, so a byte-length check plus field slicing is
-    // enough; no general calendar library is warranted for one wire format.
-    if s.len() != 29 || !s.ends_with(" GMT") {
-        return None;
-    }
-    if s.as_bytes().get(3) != Some(&b',') || s.as_bytes().get(4) != Some(&b' ') {
-        return None;
-    }
-    let day: u64 = s.get(5..7)?.parse().ok()?;
-    let month = month_from_abbrev(s.get(8..11)?)?;
-    let year: u64 = s.get(12..16)?.parse().ok()?;
-    let hour: u64 = s.get(17..19)?.parse().ok()?;
-    let minute: u64 = s.get(20..22)?.parse().ok()?;
-    let second: u64 = s.get(23..25)?.parse().ok()?;
-    let epoch_secs = civil_to_epoch_secs(year, month, day, hour, minute, second)?;
+    let at = httpdate::parse_http_date(s).ok()?;
+    let epoch_secs = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     Some(epoch_secs.saturating_sub(now))
-}
-
-fn month_from_abbrev(m: &str) -> Option<u64> {
-    Some(match m {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    })
-}
-
-/// Days-from-civil (Howard Hinnant's public-domain algorithm), giving a UTC Unix timestamp for a
-/// UTC calendar date and time with no external date/time dependency.
-fn civil_to_epoch_secs(
-    year: u64,
-    month: u64,
-    day: u64,
-    hour: u64,
-    minute: u64,
-    second: u64,
-) -> Option<u64> {
-    let y = year as i64 - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (month as i64 + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_since_epoch = era * 146_097 + doe - 719_468;
-    let days_since_epoch = u64::try_from(days_since_epoch).ok()?;
-    Some(days_since_epoch * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 /// Where an egress request actually goes: the dialled scheme and authority, carrying the target
