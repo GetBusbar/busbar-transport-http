@@ -51,6 +51,20 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
+/// RED: the size is `1*HEXDIG` (RFC 9112 7.1): no sign, no surrounding whitespace.
+#[test]
+fn a_signed_or_padded_chunk_size_is_a_framing_error() {
+    for line in [
+        &b"+5\r\nhello\r\n0\r\n\r\n"[..],
+        b" 5\r\nhello\r\n0\r\n\r\n",
+        b"5 \r\nhello\r\n0\r\n\r\n",
+        b"\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(decoder.feed(line), Err(ChunkedMalformed), "{line:?}");
+    }
+}
+
 #[test]
 fn chunk_extensions_are_ignored_rather_than_read() {
     let mut decoder = ChunkedDecoder::default();
@@ -132,4 +146,45 @@ fn parses_a_status_line() {
         }
     );
     assert!(msg.body.is_empty());
+}
+
+/// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
+/// size may be followed by whitespace before its extensions (codeaudit review of D8).
+#[test]
+fn whitespace_before_a_chunk_extension_is_allowed() {
+    let mut decoder = ChunkedDecoder::default();
+    decoder
+        .feed(b"3 \t;name=value\r\nabc\r\n0\r\n\r\n")
+        .unwrap();
+    assert!(decoder.is_done());
+    assert_eq!(decoder.take().0, vec![b"abc".to_vec()]);
+}
+
+/// RED: `RawMessage` and `ChunkedDecoder` derived `Debug`, so a message logged with `{:?}` printed
+/// its target, every header value (an `authorization` among them) and its body, and a decoder
+/// printed the chunks it held. A Debug now shows the method, header NAMES, `<redacted>` values and
+/// the body as a length.
+#[test]
+fn a_message_debug_shows_names_and_lengths_never_values() {
+    let msg = parse_message(
+        b"POST /v1/SECRETP?key=SECRETQ HTTP/1.1\r\nAuthorization: Bearer SECRETH\r\n\
+          Content-Length: 7\r\n\r\nSECRETB",
+    )
+    .unwrap();
+    let d = format!("{msg:?}");
+    assert!(d.contains("POST"), "{d}");
+    assert!(d.contains("Authorization"), "{d}");
+    assert!(d.contains("<redacted>"), "{d}");
+    assert!(d.contains("body_len: 7"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"7\r\nSECRETB\r\n0\r\nX-T: SECRETT\r\n\r\n")
+        .unwrap();
+    let d = format!("{c:?}");
+    assert!(d.contains("X-T"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"9\r\nSECR").unwrap();
+    assert!(!format!("{c:?}").contains("SECR"), "{c:?}");
 }

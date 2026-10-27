@@ -15,14 +15,8 @@ use busbar_contract::abi::transport::{
 /// The `http` claim: the entry's first claim and the row's key.
 pub const KEY: &str = "http";
 
-/// The `sse` claim: an HTTP response body read as a stream of events, framed as `http` is.
-pub mod sse {
-    /// The `sse` claim's key.
-    pub const KEY: &str = "sse";
-}
-
-/// The `sse` claim's key, by its own name.
-pub(crate) const SSE_KEY: &str = sse::KEY;
+/// The `sse` claim's key: an HTTP response body read as a stream of events, framed as `http` is.
+pub(crate) const SSE_KEY: &str = "sse";
 
 /// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
 /// secures before they leave (THE DESIGN §5: "http claims `http`, `https` and `sse`").
@@ -32,7 +26,7 @@ pub(crate) const SECURE_KEY: &str = "https";
 /// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
-/// Neither claim carries a session.
+/// None of the three claimed schemes carries a session.
 pub(crate) const SESSION: bool = false;
 
 pub(crate) const NONE: AbiStr = AbiStr {

@@ -4,7 +4,7 @@ name = "busbar-transport-http-plugin"
 version = "1.6.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "First-party signed kind:transport plugin cdylib: the `http` transport, packaged as a droppable busbar plugin. Drop the signed tarball into `plugins/` and the boot seal folds the wire beside the linked ones."
 license = "Apache-2.0"
 
@@ -15,14 +15,17 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 busbar-transport-http = { path = "../transport-http" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "c7ebdeb49e9b8649ed21192387628ec62db69c1d" }
+busbar-contract = { workspace = true }
 
 [dev-dependencies]
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "c7ebdeb49e9b8649ed21192387628ec62db69c1d", features = ["conformance"] }
+busbar-plugin-loader = { workspace = true, features = ["conformance"] }
 # door_both_ways.rs: a real hyper server on the far side of the framer, the cdylib dlopen'd.
-libloading = "0.9"
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["client-legacy", "http1", "http2", "server-auto", "server-graceful", "service", "tokio"] }
-http-body-util = "0.1"
-bytes = "1"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
+libloading = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
+
+[lints]
+workspace = true
