@@ -4,11 +4,12 @@
 //! A minimal HTTP/1.1 message reader: just enough to split a raw byte blob (request line or
 //! status line, headers, blank line, body) into its parts, and to read a chunked body across
 //! however many reads it arrives in. Not a general-purpose parser — no header folding, and the only
-//! transfer coding it reads is `chunked`. Good enough for the shapes this transport actually needs:
-//! what its own `write` is handed, and what an ingress connection carries.
+//! transfer coding it reads is `chunked`. Good enough for the one shape this transport reads: the
+//! request message `encode` renders and `emit` is handed.
 
-/// The message's first line, kept as whichever of the two shapes it turned out to be.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The message's first line, kept as whichever of the two shapes it turned out to be. Its `Debug`
+/// shows a request's method and never its target (a path may carry a token).
+#[derive(Clone, PartialEq, Eq)]
 pub enum RawStartLine {
     /// `METHOD path HTTP/version`.
     Request {
@@ -27,8 +28,9 @@ pub enum RawStartLine {
     },
 }
 
-/// One parsed message: its start line, its headers in wire order, and its body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One parsed message: its start line, its headers in wire order, and its body. Its `Debug` shows
+/// the header NAMES only, each value `<redacted>`, and the body as its length.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RawMessage {
     /// The request or status line.
     pub start: RawStartLine,
@@ -37,6 +39,64 @@ pub struct RawMessage {
     pub headers: Vec<(String, Vec<u8>)>,
     /// Everything after the blank line.
     pub body: Vec<u8>,
+}
+
+/// A parsed message's header values and body can carry credentials (an `authorization` line, a
+/// captured token in a reply): wiped when the message goes.
+impl Drop for RawMessage {
+    fn drop(&mut self) {
+        for (_, v) in &mut self.headers {
+            zeroize::Zeroize::zeroize(v);
+        }
+        zeroize::Zeroize::zeroize(&mut self.body);
+    }
+}
+
+/// A header value or a target, as a `Debug` shows it: `<redacted>`.
+struct Hidden;
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// `name: <redacted>`, for a `Debug` of header pairs.
+struct Redacted<'a, N>(&'a [(String, N)]);
+
+impl<N> std::fmt::Debug for Redacted<'_, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(k, _)| (k, Hidden)))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RawStartLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request { method, path } => f
+                .debug_struct("Request")
+                .field("method", method)
+                .field("path", &path.as_ref().map(|_| Hidden))
+                .finish(),
+            Self::Status { code, reason } => f
+                .debug_struct("Status")
+                .field("code", code)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for RawMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawMessage")
+            .field("start", &self.start)
+            .field("headers", &Redacted(&self.headers))
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Split `bytes` into a start line, headers and body. `bytes` may end exactly at the header
@@ -249,7 +309,8 @@ pub fn content_length(headers: &[(String, Vec<u8>)]) -> Result<Option<usize>, ()
 /// CRLF after one, or between the terminal chunk and its trailers. A decoder that re-scanned the
 /// whole buffer on every read would be quadratic in the body size, which for the megabyte bodies
 /// this path exists to carry is the difference between a transport and a stall.
-#[derive(Debug, Default)]
+/// Its `Debug` shows where it stands, the trailer NAMES and byte counts, never a byte of a chunk.
+#[derive(Default)]
 pub struct ChunkedDecoder {
     state: ChunkState,
     line: Vec<u8>,
@@ -257,6 +318,8 @@ pub struct ChunkedDecoder {
     current: Vec<u8>,
     chunks: Vec<Vec<u8>>,
     trailers: Vec<(String, String)>,
+    /// The decoded body bytes so far, every chunk's data counted as it arrives.
+    body_len: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -274,33 +337,52 @@ enum ChunkState {
     Done,
 }
 
+impl std::fmt::Debug for ChunkedDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedDecoder")
+            .field("state", &self.state)
+            .field("want", &self.want)
+            .field("chunks", &self.chunks.len())
+            .field("trailers", &Redacted(&self.trailers))
+            .field("body_len", &self.body_len)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The bytes did not follow the chunked grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkedMalformed;
 
 impl ChunkedDecoder {
-    /// Feed everything that has arrived since the last call.
+    /// Feed everything that has arrived since the last call, answering how many of `bytes` the
+    /// message took: all of them, unless the terminal chunk and its trailer section ended it
+    /// first. What is left after that end is not this message's, and the caller judges it.
     ///
     /// # Errors
     ///
     /// The bytes are not chunked-transfer-encoding: a size line that is not hexadecimal, a chunk
     /// not closed by CRLF, or a trailer line with no colon.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), ChunkedMalformed> {
-        for &b in bytes {
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
+        for (i, &b) in bytes.iter().enumerate() {
             if self.state == ChunkState::Done {
-                // Anything after the terminal chunk belongs to the next message on the connection,
-                // which this delivery does not read (one request per connection).
-                break;
+                return Ok(i);
             }
             self.step(b)?;
         }
-        Ok(())
+        Ok(bytes.len())
+    }
+
+    /// The decoded body bytes so far.
+    #[must_use]
+    pub fn body_len(&self) -> usize {
+        self.body_len
     }
 
     fn step(&mut self, b: u8) -> Result<(), ChunkedMalformed> {
         match self.state {
             ChunkState::Data => {
                 self.current.push(b);
+                self.body_len += 1;
                 self.want -= 1;
                 if self.want == 0 {
                     self.chunks.push(std::mem::take(&mut self.current));
@@ -325,7 +407,19 @@ impl ChunkedDecoder {
                     .map_err(|_| ChunkedMalformed)?;
                 if self.state == ChunkState::Size {
                     // A size line may carry chunk extensions after a semicolon; none is read.
-                    let size_text = line.split(';').next().unwrap_or("").trim();
+                    let (size_text, ext) = line
+                        .split_once(';')
+                        .map_or((line.as_str(), false), |(s, _)| (s, true));
+                    // Whitespace may stand between a size and its extensions (BWS, RFC 9112 7.1.1).
+                    let size_text = if ext {
+                        size_text.trim_end_matches([' ', '\t'])
+                    } else {
+                        size_text
+                    };
+                    // `1*HEXDIG` (RFC 9112 7.1): no sign, no whitespace, not empty.
+                    if size_text.is_empty() || !size_text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(ChunkedMalformed);
+                    }
                     let size =
                         usize::from_str_radix(size_text, 16).map_err(|_| ChunkedMalformed)?;
                     self.state = if size == 0 {

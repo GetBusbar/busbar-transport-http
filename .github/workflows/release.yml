@@ -1,35 +1,34 @@
-# RENDERED by `cargo xtask fleet render busbar-transport-http` from GetBusbar/busbar's plugins.yaml and
-# .github/fleet/ templates; `cargo xtask fleet check` is red on any edit here. On a v* tag: this
-# repo's CI on the tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then
-# the consumer verification of what was published, each at the busbar commit this repo pins.
+# RENDERED by `busbar-release plugin heal busbar-transport-http` from GetBusbar/busbar-release template/; a hand
+# edit is overwritten by the next sync. On a v* tag: this repo's own ci.yml (the fleet harness) on the
+# tagged commit, then busbar's plugin-release.yml (build, sign, pack, publish), then the consumer
+# verification of what was published, each at the busbar commit this repo pins.
 name: release
 
 on:
   push:
-    tags: ["v*", "!v*-*"]
+    # `vX.Y.Z-dev.N` is a signed PRE-RELEASE from dev (never main/qa); other suffixed tags start nothing.
+    tags: ["v*", "!v*-*", "v*-dev.*"]
   # A tag pushed with GITHUB_TOKEN starts no workflow, so a workflow that tags dispatches this on
   # the tag ref (`gh workflow run release.yml --ref <tag>`).
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  issues: write
-  actions: read
+# Nothing by default: each job below is granted exactly what the workflow it calls needs, and is
+# passed only the secrets that workflow declares (never every secret wholesale).
+permissions: {}
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@c7ebdeb49e9b8649ed21192387628ec62db69c1d
-    with:
-      service: none
-      busbar_checkout: false
-      macos_test: "cargo test --workspace --locked"
-      extra_test: ""
-    secrets: inherit
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    # No secrets: the tagged commit's CI needs none (coverage upload skips without CODECOV_TOKEN).
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@c7ebdeb49e9b8649ed21192387628ec62db69c1d
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@71b70e487bebe5ae2feb1fabf32d8906edf4ccad
     with:
       plugin_crate: busbar-transport-http-plugin
       manifest_name: busbar-transport-http
@@ -41,11 +40,16 @@ jobs:
       needs_prompt: ""
       needs_user: ""
       declares_file: "transport-http/declares.json"
-    secrets: inherit
+    secrets:
+      BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+      RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@c7ebdeb49e9b8649ed21192387628ec62db69c1d
+    permissions:
+      contents: read
+      actions: read
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@71b70e487bebe5ae2feb1fabf32d8906edf4ccad
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-transport-http
@@ -54,4 +58,3 @@ jobs:
       plugin_kind: transport
       bundle_image: ""
       bundle_env: ""
-    secrets: inherit

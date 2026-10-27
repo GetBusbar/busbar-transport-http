@@ -5,8 +5,6 @@
 //! carried so far are one whole message yet (the egress cross-check's framing), the request target
 //! a dialled exchange goes to, and the upstream's `Retry-After` read off a response head.
 
-use busbar_contract::transport::wire::TransportError;
-
 use crate::raw;
 
 /// Read the upstream's `Retry-After` off a response head and resolve it to whole seconds.
@@ -21,14 +19,16 @@ pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Opti
 
 /// Parse an RFC 9110 `Retry-After` header VALUE against `now` (a Unix timestamp in seconds). Both
 /// normative forms are accepted: `delay-seconds` (an integer, which ignores `now`) and an
-/// HTTP-date, converted to the seconds remaining until that instant and floored at 0 when it is
-/// already in the past.
+/// HTTP-date in any of the three forms RFC 9110 5.6.7 requires a recipient to accept (IMF-fixdate,
+/// obsolete RFC 850, asctime), converted to the seconds remaining until that instant and floored
+/// at 0 when it is already in the past. A date with an out-of-range field is absent.
 ///
-/// The arithmetic is the one the breaker's own classifier does, and it is duplicated here rather
-/// than shared: this crate sits on the transport axis and may not name a unit crate, and the unit
-/// crate's own dependency policy names the capability crate as the only workspace crate it may see.
-/// Neither can reach the other, so there is no shared home for four lines of date parsing. The forms
-/// accepted and the flooring rule are pinned by the tests below against the same values.
+/// The date is read by `httpdate`, the parser 1.5.5's breaker used. The arithmetic after it is the
+/// breaker's own classifier's, and it is duplicated here rather than shared: this crate sits on the
+/// transport axis and may not name a unit crate, and the unit crate's own dependency policy names
+/// the capability crate as the only workspace crate it may see. Neither can reach the other, so
+/// there is no shared home for it. The forms accepted and the flooring rule are pinned by the tests
+/// below against the same values.
 ///
 /// (The capability crate is deliberately not spelled here. `tests/no_plane_names.rs` refuses that
 /// name anywhere in this crate's source, and a rule with an exception for prose is a rule with an
@@ -38,68 +38,9 @@ pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
     if let Ok(n) = s.parse::<u64>() {
         return Some(n);
     }
-    parse_imf_fixdate_retry_after(s, now)
-}
-
-/// Parse the value as an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`, the sole HTTP-date form RFC
-/// 9110 recommends generating) and return the whole seconds remaining until it, floored at 0 for a
-/// date already in the past.
-fn parse_imf_fixdate_retry_after(s: &str, now: u64) -> Option<u64> {
-    // "Www, dd Mon yyyy HH:MM:SS GMT" — fixed-width, so a byte-length check plus field slicing is
-    // enough; no general calendar library is warranted for one wire format.
-    if s.len() != 29 || !s.ends_with(" GMT") {
-        return None;
-    }
-    if s.as_bytes().get(3) != Some(&b',') || s.as_bytes().get(4) != Some(&b' ') {
-        return None;
-    }
-    let day: u64 = s.get(5..7)?.parse().ok()?;
-    let month = month_from_abbrev(s.get(8..11)?)?;
-    let year: u64 = s.get(12..16)?.parse().ok()?;
-    let hour: u64 = s.get(17..19)?.parse().ok()?;
-    let minute: u64 = s.get(20..22)?.parse().ok()?;
-    let second: u64 = s.get(23..25)?.parse().ok()?;
-    let epoch_secs = civil_to_epoch_secs(year, month, day, hour, minute, second)?;
+    let at = httpdate::parse_http_date(s).ok()?;
+    let epoch_secs = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     Some(epoch_secs.saturating_sub(now))
-}
-
-fn month_from_abbrev(m: &str) -> Option<u64> {
-    Some(match m {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    })
-}
-
-/// Days-from-civil (Howard Hinnant's public-domain algorithm), giving a UTC Unix timestamp for a
-/// UTC calendar date and time with no external date/time dependency.
-fn civil_to_epoch_secs(
-    year: u64,
-    month: u64,
-    day: u64,
-    hour: u64,
-    minute: u64,
-    second: u64,
-) -> Option<u64> {
-    let y = year as i64 - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (month as i64 + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days_since_epoch = era * 146_097 + doe - 719_468;
-    let days_since_epoch = u64::try_from(days_since_epoch).ok()?;
-    Some(days_since_epoch * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 /// Where an egress request actually goes: the dialled scheme and authority, carrying the target
@@ -113,22 +54,29 @@ fn civil_to_epoch_secs(
 /// dial URI already spells the whole target — and only as the connection's FIRST request
 /// (`first`); a later request naming none goes to `/`, never to whatever path the exchange that
 /// dialled the line happened to name.
+///
+/// A stated target is ORIGIN form (`/` and a path, RFC 9112 §3.2.1), the one form this door sends
+/// (THE DESIGN §5: the http transport owns "on h1 the host header and origin-form target"). Any
+/// other is refused, never rewritten: `v1/chat` would have gone to `/`, and an absolute-form
+/// `http://other/x` to whatever host it names on the dialled address (RFC 9112 §3.2.2), each
+/// without an error.
 pub(crate) fn request_target(
     dial: &http::Uri,
     path: Option<&str>,
     first: bool,
-) -> Result<http::Uri, TransportError> {
+) -> Result<http::Uri, &'static str> {
     let path = match path {
-        Some(stated) => stated,
+        Some(stated) if stated.starts_with('/') => stated,
+        Some(_) => return Err("target not in origin form"),
         None if first => return Ok(dial.clone()),
         None => "/",
     };
     let mut parts = dial.clone().into_parts();
     parts.path_and_query = Some(
         path.parse::<http::uri::PathAndQuery>()
-            .map_err(|_| TransportError::Framing)?,
+            .map_err(|_| "target not a valid path")?,
     );
-    http::Uri::from_parts(parts).map_err(|_| TransportError::Framing)
+    http::Uri::from_parts(parts).map_err(|_| "target not a valid path")
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
@@ -136,36 +84,57 @@ pub(crate) fn request_target(
 /// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
 /// a chunked body seen, or a message that declares neither coding and therefore carries no body at
 /// all. A chunked message is decoded here, so what comes back always carries the body itself rather
-/// than a framing of it.
+/// than a framing of it. The head is held to `max_head_bytes` and the body to `max_body_bytes`.
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
     max_body_bytes: usize,
-) -> Result<Option<raw::RawMessage>, TransportError> {
+    max_head_bytes: usize,
+) -> Result<Option<raw::RawMessage>, &'static str> {
     if cache.head.is_none() {
-        let Some(header_end) = find_header_end(buffered) else {
+        // Resumed where the last call stopped: the bytes before it hold no terminator, and the
+        // search looks back from each line feed it finds, so nothing is missed.
+        let (found, scanned) = find_header_end_from(buffered, cache.searched);
+        cache.scanned += scanned;
+        cache.searched = buffered.len();
+        let Some(header_end) = found else {
+            // No terminator yet, so every buffered byte is head: past the allowance it is one the
+            // sender will not end in bounds.
+            if buffered.len() > max_head_bytes {
+                return Err("request head over its allowance");
+            }
             return Ok(None);
         };
-        let message = raw::parse_message(&buffered[..header_end]).ok_or(TransportError::Framing)?;
+        if header_end > max_head_bytes {
+            return Err("request head over its allowance");
+        }
+        let mut message =
+            raw::parse_message(&buffered[..header_end]).ok_or("unparsable request head")?;
         cache.parses += 1;
         if raw::has_transfer_encoding(&message.headers) {
             if !raw::is_chunked(&message.headers) {
                 // A declared coding this transport cannot frame. Falling through to
                 // `Content-Length` would be answering a question the sender did not ask.
-                return Err(TransportError::Framing);
+                return Err("unsupported transfer coding");
             }
             if raw::header(&message.headers, "content-length").is_some() {
                 // Two headers describing two framings of the same bytes. The coding wins the
                 // reading, but forwarding the pair on — as this used to do — hands the next hop a
                 // length the bytes do not have, the smuggling shape itself. Refused rather than
-                // silently disambiguated, mirroring the ingress reader's identical refusal.
-                return Err(TransportError::Framing);
+                // silently disambiguated.
+                return Err("transfer-encoding with content-length");
             }
         }
         cache.head = Some(CachedHead {
             end: header_end,
-            start: message.start,
-            headers: message.headers,
+            start: std::mem::replace(
+                &mut message.start,
+                crate::raw::RawStartLine::Status {
+                    code: 0,
+                    reason: String::new(),
+                },
+            ),
+            headers: std::mem::take(&mut message.headers),
         });
     }
     // Read what the head says before touching the cache again: the decoder lives beside it, and
@@ -180,44 +149,62 @@ pub(crate) fn complete_message(
     };
     let rest = &buffered[head_end..];
 
-    let (body, trailers) = if chunked {
+    let body = if chunked {
         // ONE decoder across the calls, fed only what arrived with this one. A fresh decoder per
         // call re-decodes every byte received so far and re-allocates the decoded chunks each
         // time — quadratic in the body, which for the megabyte bodies this path exists to carry is
-        // the difference between a transport and a stall. The ingress reader already reads this
-        // way; this is the same reading on the side that accumulates.
+        // the difference between a transport and a stall.
         let decoder = cache
             .decoder
             .get_or_insert_with(|| Box::new(raw::ChunkedDecoder::default()));
         let fresh = &rest[cache.fed.min(rest.len())..];
         cache.feeds += fresh.len();
-        decoder.feed(fresh).map_err(|_| TransportError::Framing)?;
+        let used = decoder.feed(fresh).map_err(|_| "malformed chunked body")?;
         cache.fed = rest.len();
+        // The body cap is the decoded body's, as it is a declared length's, and it is held as the
+        // chunks arrive rather than once the message is whole.
+        if decoder.body_len() > max_body_bytes {
+            return Err("decoded chunked body over the body cap");
+        }
         if !decoder.is_done() {
             return Ok(None);
         }
-        let (chunks, trailers) = cache.decoder.take().expect("set just above").take();
-        (chunks.concat(), trailers)
+        // Bytes after the terminal chunk's trailer section belong to no message this stream
+        // carries: a mis-framed writer, refused rather than dropped.
+        if used < fresh.len() {
+            return Err("bytes past the end of the message");
+        }
+        // The trailer section is discarded: RFC 9110 §6.5.1 lets a recipient that removes the
+        // chunked coding discard its trailers, and forbids merging them into the header section
+        // (a trailer `host` or `connection` would become a second header of that name). THE
+        // DESIGN §5 carries no trailer on the transport ABI, so there is nowhere else to send
+        // them.
+        let (chunks, _trailers) = cache.decoder.take().expect("set just above").take();
+        chunks.concat()
     } else {
-        let declared = declared.map_err(|()| TransportError::Framing)?.unwrap_or(0);
+        let declared = declared
+            .map_err(|()| "invalid content-length")?
+            .unwrap_or(0);
         if declared > max_body_bytes {
-            return Err(TransportError::Framing);
+            return Err("declared body over the body cap");
         }
         if rest.len() < declared {
             return Ok(None);
         }
-        (rest[..declared].to_vec(), Vec::new())
+        // Bytes past the declared length (or past a head that declares no body) are a mis-framed
+        // writer's, refused rather than dropped.
+        if rest.len() > declared {
+            return Err("bytes past the end of the message");
+        }
+        rest.to_vec()
     };
 
     // Whole: the head is spent with the message it belonged to, so the next one parses its own,
     // and the decoder that read this body is spent with it too.
-    let mut head = cache.head.take().expect("set just above");
+    let head = cache.head.take().expect("set just above");
     cache.decoder = None;
     cache.fed = 0;
-    // A trailer is a header that arrived late; it goes where every other header went, so
-    // nothing downstream has to know which side of the body it was written on.
-    head.headers
-        .extend(trailers.into_iter().map(|(n, v)| (n, v.into_bytes())));
+    cache.searched = 0;
     Ok(Some(raw::RawMessage {
         start: head.start,
         headers: head.headers,
@@ -246,8 +233,7 @@ pub(crate) struct EgressHead {
     pub(crate) head: Option<CachedHead>,
     pub(crate) parses: usize,
     /// The chunked decoder this message is being decoded by, kept across `emit` calls so each
-    /// call feeds only the bytes that arrived with it — the same discipline the ingress reader
-    /// keeps across reads. Behind a box because it is a per-message working set that most
+    /// call feeds only the bytes that arrived with it. Behind a box because it is a per-message working set that most
     /// connections never allocate, and inline it would be carried by every connection ever dialled.
     pub(crate) decoder: Option<Box<raw::ChunkedDecoder>>,
     /// How many bytes past the header block have already been fed to `decoder`.
@@ -255,6 +241,12 @@ pub(crate) struct EgressHead {
     /// This connection's own tally of bytes fed to a decoder, per instance for the same reason
     /// `parses` is: a test reading it back sees only its own connection's work.
     pub(crate) feeds: usize,
+    /// This connection's own tally of bytes the header-end search examined, per instance for the
+    /// same reason.
+    pub(crate) scanned: usize,
+    /// How far into the pending bytes the header-end search has already looked without finding the
+    /// end: the next call resumes there.
+    pub(crate) searched: usize,
 }
 
 /// The offset just past the blank line that ends a header block, searching from `start`, alongside
@@ -279,8 +271,4 @@ pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> (Option<usize>, 
         i = at + 1;
     };
     (found, scanned)
-}
-
-pub(crate) fn find_header_end(buf: &[u8]) -> Option<usize> {
-    find_header_end_from(buf, 0).0
 }

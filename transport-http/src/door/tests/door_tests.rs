@@ -27,11 +27,86 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
         (p.request_timeout, p.max_body_bytes),
         (Duration::from_secs(7), 9)
     );
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
     assert_eq!(
-        read_settings(blob(r#"{"advanced.upstream_http1_only":"yes"}"#)).err(),
-        Some("settings: a value is not of its declared kind")
+        refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
+        Some("settings: advanced.upstream_http1_only must be true or false")
     );
-    assert_eq!(read_settings(blob("[")).err(), Some("settings: not JSON"));
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
+    );
+    assert_eq!(
+        refused("[").as_deref(),
+        Some("settings: must be a JSON object")
+    );
+}
+
+/// RED: an undeclared key was read past, a zero limit was taken (a zero body cap refuses every
+/// body, a zero timeout every exchange) and a bad value was named `<key>: not of its declared
+/// kind`. The canon: an undeclared key is refused by name, zero is a bad value, and each bad value
+/// says what the key must be.
+#[test]
+fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":false,"limits.nope":1}"#).as_deref(),
+        Some("settings: limits.nope is not a setting this transport reads")
+    );
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":0}"#).as_deref(),
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":0}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":"7"}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":1}"#).as_deref(),
+        Some("settings: advanced.upstream_h2_prior_knowledge must be true or false")
+    );
+}
+
+/// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
+/// built, so the offered name is lower-case; the dial authority stays as written.
+#[test]
+fn locate_offers_a_dns_name_lower_cased() {
+    let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
+    assert_eq!(name, "api.example.com");
+    assert_eq!(authority, "API.Example.com:443");
+    let (_, _, name) = located(b"https://[FE80::1]:4318/").expect("located");
+    assert_eq!(name, "fe80::1");
+}
+
+/// A settings blob that is not a JSON object reads nothing, so it is refused, not defaulted.
+#[test]
+fn a_settings_blob_that_is_not_an_object_is_refused() {
+    for s in ["null", "[]", "\"x\"", "5", "true"] {
+        let r = read_settings(blob(s)).err().map(|e| e.to_string());
+        assert_eq!(r.as_deref(), Some("settings: must be a JSON object"), "{s}");
+    }
+    assert!(read_settings(blob("")).is_ok());
+}
+
+/// The defaults the settings declare are the host's own (`transport::registry`), so the door and
+/// the host read one figure for each.
+#[test]
+fn the_declared_defaults_are_the_hosts() {
+    use busbar_contract::transport::registry::{
+        DEFAULT_REQUEST_BODY_MAX_BYTES, DEFAULT_REQUEST_TIMEOUT_SECS,
+    };
+    assert_eq!(
+        declared_count(setting::REQUEST_TIMEOUT_SECS),
+        DEFAULT_REQUEST_TIMEOUT_SECS
+    );
+    assert_eq!(
+        declared_count(setting::BODY_MAX_BYTES),
+        DEFAULT_REQUEST_BODY_MAX_BYTES as u64
+    );
 }
 
 /// Each status band lands in its class; anything outside the three bands is other.
@@ -41,6 +116,21 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(429), STATUS_CALLER_FAULT);
     assert_eq!(class_of(503), STATUS_FAR_END_FAULT);
     assert_eq!(class_of(101), STATUS_OTHER);
+    // The band edges, each side of each.
+    for (code, class) in [
+        (199, STATUS_OTHER),
+        (200, STATUS_SUCCESS),
+        (299, STATUS_SUCCESS),
+        (300, STATUS_OTHER),
+        (399, STATUS_OTHER),
+        (400, STATUS_CALLER_FAULT),
+        (499, STATUS_CALLER_FAULT),
+        (500, STATUS_FAR_END_FAULT),
+        (599, STATUS_FAR_END_FAULT),
+        (600, STATUS_OTHER),
+    ] {
+        assert_eq!(class_of(code), class, "status {code}");
+    }
 }
 
 /// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
