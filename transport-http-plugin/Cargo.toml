@@ -18,7 +18,8 @@ busbar-transport-http = { path = "../transport-http" }
 busbar-contract = { workspace = true }
 
 [dev-dependencies]
-busbar-plugin-loader = { workspace = true, features = ["conformance"] }
+busbar-plugin-loader = { workspace = true }
+busbar-test-kit = { workspace = true }
 # door_both_ways.rs: a real hyper server on the far side of the framer, the cdylib dlopen'd.
 libloading = { workspace = true }
 hyper = { workspace = true }
