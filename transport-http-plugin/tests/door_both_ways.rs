@@ -662,7 +662,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 fn linked() -> &'static Ops {
     let d = busbar_transport_http_plugin::door::door();
     // SAFETY: the door's `'static` table.
-    unsafe { &*(*d).ops.cast::<Ops>() }
+    unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
 fn dropped() -> (&'static Ops, &'static libloading::Library) {
@@ -687,7 +687,7 @@ fn dropped() -> (&'static Ops, &'static libloading::Library) {
         unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
     let d = door();
     // SAFETY: the dropped-in door's `'static` table.
-    (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
+    (unsafe { &*(*d).ops().cast::<Ops>() }, lib)
 }
 
 #[test]
