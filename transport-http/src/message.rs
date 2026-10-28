@@ -105,8 +105,11 @@ pub(crate) fn complete_message(
         None => {
             // Resumed where the last call stopped: the bytes before it hold no terminator, and the
             // search looks back from each line feed it finds, so nothing is missed.
-            let (found, scanned) = find_header_end_from(buffered, cache.searched);
-            cache.scanned += scanned;
+            let found = find_header_end_from(buffered, cache.searched);
+            #[cfg(test)]
+            {
+                cache.scanned += buffered.len() - cache.searched.min(buffered.len());
+            }
             cache.searched = buffered.len();
             let Some(header_end) = found else {
                 // No terminator yet, so every buffered byte is head: past the allowance it is one
@@ -123,7 +126,10 @@ pub(crate) fn complete_message(
             // where they are, and the request is built from them in place once the message is
             // whole.
             let framing = raw::Head::parse(&buffered[..header_end])?.framing()?;
-            cache.parses += 1;
+            #[cfg(test)]
+            {
+                cache.parses += 1;
+            }
             cache.head = Some((header_end, framing));
             (header_end, framing)
         }
@@ -136,7 +142,10 @@ pub(crate) fn complete_message(
             // per call re-decodes every byte received so far — quadratic in the body.
             let decoder = cache.decoder.get_or_insert_with(Box::default);
             let fresh = &rest[cache.fed.min(rest.len())..];
-            cache.feeds += fresh.len();
+            #[cfg(test)]
+            {
+                cache.feeds += fresh.len();
+            }
             let used = decoder.feed(fresh).map_err(|_| "malformed chunked body")?;
             cache.fed = rest.len();
             // The body cap is the decoded body's, as it is a declared length's, and it is held as
@@ -183,14 +192,14 @@ pub(crate) fn complete_message(
 ///
 /// `emit` asks whether the message is whole on EVERY chunk, and the header prefix does not change
 /// between those asks: its end and framing are held here, and taken when the message completes so
-/// they can never outlive it. Also this connection's own count of how many times it has parsed a
-/// head — the cell that pins the egress side to one parse per message rather than one per `emit`
-/// call. Per instance rather than a crate-global counter, so a test reading it back sees only its
-/// own connection's work, never a sibling test's sharing the same binary.
+/// they can never outlive it. A test build also tallies the work done here (heads parsed, bytes
+/// fed to a decoder, bytes searched for a head's end), per instance rather than crate-global so a
+/// test reading it back sees only its own connection's work.
 #[derive(Default)]
 pub(crate) struct EgressHead {
     /// Where the parsed head ends, and how its body is framed.
     pub(crate) head: Option<(usize, raw::BodyFraming)>,
+    #[cfg(test)]
     pub(crate) parses: usize,
     /// The chunked decoder this message is being decoded by, kept across `emit` calls so each
     /// call feeds only the bytes that arrived with it. Behind a box because it is a per-message working set that most
@@ -198,37 +207,28 @@ pub(crate) struct EgressHead {
     pub(crate) decoder: Option<Box<raw::ChunkedDecoder>>,
     /// How many bytes past the header block have already been fed to `decoder`.
     pub(crate) fed: usize,
-    /// This connection's own tally of bytes fed to a decoder, per instance for the same reason
-    /// `parses` is: a test reading it back sees only its own connection's work.
+    #[cfg(test)]
     pub(crate) feeds: usize,
-    /// This connection's own tally of bytes the header-end search examined, per instance for the
-    /// same reason.
+    #[cfg(test)]
     pub(crate) scanned: usize,
     /// How far into the pending bytes the header-end search has already looked without finding the
     /// end: the next call resumes there.
     pub(crate) searched: usize,
 }
 
-/// The offset just past the blank line that ends a header block, searching from `start`, alongside
-/// how many bytes of `buf` this call examined — the pair a caller uses to pin the scan's own
-/// complexity class without a process-global counter racing every other test in the binary.
+/// The offset just past the blank line that ends a header block, searching from `start`.
 ///
 /// The search JUMPS between line feeds rather than stepping a four-byte window over every position;
 /// the terminator's last byte is one, so no candidate is skipped. `start` may sit anywhere in the
 /// buffer: the match looks BACKWARD from the line feed it found, so a caller resuming a scan never
 /// has to have kept the three bytes before it in view.
-pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> (Option<usize>, usize) {
+fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start.min(buf.len());
-    let scanned = buf.len() - i;
-    let found = loop {
-        let Some(rel) = memchr::memchr(b'\n', &buf[i..]) else {
-            break None;
-        };
-        let at = i + rel;
+    loop {
+        let at = i + memchr::memchr(b'\n', &buf[i..])?;
         if at >= 3 && &buf[at - 3..=at] == b"\r\n\r\n" {
-            break Some(at + 1);
+            return Some(at + 1);
         }
         i = at + 1;
-    };
-    (found, scanned)
+    }
 }
