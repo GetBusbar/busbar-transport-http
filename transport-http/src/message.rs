@@ -80,10 +80,11 @@ pub(crate) fn request_target(
 }
 
 /// A whole request message: where its head ends in the buffered bytes (the head is read in place
-/// from them, `raw::Head::parse`), and its body, a chunked one already decoded.
+/// from them, `raw::Head::parse`), and a chunked body decoded. `decoded` is `None` for a
+/// `Content-Length` body: it is the rest of the buffered bytes, where it already lies.
 pub(crate) struct Whole {
     pub(crate) head_end: usize,
-    pub(crate) body: Vec<u8>,
+    pub(crate) decoded: Option<Vec<u8>>,
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
@@ -128,7 +129,7 @@ pub(crate) fn complete_message(
     };
     let rest = &buffered[head_end..];
 
-    let body = match framing {
+    let decoded = match framing {
         raw::BodyFraming::Chunked => {
             // ONE decoder across the calls, fed only what arrived with this one. A fresh decoder
             // per call re-decodes every byte received so far — quadratic in the body.
@@ -150,7 +151,7 @@ pub(crate) fn complete_message(
             if used < fresh.len() {
                 return Err("bytes past the end of the message");
             }
-            cache.decoder.take().expect("set just above").take()
+            Some(cache.decoder.take().expect("set just above").take())
         }
         raw::BodyFraming::Length(declared) => {
             if declared > max_body_bytes {
@@ -164,7 +165,7 @@ pub(crate) fn complete_message(
             if rest.len() > declared {
                 return Err("bytes past the end of the message");
             }
-            rest.to_vec()
+            None
         }
     };
 
@@ -174,7 +175,7 @@ pub(crate) fn complete_message(
     cache.decoder = None;
     cache.fed = 0;
     cache.searched = 0;
-    Ok(Some(Whole { head_end, body }))
+    Ok(Some(Whole { head_end, decoded }))
 }
 
 /// Where the message the door's `emit` is still accumulating stands.
