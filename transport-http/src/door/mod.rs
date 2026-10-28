@@ -144,7 +144,7 @@ const HTTP_ROW: Claim = Claim {
     session_bound: 0,
     unit0_trigger: 0,
     status_at: STATUS_AT_FIRST_FRAME,
-    _reserved: 0,
+    ..Claim::ZERO
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
@@ -162,7 +162,7 @@ pub(crate) const CLAIMS: &[Claim] = &[
         session_bound: 0,
         unit0_trigger: 0,
         status_at: STATUS_AT_FIRST_FRAME,
-        _reserved: 0,
+        ..Claim::ZERO
     },
     HTTP_ROW,
 ];
@@ -872,16 +872,19 @@ impl SafeSlot for Encode {
             };
             pairs.push((name, f.field(|x| &x.value).bytes()));
         }
-        let Ok(bytes) = crate::transport::render_envelope(&pairs, i.body()) else {
+        let body = i.body();
+        let Ok(head) = crate::transport::render_head(&pairs, body.len()) else {
             o.error("encode: the envelope cannot be expressed on this wire");
             return Outcome::Failed;
         };
         let mut wire = i.field(|x| &x.sink).wire();
-        if bytes.len() > wire.cap() {
+        if head.len().saturating_add(body.len()) > wire.cap() {
             o.error("encode: the rendered message is larger than the wire buffer");
             return Outcome::Failed;
         }
-        wire.extend(&bytes);
+        // The head, then the body straight from the host's own buffer: the one copy is the wire's.
+        wire.extend(&head);
+        wire.extend(body);
         o.set(|x| &x.yielded.wire_len, wire.written() as u64);
         Outcome::Ready
     }

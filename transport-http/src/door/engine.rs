@@ -33,7 +33,7 @@ use hyper::client::conn::{http1, http2};
 use hyper::rt::{Executor, Sleep};
 use zeroize::Zeroizing;
 
-use crate::raw::RawStartLine;
+use crate::raw::Head;
 use crate::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// Which HTTP a framing speaks, as connection security (or the operator's cleartext key) agreed it.
@@ -75,10 +75,11 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// the wait for the connection, the head and every byte of the body spend the same clock.
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
-    /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
-    /// gone), and when it grows (`append_zeroizing`). Only this buffer is wiped: the parsed head
-    /// (`EgressHead`), the `RawMessage` and the `http::Request` built from it still hold header
-    /// values in ordinary memory, until credentials stop reaching the framer as plaintext.
+    /// The raw buffer is zeroed when it is dropped (the message refused, or the framing gone), and
+    /// when it grows (`append_zeroizing`); a whole message's head span is zeroed and its body
+    /// handed on in place (`Framing::message`). The head is read in place from it
+    /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
+    /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
     Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
@@ -346,27 +347,40 @@ impl Framing {
         }
         let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
             .map_err(|e| Failure(format!("request message: {e}")))?;
-        let Some(mut raw) = raw else { return Ok(()) };
-        let RawStartLine::Request { method, path } = &raw.start else {
-            return Err(Failure("a status line is not a request".into()));
-        };
+        let Some(whole) = raw else { return Ok(()) };
+        // Read once already (`complete_message`), so this second read of the same bytes is the
+        // same head: the request is built from it in place, nothing copied out but by `http`.
+        let parsed = Head::parse(&buf[..whole.head_end])
+            .map_err(|e| Failure(format!("request message: {e}")))?;
         // The path is not repeated: a path (and its query) may carry a token.
-        let target = request_target(&self.dial, path.as_deref(), !self.carried)
+        let target = request_target(&self.dial, parsed.path, !self.carried)
             .map_err(|e| Failure(format!("request target: {e}")))?;
-        let mut b = http::Request::builder().method(method.as_str()).uri(target);
-        for (k, v) in &raw.headers {
+        let mut b = http::Request::builder().method(parsed.method).uri(target);
+        for (k, v) in parsed.fields() {
             // A chunked body was decoded by `complete_message`, so its coding describes the wire
             // it was written for, not the one going out: hyper frames the body by its length, as
             // 1.5.5's client sent a decoded body on (`crates/busbar/src/proxy/engine/walk.rs:592`).
-            if k.eq_ignore_ascii_case("transfer-encoding") {
+            if k.eq_ignore_ascii_case(b"transfer-encoding") {
                 continue;
             }
             // Every other line goes out as stated. The length line is the one the auth saw (THE
             // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
-            b = b.header(k.as_str(), v.as_slice());
+            b = b.header(k, v);
         }
+        let body = match whole.decoded {
+            Some(decoded) => Bytes::from(decoded),
+            // The body goes on as it lies in the buffer, not copied. The head before it is the
+            // span that carries credentials (an `authorization` field, a token in the target) and
+            // it is in the request's own fields now: wiped where it was read. A decoded chunked
+            // body leaves its framed bytes in `buf`, wiped whole as the stage goes.
+            None => {
+                let mut bytes = std::mem::take(&mut **buf);
+                zeroize::Zeroize::zeroize(&mut bytes[..whole.head_end]);
+                Bytes::from(bytes).slice(whole.head_end..)
+            }
+        };
         let mut req = b
-            .body(Full::new(Bytes::from(std::mem::take(&mut raw.body))))
+            .body(Full::new(body))
             .map_err(|e| Failure(format!("request: {e}")))?;
         target_form(&mut req, self.proto)?;
         // Spent only by a request that was built: one the builder refuses leaves the dial path to
