@@ -6,6 +6,10 @@
 //! `encode` answers, the bytes the egress cross-check reads. The framing itself is the door's
 //! (`crate::door::engine`).
 
+use std::io::Write as _;
+
+use zeroize::Zeroizing;
+
 /// An RFC 9110 `token`: one or more `tchar`. A field name is one; anything else (a `:`, a space,
 /// a control byte, a non-ASCII byte) is not a name this wire can carry back out unchanged.
 fn is_token(name: &[u8]) -> bool {
@@ -32,18 +36,21 @@ fn is_token(name: &[u8]) -> bool {
         })
 }
 
-/// Render an outbound envelope (`fields`, post-decoration) and `body` as one HTTP/1.1 request
-/// message: the bytes the egress cross-check reads, whichever door rendered them.
+/// Render the head of the one HTTP/1.1 request message an outbound envelope (`fields`,
+/// post-decoration) with a `body_len`-byte body makes: the request line, the fields and the
+/// transport's own `content-length`, through the blank line. The body follows it on the wire
+/// as it is, so `encode` writes the head and then the body straight into the wire buffer. The head
+/// carries the credential fields: it is wiped as it drops.
 ///
 /// # Errors
 ///
 /// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
 /// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
 /// reparse): `Encode::Unrepresentable`.
-pub(crate) fn render_envelope(
+pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
-    body: &[u8],
-) -> Result<Vec<u8>, busbar_contract::transport::wire::Encode> {
+    body_len: usize,
+) -> Result<Zeroizing<Vec<u8>>, busbar_contract::transport::wire::Encode> {
     let field = |name: &str| {
         fields
             .iter()
@@ -66,13 +73,15 @@ pub(crate) fn render_envelope(
     if !clean(method) || !clean(path) {
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
+    let mut size = method.len() + path.len() + 64;
     for (name, value) in fields {
         if !is_token(name.as_bytes()) || !clean(value) {
             return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
         }
+        size += name.len() + value.len() + 4;
     }
 
-    let mut out = Vec::with_capacity(body.len() + 128);
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
     out.extend_from_slice(method);
     out.push(b' ');
     out.extend_from_slice(path);
@@ -88,8 +97,17 @@ pub(crate) fn render_envelope(
     }
     // The length is this transport's to state: it is a fact about the bytes below, not
     // something an envelope gets to disagree with.
-    out.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"\r\n");
+    write!(out, "content-length: {body_len}\r\n\r\n").expect("a Vec takes every byte");
+    Ok(out)
+}
+
+/// The whole message, head and body, for a test to read back.
+#[cfg(test)]
+pub(crate) fn render_envelope(
+    fields: &[(&str, &[u8])],
+    body: &[u8],
+) -> Result<Vec<u8>, busbar_contract::transport::wire::Encode> {
+    let mut out = render_head(fields, body.len())?.to_vec();
     out.extend_from_slice(body);
     Ok(out)
 }

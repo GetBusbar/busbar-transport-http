@@ -8,6 +8,15 @@
 
 use super::*;
 
+impl crate::message::Whole {
+    /// The body, where it lies: decoded, or the rest of the buffered bytes.
+    fn body<'b>(&'b self, buffered: &'b [u8]) -> &'b [u8] {
+        self.decoded
+            .as_deref()
+            .unwrap_or(&buffered[self.head_end..])
+    }
+}
+
 /// Both RFC 9110 forms, and nothing else. A value nobody can read is a value nobody asked for.
 #[test]
 fn retry_after_parses_both_normative_forms() {
@@ -132,7 +141,7 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
         .unwrap()
         .expect("the terminal chunk completes the message");
     assert_eq!(
-        done.body.len(),
+        done.body(&buffered).len(),
         CALLS * 16,
         "the body is decoded byte-exact"
     );
@@ -186,7 +195,8 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
                  smuggling PAIR, not chunked encoding on its own",
         );
     assert_eq!(
-        done.body, b"abc",
+        done.body(clean),
+        b"abc",
         "the clean chunked body still decodes byte-exact"
     );
 }
@@ -253,7 +263,7 @@ fn the_envelope_encodes_as_an_http_message() {
         .expect("a message it can read");
     let parsed = raw::Head::parse(&bytes[..whole.head_end]).expect("a head it can read");
     assert_eq!((parsed.method, parsed.path), ("POST", Some("/v1/messages")));
-    assert_eq!(whole.body, b"{\"model\":\"m\"}");
+    assert_eq!(whole.body(&bytes), b"{\"model\":\"m\"}");
 }
 
 /// An envelope naming NO path is not one that named `/`: it renders an empty target word and reads
@@ -353,7 +363,7 @@ fn a_chunked_request_body_is_held_to_the_body_cap() {
     let done = complete_message(whole, &mut cache, 5, usize::MAX)
         .unwrap()
         .expect("a body at the cap is whole");
-    assert_eq!(done.body, b"abcde");
+    assert_eq!(done.body(whole), b"abcde");
     let mut cache = EgressHead::default();
     assert_eq!(
         complete_message(whole, &mut cache, 4, usize::MAX).unwrap_err(),
