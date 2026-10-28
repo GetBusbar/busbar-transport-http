@@ -64,7 +64,7 @@ impl<'a> Head<'a> {
         let mut all = lines(block);
         let first = std::str::from_utf8(all.next().ok_or(UNPARSABLE)?).map_err(|_| UNPARSABLE)?;
         // The start line and every field name are text; a field VALUE is bytes (RFC 9110 5.5:
-        // obs-text is a value's, and 1.5.5's client carried such a value as given).
+        // obs-text is a value's, and such a value is carried as given).
         for line in all {
             let (name, _) = split_field(line).ok_or(UNPARSABLE)?;
             let name = std::str::from_utf8(name).map_err(|_| UNPARSABLE)?;
@@ -174,8 +174,8 @@ impl<'a> Head<'a> {
 /// between the terminal chunk and its trailers. A decoder that re-scanned the whole buffer on every
 /// read would be quadratic in the body size. A chunk's data is taken a slice at a time and a line
 /// is found with `memchr`. The trailer section is read for its grammar and discarded: RFC 9110
-/// §6.5.1 lets a recipient that removes the chunked coding discard its trailers, and THE DESIGN §5
-/// carries no trailer on the transport ABI.
+/// §6.5.1 lets a recipient that removes the chunked coding discard its trailers, and the transport
+/// ABI carries no trailer.
 #[derive(Default)]
 pub(crate) struct ChunkedDecoder {
     state: ChunkState,
