@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE REQUEST TARGET, AS 1.5.5 SENT IT. 1.5.5 built an upstream URL as text and handed it to its
-//! client, whose URL parser serialised the path and query: a space in a model name went out as
-//! `%20`, never refused. [`encode_target`] writes a target the same way, byte for byte, for an
-//! `http(s)` URL (the WHATWG URL rules the parser follows for a special scheme):
+//! The request target as the URL parser serialises it: a space in a model name goes out as `%20`,
+//! never refused. [`encode_target`] writes a target that way, byte for byte, for an `http(s)` URL
+//! (the WHATWG URL rules the parser follows for a special scheme):
 //!
 //! * the path: a `\` is a `/`; `.` and `..` segments (and their `%2e` spellings) are resolved; C0
 //!   controls, space, `"`, `<`, `>`, `` ` ``, `{`, `}`, DEL and every non-ASCII byte are
@@ -45,7 +44,7 @@ fn is_dot_dot(seg: &[u8]) -> bool {
             .any(|d| seg.eq_ignore_ascii_case(d))
 }
 
-/// `target` as 1.5.5's client wrote it on the request line.
+/// `target` as written on the request line.
 ///
 /// # Errors
 ///
