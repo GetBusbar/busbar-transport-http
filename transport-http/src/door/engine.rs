@@ -75,8 +75,9 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// the wait for the connection, the head and every byte of the body spend the same clock.
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
-    /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
-    /// gone), and when it grows (`append_zeroizing`). The head is read in place from it
+    /// The raw buffer is zeroed when it is dropped (the message refused, or the framing gone), and
+    /// when it grows (`append_zeroizing`); a whole message's head span is zeroed and its body
+    /// handed on in place (`Framing::message`). The head is read in place from it
     /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
     /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
     Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
@@ -320,8 +321,20 @@ impl Framing {
             }
             b = b.header(k, v);
         }
+        let body = match whole.decoded {
+            Some(decoded) => Bytes::from(decoded),
+            // The body goes on as it lies in the buffer, not copied. The head before it is the
+            // span that carries credentials (an `authorization` field, a token in the target) and
+            // it is in the request's own fields now: wiped where it was read. A decoded chunked
+            // body leaves its framed bytes in `buf`, wiped whole as the stage goes.
+            None => {
+                let mut bytes = std::mem::take(&mut **buf);
+                zeroize::Zeroize::zeroize(&mut bytes[..whole.head_end]);
+                Bytes::from(bytes).slice(whole.head_end..)
+            }
+        };
         let mut req = b
-            .body(Full::new(Bytes::from(whole.body)))
+            .body(Full::new(body))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
         // Spent only by a request that was built: one the builder refuses leaves the dial path to
