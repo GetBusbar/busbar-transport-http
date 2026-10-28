@@ -90,15 +90,14 @@ busbar_contract::own_seal!(Own);
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
-use std::sync::{PoisonError, RwLock};
+use std::borrow::Cow;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use std::task::Poll;
 
 use busbar_contract::abi::host::service::{AuthRef, UnitRef};
-use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, InHead, OutHead, Outcome, BLOB_OCTETS, FLAG_RESUME,
-};
+use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
 use busbar_contract::abi::mechanism::lifecycle::{
     CancelIn, CancelOut, DriveIn, GenIn, OpenIn, OpenOut, RefreshIn, ReleaseIn, TickIn, TickOut,
@@ -106,7 +105,7 @@ use busbar_contract::abi::mechanism::lifecycle::{
 };
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
-use busbar_contract::abi::sdk::life::Refusal;
+use busbar_contract::abi::sdk::life::{settings_object, Refusal};
 use busbar_contract::abi::sdk::services::{
     HeadViewArgs, Pend, RefusalCopy, ServiceError, Services,
 };
@@ -134,7 +133,7 @@ use hyper_io::{fill, mark_stream_full, Owed};
 // ── the statement ────────────────────────────────────────────────────────────────────────────────
 
 /// The settings this transport reads, at their 1.5.5 paths.
-pub(crate) mod setting {
+pub mod setting {
     /// Force cleartext HTTP/2 prior knowledge.
     pub const H2_PRIOR_KNOWLEDGE: &str = "advanced.upstream_h2_prior_knowledge";
     /// Pin the connection to HTTP/1.1.
@@ -318,67 +317,62 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
-/// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
-/// THE AUTH POINTS THIS DOOR OFFERS (THE DESIGN §6 "Auth points and guest lists" item 1: "A
-/// transport declares the points it offers"; Q128 reader B r212, coordinator ruling): `Peer` (once
-/// per connection, before any head, under the Peer rule: the call carries no request and its
-/// answer no field or name, `door::accept`), `Head` and `HeadBody`. Stated in the Statement's
-/// `extensions` under the transport ABI's offered-points key ([`EXT_OFFERED_POINTS`]); with no
-/// record the host reads `{Head, HeadBody}` and refuses at boot a line whose auth needs `Peer`.
-const OFFERED_POINTS: u32 = busbar_contract::abi::auth::POINT_PEER
+/// THE AUTH POINTS THIS DOOR OFFERS: `Peer` (once per connection, before any head: the call
+/// carries no request and its answer no field or name, `door::accept`), `Head` and `HeadBody`.
+/// With no record the host reads `{Head, HeadBody}` and refuses at boot a line whose auth needs
+/// `Peer`.
+const OFFERED_POINTS: [u8; 4] = (busbar_contract::abi::auth::POINT_PEER
     | busbar_contract::abi::auth::POINT_HEAD
-    | busbar_contract::abi::auth::POINT_HEAD_BODY;
+    | busbar_contract::abi::auth::POINT_HEAD_BODY)
+    .to_le_bytes();
 
-const OFFERED_POINTS_LEN: usize = busbar_contract::abi::mechanism::extensions::entry_len(
-    EXT_OFFERED_POINTS,
-    &OFFERED_POINTS.to_le_bytes(),
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document, and the auth points
+    /// it offers.
+    EXTENSIONS: [
+        (
+            busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+            include_bytes!("../../declares.json")
+        ),
+        (EXT_OFFERED_POINTS, &OFFERED_POINTS),
+    ]
 );
 
-/// The Statement's `extensions` blob: the offered-points record, its one entry.
-const EXTENSIONS: &[u8] = &busbar_contract::abi::mechanism::extensions::entry::<OFFERED_POINTS_LEN>(
-    EXT_OFFERED_POINTS,
-    &OFFERED_POINTS.to_le_bytes(),
-);
-
-pub(crate) const STATEMENT: Statement = Statement {
+/// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
+pub const STATEMENT: Statement = Statement {
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
-    extensions: Blob {
-        ptr: EXTENSIONS.as_ptr(),
-        len: EXTENSIONS.len(),
-        fmt: BLOB_OCTETS,
-        flags: 0,
-    },
+    extensions: EXTENSIONS,
     ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
 // ── the instance ─────────────────────────────────────────────────────────────────────────────────
 
-/// What the settings say: read by `open`, and read again, whole, by every `refresh`.
-#[derive(Clone, Copy)]
-struct Settings {
-    posture: Posture,
-    prior_knowledge: bool,
-    http1_only: bool,
-}
-
-/// The settings in force, and the framings the instance holds.
-pub(crate) struct Instance {
-    /// Swapped whole by `refresh`; read once by each op that dials or offers, so one op never sees
-    /// half of one reload and half of the next.
-    settings: RwLock<Settings>,
-    /// Reached by token alone, with no instance-wide lock (audit A1 F6, `framings`).
+/// What `open` read from the settings (and the last good `refresh` replaced), and the framings it
+/// holds.
+pub struct Instance {
+    settings: Mutex<Settings>,
     framings: Framings,
     /// The host services `open` was handed (`OpenIn::host`): the auth handle an accepted side
     /// admits its requests through. `None`: the host offers none, and no request is admitted.
     services: Option<Services>,
 }
 
+/// The settings as read: the posture every framing begun under them carries, and the two keys
+/// that choose the protocol offer.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Settings {
+    posture: Posture,
+    prior_knowledge: bool,
+    http1_only: bool,
+}
+
 impl Instance {
-    /// The settings in force now.
+    /// The settings in force: what `open` read, or the last good `refresh`. Held only to copy them,
+    /// by `locate` and `begin` (per connection, never per chunk).
     fn settings(&self) -> Settings {
-        *self.settings.read().unwrap_or_else(PoisonError::into_inner)
+        *self.settings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -395,28 +389,53 @@ fn declared_count(path: &str) -> u64 {
         .expect("a declared count setting with a numeric default")
 }
 
-/// The settings blob's bytes, parsed; `Err` names, by its path, the first one that is not what its
-/// declaration says (the host renders the path instance-relative). An absent blob reads as `{}`.
-fn read_settings(bytes: &[u8]) -> Result<Settings, String> {
-    let text: &[u8] = if bytes.is_empty() { b"{}" } else { bytes };
-    let v: serde_json::Value =
-        serde_json::from_slice(text).map_err(|_| "settings: not JSON".to_owned())?;
+/// What a bad value of the count setting `path` is told (zero is a bad value).
+fn bad_count(path: &str) -> &'static str {
+    if path == setting::BODY_MAX_BYTES {
+        "settings: limits.request_body_max_bytes must be a count of bytes above 0"
+    } else {
+        "settings: limits.upstream_request_timeout_secs must be a count of seconds above 0"
+    }
+}
+
+/// The settings blob's bytes, parsed (`validate`, `open` and `refresh` alike); `Err` is the first
+/// thing wrong with it, in the words the settings texts share: a blob that is not a JSON object, a
+/// key this transport does not declare, a value its declaration refuses. An absent blob reads as
+/// `{}`.
+fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Cow<'static, str>> {
+    let v = settings_object(bytes).map_err(|r| {
+        Cow::Owned(
+            r.text()
+                .unwrap_or("settings: must be a JSON object")
+                .to_owned(),
+        )
+    })?;
+    if let Some(k) = v
+        .keys()
+        .find(|k| !SETTING_ROWS.iter().any(|(p, _, _)| p == k))
+    {
+        return Err(format!("settings: {k} is not a setting this transport reads").into());
+    }
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
-        Some(x) => x.as_bool().ok_or(k),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| Cow::Owned(format!("settings: {k} must be true or false"))),
     };
     // An absent count reads as the default its declaration states (`SETTINGS`): one source.
     let count = |k: &'static str| match v.get(k) {
         None => Ok(declared_count(k)),
-        Some(x) => x.as_u64().ok_or(k),
+        Some(x) => x
+            .as_u64()
+            .filter(|n| *n > 0)
+            .ok_or(Cow::Borrowed(bad_count(k))),
     };
-    let err = |k: &str| format!("{k}: not of its declared kind");
-    let prior = flag(setting::H2_PRIOR_KNOWLEDGE).map_err(err)?;
-    let h1 = flag(setting::HTTP1_ONLY).map_err(err)?;
-    let secs = count(setting::REQUEST_TIMEOUT_SECS).map_err(err)?;
-    let max = count(setting::BODY_MAX_BYTES).map_err(err)?;
-    Ok(Settings {
-        posture: Posture {
+    let prior = flag(setting::H2_PRIOR_KNOWLEDGE)?;
+    let h1 = flag(setting::HTTP1_ONLY)?;
+    let secs = count(setting::REQUEST_TIMEOUT_SECS)?;
+    let max = count(setting::BODY_MAX_BYTES)?;
+    Ok((
+        Posture {
             // 1.5.5's egress client: keep-alive ping every 30s, 10s to answer, adaptive window on.
             keep_alive_interval: Some(Duration::from_secs(30)),
             keep_alive_timeout: Duration::from_secs(10),
@@ -424,8 +443,17 @@ fn read_settings(bytes: &[u8]) -> Result<Settings, String> {
             request_timeout: Duration::from_secs(secs),
             max_body_bytes: usize::try_from(max).unwrap_or(usize::MAX),
         },
-        prior_knowledge: prior,
-        http1_only: h1,
+        prior,
+        h1,
+    ))
+}
+
+/// [`read_settings`], as the instance holds them.
+fn settings_of(bytes: &[u8]) -> Result<Settings, Cow<'static, str>> {
+    read_settings(bytes).map(|(posture, prior_knowledge, http1_only)| Settings {
+        posture,
+        prior_knowledge,
+        http1_only,
     })
 }
 
@@ -434,7 +462,7 @@ macro_rules! slot {
     ($(#[$doc:meta])* $name:ident, $in:ty, $out:ty,
      |$inst:pat_param, $input:pat_param, $o:ident| $body:block) => {
         $(#[$doc])*
-        pub(crate) struct $name;
+        pub struct $name;
         impl SafeSlot for $name {
             type In = $in;
             type Out = $out;
@@ -464,17 +492,35 @@ slot!(
 slot!(
     /// `open`.
     Open, OpenIn, OpenOut, |instance, i, o| {
-        match read_settings(i.field(|x| &x.settings).bytes()) {
+        match settings_of(i.field(|x| &x.settings).bytes()) {
             Ok(settings) => {
                 let services = i.host().and_then(|h| Services::of(h.get()));
                 instance.open(Instance {
-                    settings: RwLock::new(settings),
+                    settings: Mutex::new(settings),
                     framings: Framings::default(),
                     services,
                 });
                 Outcome::Ready
             }
             // The owned text rides the host's lent reason buffer (`ValidateIn`/`OpenIn::err_buf`).
+            Err(e) => o.fail(Refusal::failed(e)),
+        }
+    }
+);
+
+slot!(
+    /// `refresh`: the new settings, read with `validate`'s texts. A bad blob is FAILED and the
+    /// settings in force stay; good ones apply to every framing begun after it (a framing already
+    /// begun keeps the posture it began under).
+    Refresh, RefreshIn, OutHead, |instance, i, o| {
+        let Some(inst) = instance.get() else {
+            return o.fail(Refusal::failed("refresh: no open instance"));
+        };
+        match settings_of(i.field(|x| &x.settings).bytes()) {
+            Ok(s) => {
+                *inst.settings.lock().unwrap_or_else(PoisonError::into_inner) = s;
+                Outcome::Ready
+            }
             Err(e) => o.fail(Refusal::failed(e)),
         }
     }
@@ -532,39 +578,39 @@ macro_rules! answer {
     };
 }
 
-slot!(
-    /// `refresh`: the reload's settings, read as `open` reads them, replace the ones in force for
-    /// every framing begun after it (a framing already begun keeps the posture it was dialled with,
-    /// as a connection 1.5.5's client had open kept its own). A blob `open` would refuse is refused
-    /// with the same words, and the settings in force stay: a reload never half-applies.
-    Refresh, RefreshIn, OutHead, |instance, i, o| {
-        let Some(inst) = instance.get() else {
-            return Outcome::Fault;
-        };
-        match read_settings(i.field(|x| &x.settings).bytes()) {
-            Ok(settings) => {
-                *inst.settings.write().unwrap_or_else(PoisonError::into_inner) = settings;
-                Outcome::Ready
-            }
-            Err(e) => o.fail(Refusal::failed(e)),
-        }
-    }
-);
 answer!(Retire, GenIn, OutHead, Outcome::Ready);
 answer!(Drive, DriveIn, OutHead, Outcome::Ready);
 answer!(Release, ReleaseIn, OutHead, Outcome::Ready);
 
+/// A stub for an op of the role this framer does not play: REFUSED, naming the op.
+macro_rules! not_served {
+    ($name:ident, $in:ty, $out:ty, $op:literal) => {
+        slot!(
+            #[doc = concat!("`", $op, "`: REFUSED, the http framer does not serve it.")]
+            $name,
+            $in,
+            $out,
+            |_, _, o| {
+                o.fail(Refusal::refused(concat!(
+                    $op,
+                    ": the http framer does not serve this op"
+                )))
+            }
+        );
+    };
+}
+
 // A framer is not a carrier: every carrier op is refused.
-answer!(Listen, ListenIn, ListenOut, Outcome::Refused);
-answer!(Accept, AcceptIn, AcceptOut, Outcome::Refused);
-answer!(Dial, DialIn, ConnOut, Outcome::Refused);
-answer!(Read, ReadIn, IoOut, Outcome::Refused);
-answer!(Write, WriteIn, IoOut, Outcome::Refused);
-answer!(Flush, ConnIn, OutHead, Outcome::Refused);
-answer!(Shut, ShutIn, OutHead, Outcome::Refused);
-answer!(Arrival, ArrivalIn, ArrivalOut, Outcome::Refused);
+not_served!(Listen, ListenIn, ListenOut, "listen");
+not_served!(Accept, AcceptIn, AcceptOut, "accept");
+not_served!(Dial, DialIn, ConnOut, "dial");
+not_served!(Read, ReadIn, IoOut, "read");
+not_served!(Write, WriteIn, IoOut, "write");
+not_served!(Flush, ConnIn, OutHead, "flush");
+not_served!(Shut, ShutIn, OutHead, "shut");
+not_served!(Arrival, ArrivalIn, ArrivalOut, "arrival");
 // No adoption: nothing switches TO http.
-answer!(Adopt, AdoptIn, FramerOut, Outcome::Refused);
+not_served!(Adopt, AdoptIn, FramerOut, "adopt");
 
 /// `refuse`: THE HOST'S REFUSAL on an ACCEPTED connection (the transport ABI's `RefuseIn`; Q128
 /// reader B finding 2, ruling 22), for a stream the host was handed or the whole connection
@@ -594,6 +640,7 @@ impl SafeSlot for Refuse {
         let stream = (i.has_stream != 0).then_some(i.stream);
         let (status, head_sent) = (i.status, i.head_sent != 0);
         with(
+            "refuse",
             &p,
             i.head,
             false,
@@ -670,6 +717,9 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     else {
         return Err("locate: the target is not a URL");
     };
+    if carries_userinfo(&uri) {
+        return Err("locate: the target carries userinfo; credentials never ride a URL");
+    }
     let secure = match uri.scheme_str() {
         Some("https") => true,
         Some("http") => false,
@@ -688,26 +738,31 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     Ok((secure, authority, offered_name(host)))
 }
 
+/// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a
+/// URL, so `locate` and `begin` refuse it rather than drop it.
+fn carries_userinfo(uri: &http::Uri) -> bool {
+    uri.authority().is_some_and(|a| a.as_str().contains('@'))
+}
+
 /// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
 /// its URL parser (WHATWG, reqwest 0.12) turned every IPv4 spelling into the dotted quad before it
 /// connected, so `https://127.1/` was verified against `127.0.0.1` and `https://16909060/` against
 /// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
 /// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
 /// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal, a dotted quad) is
-/// offered as written.
+/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal) is offered ASCII
+/// lower-cased, as WHATWG lower-cases it (`https://API.Example.com/` went out as `api.example.com`).
 fn offered_name(host: &str) -> String {
     let bare = host.strip_suffix('.').unwrap_or(host);
-    // An IP literal (a canonical dotted quad, or an IPv6 address, the only spellings
-    // `is_ip_literal` accepts) is offered as written.
-    if busbar_contract::net::is_ip_literal(bare) {
-        return bare.to_owned();
+    if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
+        return v4.to_string();
     }
-    sdk::net::expand_alternate_ipv4(bare).map_or_else(|| host.to_owned(), |v4| v4.to_string())
+    sdk::net::expand_alternate_ipv4(bare)
+        .map_or_else(|| host.to_ascii_lowercase(), |v4| v4.to_string())
 }
 
 /// `locate`.
-pub(crate) struct Locate;
+pub struct Locate;
 impl SafeSlot for Locate {
     type In = LocateIn;
     type Out = LocateOut;
@@ -771,8 +826,8 @@ impl SafeSlot for Locate {
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
-        // THE LENGTH LINE is the host's to state, before the auth (THE DESIGN §6 step 5): for a
-        // fixed, non-empty body, last, after these lines. `encode` renders it and adds none.
+        // The length line is the host's to state, before the auth: for a fixed, non-empty body,
+        // last, after these lines. `encode` renders it and adds none.
         o.set(|x| &x.states_length, 1u8);
         o.set(|x| &x.defaults_written, dw as u64);
         o.set(|x| &x.defaults_needed, dnd as u64);
@@ -785,7 +840,7 @@ impl SafeSlot for Locate {
 }
 
 /// `begin`.
-pub(crate) struct Begin;
+pub struct Begin;
 impl SafeSlot for Begin {
     type In = BeginIn;
     type Out = FramerOut;
@@ -796,6 +851,7 @@ impl SafeSlot for Begin {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let Some(inst) = p.get() else {
+            o.error("begin: no open instance");
             return Outcome::Failed;
         };
         let settings = inst.settings();
@@ -828,7 +884,9 @@ impl SafeSlot for Begin {
                     .with_scheme(scheme)
                     .with_alpn(alpn),
             );
-            let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
+            let r = step("begin", &mut h, i.field(|x| &x.sink), &mut o, None, |_| {
+                Ok(())
+            });
             if r != Outcome::Ready {
                 return r;
             }
@@ -860,6 +918,13 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not text");
             return Outcome::Failed;
         };
+        if target
+            .parse::<http::Uri>()
+            .is_ok_and(|u| carries_userinfo(&u))
+        {
+            o.error("begin: the target carries userinfo; credentials never ride a URL");
+            return Outcome::Failed;
+        }
         let Ok(framing) = Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
         else {
             o.error("begin: the target is not a URL");
@@ -868,7 +933,9 @@ impl SafeSlot for Begin {
         // The framing joins the instance's table only once its first step is READY: a begin that
         // fails hands the host no token, so nothing would ever release an entry it left behind.
         let mut h = Held::Dial(framing);
-        let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
+        let r = step("begin", &mut h, i.field(|x| &x.sink), &mut o, None, |_| {
+            Ok(())
+        });
         if r != Outcome::Ready {
             return r;
         }
@@ -882,7 +949,7 @@ impl SafeSlot for Begin {
 }
 
 /// `ingest`.
-pub(crate) struct Ingest;
+pub struct Ingest;
 impl SafeSlot for Ingest {
     type In = IngestIn;
     type Out = FramerOut;
@@ -894,6 +961,7 @@ impl SafeSlot for Ingest {
     ) -> Outcome {
         let bytes = i.bytes();
         with(
+            "ingest",
             &p,
             i.head,
             true,
@@ -912,7 +980,7 @@ impl SafeSlot for Ingest {
 }
 
 /// `emit`.
-pub(crate) struct Emit;
+pub struct Emit;
 impl SafeSlot for Emit {
     type In = EmitIn;
     type Out = FramerOut;
@@ -926,6 +994,7 @@ impl SafeSlot for Emit {
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
         let mut full = false;
         let r = with(
+            "emit",
             &p,
             i.head,
             true,
@@ -955,7 +1024,7 @@ impl SafeSlot for Emit {
 }
 
 /// `timer`.
-pub(crate) struct Timer;
+pub struct Timer;
 impl SafeSlot for Timer {
     type In = FramingIn;
     type Out = FramerOut;
@@ -966,6 +1035,7 @@ impl SafeSlot for Timer {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         with(
+            "timer",
             &p,
             i.head,
             false,
@@ -1006,10 +1076,7 @@ impl SafeSlot for Detach {
         };
         let mut slot = match inst.framings.reach(i.framing) {
             Ok(slot) => slot,
-            Err(why) => {
-                o.error(why.why());
-                return Outcome::Failed;
-            }
+            Err(why) => return failed(&mut o, format!("detach: {}", why.why())),
         };
         let Held::Accept(a) = slot.held() else {
             o.error("detach: a dialled http connection does not switch");
@@ -1049,7 +1116,7 @@ impl SafeSlot for Detach {
 }
 
 /// `finish`.
-pub(crate) struct Finish;
+pub struct Finish;
 impl SafeSlot for Finish {
     type In = FinishIn;
     type Out = FramerOut;
@@ -1059,10 +1126,11 @@ impl SafeSlot for Finish {
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        let removed = p.get().map_or(Err(framings::Reach::Gone), |inst| {
-            inst.framings.remove(i.framing)
-        });
-        match removed {
+        let Some(inst) = p.get() else {
+            o.error("finish: no open instance");
+            return Outcome::Failed;
+        };
+        match inst.framings.remove(i.framing) {
             Ok(()) => {
                 o.set(|x| &x.yielded.flags, YIELD_ENDED);
                 Outcome::Ready
@@ -1073,7 +1141,7 @@ impl SafeSlot for Finish {
 }
 
 /// `encode`: one HTTP/1.1 request message into the wire buffer.
-pub(crate) struct Encode;
+pub struct Encode;
 impl SafeSlot for Encode {
     type In = EncodeIn;
     type Out = FramerOut;
@@ -1103,10 +1171,7 @@ impl SafeSlot for Encode {
         .map(dest_head::encode_target)
         .transpose();
         let Ok(target) = target else {
-            return failed(
-                &mut o,
-                "encode: a request target holds CR, LF or NUL".into(),
-            );
+            return failed(&mut o, format!("encode: {}", dest_head::REFUSED));
         };
         if !method.is_empty() {
             pairs.push(("method", method));
@@ -1136,10 +1201,11 @@ impl SafeSlot for Encode {
     }
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink. An op re-entered with
-/// `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its input whole the first time:
-/// `f` is not run again.
+/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with `op`. An
+/// op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its input
+/// whole the first time: `f` is not run again.
 fn with(
+    op: &'static str,
     p: &sdk::Instance<'_, Instance>,
     head: InHead,
     admit: bool,
@@ -1149,7 +1215,8 @@ fn with(
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(inst) = p.get() else {
-        o.error("no such framing");
+        // A static text: with no instance there is nowhere to keep an owned one.
+        o.error(no_open_instance(op));
         return Outcome::Failed;
     };
     let mut kernel = HostKernel {
@@ -1165,18 +1232,27 @@ fn with(
     // Reached by its token alone; a framing another op holds is answered at once (audit A1 F6).
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
-        Err(why) => {
-            o.error(why.why());
-            return Outcome::Failed;
-        }
+        Err(why) => return failed(o, format!("{op}: {}", why.why())),
     };
     if head.flags & FLAG_RESUME != 0 {
-        return step(slot.held(), sink, o, kernel, |_| Ok(()));
+        return step(op, slot.held(), sink, o, kernel, |_| Ok(()));
     }
-    step(slot.held(), sink, o, kernel, f)
+    step(op, slot.held(), sink, o, kernel, f)
 }
 
+/// `<op>: no open instance`, for each op [`with`] runs.
+fn no_open_instance(op: &str) -> &'static str {
+    match op {
+        "ingest" => "ingest: no open instance",
+        "emit" => "emit: no open instance",
+        "refuse" => "refuse: no open instance",
+        _ => "timer: no open instance",
+    }
+}
+
+/// Run `f` on `h`'s framing, drive it and fill the sink; a failure text leads with `op`.
 fn step(
+    op: &'static str,
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -1184,7 +1260,7 @@ fn step(
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(h) {
-        return failed(o, e.0);
+        return failed(o, format!("{op}: {}", e.0));
     }
     match h {
         Held::Dial(framing) => {
@@ -1192,7 +1268,7 @@ fn step(
             let pending = framing.wire_pending() || !framing.pieces().is_empty();
             if let Some(e) = framing.failure().cloned() {
                 if !pending {
-                    return failed(o, e.0);
+                    return failed(o, format!("{op}: {}", e.0));
                 }
             }
             fill(framing, sink, o, class_of, fault_of);

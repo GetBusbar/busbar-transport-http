@@ -12,20 +12,23 @@ on:
   # the tag ref (`gh workflow run release.yml --ref <tag>`).
   workflow_dispatch: {}
 
-permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  issues: write
-  actions: read
+# Nothing by default: each job below is granted exactly what the workflow it calls needs, and is
+# passed only the secrets that workflow declares (never every secret wholesale).
+permissions: {}
 
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
-    secrets: inherit
+    permissions:
+      contents: read
+    # No secrets: the tagged commit's CI needs none (coverage upload skips without CODECOV_TOKEN).
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@9dc981a19fae06cf05a088e7365e12807cc7f99d
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@b5e5aa3ff1a4b99443133ca3c66052c849994c37
     with:
       plugin_crate: busbar-transport-http-plugin
       manifest_name: busbar-transport-http
@@ -37,11 +40,16 @@ jobs:
       needs_prompt: ""
       needs_user: ""
       declares_file: "transport-http/declares.json"
-    secrets: inherit
+    secrets:
+      BUSBAR_SIGN_KEY: ${{ secrets.BUSBAR_SIGN_KEY }}
+      RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@9dc981a19fae06cf05a088e7365e12807cc7f99d
+    permissions:
+      contents: read
+      actions: read
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@b5e5aa3ff1a4b99443133ca3c66052c849994c37
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-transport-http
@@ -50,4 +58,3 @@ jobs:
       plugin_kind: transport
       bundle_image: ""
       bundle_env: ""
-    secrets: inherit

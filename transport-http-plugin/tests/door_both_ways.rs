@@ -51,6 +51,9 @@ use busbar_contract::abi::transport::{
     PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
     YIELD_HAS_DEADLINE, YIELD_MORE,
 };
+use busbar_contract::abi::transport::{
+    FAULT_NONE, FAULT_TRANSIENT, STATUS_CALLER_FAULT, STATUS_SUCCESS,
+};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -111,11 +114,19 @@ fn serve(rt: &tokio::runtime::Runtime, h2: bool) -> Arc<Socket> {
                 if req.uri().path() == "/hang" {
                     std::future::pending::<()>().await;
                 }
+                let req_path = req.uri().path().to_owned();
                 let got = http_body_util::BodyExt::collect(req.into_body())
                     .await
                     .expect("request body")
                     .to_bytes();
                 let (tx, rx) = mpsc::channel(4);
+                if req_path == "/limited" {
+                    let mut r = hyper::Response::new(ChanBody(rx));
+                    *r.status_mut() = hyper::StatusCode::TOO_MANY_REQUESTS;
+                    r.headers_mut()
+                        .insert("retry-after", hyper::header::HeaderValue::from_static("7"));
+                    return Ok::<_, Infallible>(r);
+                }
                 tokio::spawn(async move {
                     let _ = tx.send(Bytes::from(format!("got={};a", got.len()))).await;
                     rel.lock().await.recv().await;
@@ -180,6 +191,10 @@ struct Got {
     code: u32,
     /// The body length the piece states its head declared (`PIECE_HAS_DECLARED_LEN`), if any.
     declared_len: Option<u64>,
+    /// The status class, fault reading and `Retry-After` seconds the door wrote on the piece.
+    status_class: u8,
+    fault: u8,
+    retry_after_secs: u64,
 }
 
 struct Host {
@@ -310,6 +325,9 @@ impl Host {
                 flags: p.flags,
                 code: p.code,
                 declared_len: (p.flags & PIECE_HAS_DECLARED_LEN != 0).then_some(p.declared_len),
+                status_class: p.status_class,
+                fault: p.fault,
+                retry_after_secs: p.retry_after_secs,
             });
         }
         self.deadline =
@@ -589,6 +607,13 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
         .expect("a head frame");
     println!("PROOF {label}: HEAD {}", head.code);
     assert_eq!((head.stream, head.code), (1, 200));
+    // The head states the class and the breaker's reading of its own status: a 200 is success, and
+    // nothing to count against the far end, with no `Retry-After` asked for.
+    assert_eq!(
+        (head.status_class, head.fault, head.retry_after_secs),
+        (STATUS_SUCCESS, FAULT_NONE, 0),
+        "{label}: the 200 head's class, fault reading and retry-after"
+    );
     // The head is ONE field block, flagged as one: no status line, no hop-by-hop field.
     assert_ne!(head.flags & PIECE_FIELDS, 0, "the head is a fields piece");
     // A streamed answer declares no body length, and its head piece states none: read at the
@@ -851,6 +876,44 @@ fn one_h2_stream_fails_alone_linked_and_dropped() {
     one_stream_fails_alone("dropped", d, &rt);
 }
 
+/// A `429` with `retry-after: 7` reaches the host as a head whose piece states the caller-fault
+/// class, the transient fault reading and the seven seconds, linked and dropped-in alike.
+#[test]
+fn a_429_head_states_its_class_fault_and_retry_after() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (d, _lib) = dropped();
+    for (label, ops) in [("linked", linked()), ("dropped", d)] {
+        let sock = serve(&rt, true);
+        let mut host = Host::open(
+            ops,
+            r#"{"advanced.upstream_h2_prior_knowledge":true}"#,
+            sock,
+            ROOMY,
+        );
+        host.begin("");
+        let mut got = host.ask(1, "/limited", "hello");
+        assert_eq!(
+            host.pump(Duration::from_millis(300), &mut got),
+            Outcome::Ready
+        );
+        let head = got
+            .iter()
+            .find(|g| g.flags & PIECE_HAS_CODE != 0)
+            .expect("a head frame");
+        assert_eq!(head.code, 429, "{label}");
+        assert_eq!(
+            (head.status_class, head.fault, head.retry_after_secs),
+            (STATUS_CALLER_FAULT, FAULT_TRANSIENT, 7),
+            "{label}: the 429 head's class, fault reading and retry-after"
+        );
+        host.close();
+    }
+}
+
 #[test]
 fn a_yield_more_recall_answers_nothing_twice() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -876,6 +939,16 @@ fn a_yield_more_recall_answers_nothing_twice() {
         assert!(
             recall_continues(&dup, &roomy).is_err(),
             "a duplicated piece is caught"
+        );
+        // RED, the wire half: a framer that wrote the first wire bytes twice is caught too.
+        let mut dup = tight.clone();
+        assert!(!dup.0.is_empty(), "the exchange wrote wire bytes");
+        let at = dup.0.len().min(5);
+        let first = dup.0[..at].to_vec();
+        dup.0.splice(at..at, first);
+        assert!(
+            recall_continues(&dup, &roomy).is_err(),
+            "a duplicated run of wire bytes is caught"
         );
     }
 }
