@@ -6,6 +6,8 @@
 //! `encode` answers, the bytes the egress cross-check reads. The framing itself is the door's
 //! (`crate::door::engine`).
 
+use zeroize::Zeroizing;
+
 /// An RFC 9110 `token`: one or more `tchar`. A field name is one; anything else (a `:`, a space,
 /// a control byte, a non-ASCII byte) is not a name this wire can carry back out unchanged.
 fn is_token(name: &[u8]) -> bool {
@@ -32,21 +34,24 @@ fn is_token(name: &[u8]) -> bool {
         })
 }
 
-/// Render an outbound envelope (`fields`, post-decoration) and `body` as one HTTP/1.1 request
-/// message: the bytes the egress cross-check reads, whichever door rendered them.
+/// Render the head of the one HTTP/1.1 request message an outbound envelope (`fields`,
+/// post-decoration) with a `body_len`-byte body makes: the request line and the fields (the
+/// `content-length` among them, as the host stated it), through the blank line. The body follows it on the wire
+/// as it is, so `encode` writes the head and then the body straight into the wire buffer. The head
+/// carries the credential fields: it is wiped as it drops.
 ///
 /// # Errors
 ///
 /// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
 /// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
 /// reparse): `Encode::Unrepresentable`. So is a length that does not frame the body: a stated
-/// `content-length` other than the body's, or a non-empty body with none stated. The length is one
+/// `content-length` other than `body_len`, or a non-empty body with none stated. The length is one
 /// of the transport's own lines the host states BEFORE the auth (THE DESIGN §6 step 5): this
 /// renders it where the host put it and adds no line of its own.
-pub(crate) fn render_envelope(
+pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
-    body: &[u8],
-) -> Result<Vec<u8>, busbar_contract::transport::wire::Encode> {
+    body_len: usize,
+) -> Result<Zeroizing<Vec<u8>>, busbar_contract::transport::wire::Encode> {
     let field = |name: &str| {
         fields
             .iter()
@@ -72,10 +77,12 @@ pub(crate) fn render_envelope(
     if !is_token(method) || !clean(path) || path.contains(&b' ') {
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
+    let mut size = method.len() + path.len() + 64;
     for (name, value) in fields {
         if !is_token(name.as_bytes()) || !clean(value) {
             return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
         }
+        size += name.len() + value.len() + 4;
     }
 
     // THE LENGTH is a fact about the bytes below, stated in the head the auth saw: it must frame
@@ -87,15 +94,15 @@ pub(crate) fn render_envelope(
             std::str::from_utf8(v)
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                == Some(body.len())
+                == Some(body_len)
         }
-        None => body.is_empty(),
+        None => body_len == 0,
     };
     if !framed {
         return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
 
-    let mut out = Vec::with_capacity(body.len() + 128);
+    let mut out = Zeroizing::new(Vec::with_capacity(size));
     out.extend_from_slice(method);
     out.push(b' ');
     out.extend_from_slice(path);
@@ -110,6 +117,16 @@ pub(crate) fn render_envelope(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
+    Ok(out)
+}
+
+/// The whole message, head and body, for a test to read back.
+#[cfg(test)]
+pub(crate) fn render_envelope(
+    fields: &[(&str, &[u8])],
+    body: &[u8],
+) -> Result<Vec<u8>, busbar_contract::transport::wire::Encode> {
+    let mut out = render_head(fields, body.len())?.to_vec();
     out.extend_from_slice(body);
     Ok(out)
 }
