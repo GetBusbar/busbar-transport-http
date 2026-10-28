@@ -29,11 +29,6 @@ pub(crate) const COMPOSES_OVER: &[&str] = &[];
 /// None of the three claimed schemes carries a session.
 pub(crate) const SESSION: bool = false;
 
-pub(crate) const NONE: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
-
 pub(crate) const TAIL: TransportTail = TransportTail {
     head: KindTailHead {
         size: std::mem::size_of::<TransportTail>() as u32,
@@ -52,10 +47,10 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     claim_rows_len: crate::door::CLAIMS.len(),
     upgrades_to: std::ptr::null(),
     upgrades_to_len: 0,
-    handoff_from: NONE,
-    handoff_to: NONE,
-    handoff_binding_fact: NONE,
-    handshake_frame_kind: NONE,
+    handoff_from: AbiStr::ABSENT,
+    handoff_to: AbiStr::ABSENT,
+    handoff_binding_fact: AbiStr::ABSENT,
+    handshake_frame_kind: AbiStr::ABSENT,
     status_rows: crate::door::STATUS_ROWS.as_ptr(),
     status_rows_len: crate::door::STATUS_ROWS.len(),
     settings: crate::door::SETTINGS.as_ptr(),
