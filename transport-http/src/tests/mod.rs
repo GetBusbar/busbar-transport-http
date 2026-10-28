@@ -197,24 +197,23 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
 #[test]
 fn a_start_line_with_no_http_version_is_not_a_message() {
     assert!(
-        raw::parse_message(b"GET /\r\nHost: x\r\n\r\n").is_none(),
+        raw::Head::parse(b"GET /\r\nHost: x\r\n\r\n").is_err(),
         "a request line with no version token is not a request line"
     );
     assert!(
-        raw::parse_message(b"NOT A REQUEST\r\nHost: x\r\n\r\n").is_none(),
+        raw::Head::parse(b"NOT A REQUEST\r\nHost: x\r\n\r\n").is_err(),
         "an arbitrary first line is not a request line"
     );
     assert!(
-        raw::parse_message(b"GET / HTTP/2\r\nHost: x\r\n\r\n").is_none(),
+        raw::Head::parse(b"GET / HTTP/2\r\nHost: x\r\n\r\n").is_err(),
         "a version this reader does not frame is refused, not read with 1.x's rules"
     );
     assert!(
-        raw::parse_message(b"HTTP/2 200 OK\r\n\r\n").is_none(),
+        raw::Head::parse(b"HTTP/2 200 OK\r\n\r\n").is_err(),
         "and the same on the status side"
     );
-    assert!(raw::parse_message(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_some());
-    assert!(raw::parse_message(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_some());
-    assert!(raw::parse_message(b"HTTP/1.1 200 OK\r\n\r\n").is_some());
+    assert!(raw::Head::parse(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").is_ok());
+    assert!(raw::Head::parse(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_ok());
 }
 
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
@@ -248,15 +247,13 @@ fn the_envelope_encodes_as_an_http_message() {
     assert!(text.ends_with("\r\n\r\n{\"model\":\"m\"}"));
 
     // And the message this transport wrote is one this transport can read back.
-    let parsed = raw::parse_message(&bytes).expect("a message it can read");
-    assert_eq!(
-        parsed.start,
-        raw::RawStartLine::Request {
-            method: "POST".to_string(),
-            path: Some("/v1/messages".to_string())
-        }
-    );
-    assert_eq!(parsed.body, b"{\"model\":\"m\"}");
+    let mut cache = EgressHead::default();
+    let whole = complete_message(&bytes, &mut cache, usize::MAX, usize::MAX)
+        .unwrap()
+        .expect("a message it can read");
+    let parsed = raw::Head::parse(&bytes[..whole.head_end]).expect("a head it can read");
+    assert_eq!((parsed.method, parsed.path), ("POST", Some("/v1/messages")));
+    assert_eq!(whole.body, b"{\"model\":\"m\"}");
 }
 
 /// An envelope naming NO path is not one that named `/`: it renders an empty target word and reads
@@ -266,25 +263,15 @@ fn the_envelope_encodes_as_an_http_message() {
 fn no_target_named_and_a_stated_root_stay_distinct() {
     let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
     assert!(unnamed.starts_with(b"GET  HTTP/1.1\r\n"), "{unnamed:?}");
-    assert_eq!(
-        raw::parse_message(&unnamed).expect("readable").start,
-        raw::RawStartLine::Request {
-            method: "GET".to_string(),
-            path: None
-        }
-    );
+    let head = raw::Head::parse(&unnamed).expect("readable");
+    assert_eq!((head.method, head.path), ("GET", None));
     let root = crate::transport::render_envelope(
         &[("method", b"GET".as_slice()), ("path", b"/".as_slice())],
         b"",
     )
     .unwrap();
-    assert_eq!(
-        raw::parse_message(&root).expect("readable").start,
-        raw::RawStartLine::Request {
-            method: "GET".to_string(),
-            path: Some("/".to_string())
-        }
-    );
+    let head = raw::Head::parse(&root).expect("readable");
+    assert_eq!((head.method, head.path), ("GET", Some("/")));
 }
 
 /// A CR or an LF in a field is not data on this wire: it ENDS the line. A caller that can put one
