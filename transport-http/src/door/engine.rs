@@ -33,7 +33,7 @@ use hyper::client::conn::{http1, http2};
 use hyper::rt::{Executor, Sleep};
 use zeroize::Zeroizing;
 
-use crate::raw::RawStartLine;
+use crate::raw::Head;
 use crate::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// Which HTTP a framing speaks, as connection security (or the operator's cleartext key) agreed it.
@@ -76,9 +76,9 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
     /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
-    /// gone), and when it grows (`append_zeroizing`). Only this buffer is wiped: the parsed head
-    /// (`EgressHead`), the `RawMessage` and the `http::Request` built from it still hold header
-    /// values in ordinary memory, until credentials stop reaching the framer as plaintext.
+    /// gone), and when it grows (`append_zeroizing`). The head is read in place from it
+    /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
+    /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
     Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
@@ -301,26 +301,27 @@ impl Framing {
         }
         let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
             .map_err(|e| Failure(format!("request message: {e}")))?;
-        let Some(mut raw) = raw else { return Ok(()) };
-        let RawStartLine::Request { method, path } = &raw.start else {
-            return Err(Failure("a status line is not a request".into()));
-        };
+        let Some(whole) = raw else { return Ok(()) };
+        // Read once already (`complete_message`), so this second read of the same bytes is the
+        // same head: the request is built from it in place, nothing copied out but by `http`.
+        let parsed = Head::parse(&buf[..whole.head_end])
+            .map_err(|e| Failure(format!("request message: {e}")))?;
         // The path is not repeated: a path (and its query) may carry a token.
-        let target = request_target(&self.dial, path.as_deref(), !self.carried)
+        let target = request_target(&self.dial, parsed.path, !self.carried)
             .map_err(|e| Failure(format!("request target: {e}")))?;
-        let mut b = http::Request::builder().method(method.as_str()).uri(target);
-        for (k, v) in &raw.headers {
+        let mut b = http::Request::builder().method(parsed.method).uri(target);
+        for (k, v) in parsed.fields() {
             // hyper frames the body below; a length or coding the message carried describes the
             // wire it was written for, not the one going out.
-            if k.eq_ignore_ascii_case("transfer-encoding")
-                || k.eq_ignore_ascii_case("content-length")
+            if k.eq_ignore_ascii_case(b"transfer-encoding")
+                || k.eq_ignore_ascii_case(b"content-length")
             {
                 continue;
             }
-            b = b.header(k.as_str(), v.as_slice());
+            b = b.header(k, v);
         }
         let mut req = b
-            .body(Full::new(Bytes::from(std::mem::take(&mut raw.body))))
+            .body(Full::new(Bytes::from(whole.body)))
             .map_err(|e| Failure(format!("request: {e}")))?;
         client_posture(&mut req, self.proto)?;
         // Spent only by a request that was built: one the builder refuses leaves the dial path to

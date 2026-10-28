@@ -33,8 +33,6 @@ mod meta;
 mod raw;
 mod transport;
 
-pub use raw::{RawMessage, RawStartLine};
-
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this row: its key, the

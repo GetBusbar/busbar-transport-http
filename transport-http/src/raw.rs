@@ -1,328 +1,190 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A minimal HTTP/1.1 message reader: just enough to split a raw byte blob (request line or
-//! status line, headers, blank line, body) into its parts, and to read a chunked body across
-//! however many reads it arrives in. Not a general-purpose parser — no header folding, and the only
-//! transfer coding it reads is `chunked`. Good enough for the one shape this transport reads: the
-//! request message `encode` renders and `emit` is handed.
+//! A minimal HTTP/1.1 request reader over borrowed bytes: just enough to read the request line
+//! and header fields of the message `encode` renders and `emit` is handed, and to undo a chunked
+//! body across however many reads it arrives in. Not a general-purpose parser — no header folding,
+//! and the only transfer coding it reads is `chunked`. Nothing is copied out of the head: every
+//! word and field is a slice of the bytes it was read from.
 
-/// The message's first line, kept as whichever of the two shapes it turned out to be. Its `Debug`
-/// shows a request's method and never its target (a path may carry a token).
-#[derive(Clone, PartialEq, Eq)]
-pub enum RawStartLine {
-    /// `METHOD path HTTP/version`.
-    Request {
-        /// The request method.
-        method: String,
-        /// The request target the message STATED; `None` = it named none (an empty target word,
-        /// `METHOD  HTTP/version`). A stated `/` is `Some("/")`: it is a target like any other.
-        path: Option<String>,
-    },
-    /// `HTTP/version status reason`.
-    Status {
-        /// The status code.
-        code: u16,
-        /// The status reason phrase.
-        reason: String,
-    },
+/// A request head, read in place.
+pub(crate) struct Head<'a> {
+    /// The request method.
+    pub(crate) method: &'a str,
+    /// The request target the message STATED; `None` = it named none (an empty target word,
+    /// `METHOD  HTTP/version`). A stated `/` is `Some("/")`: it is a target like any other.
+    pub(crate) path: Option<&'a str>,
+    /// The header block, its request line included.
+    block: &'a [u8],
 }
 
-/// One parsed message: its start line, its headers in wire order, and its body. Its `Debug` shows
-/// the header NAMES only, each value `<redacted>`, and the body as its length.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RawMessage {
-    /// The request or status line.
-    pub start: RawStartLine,
-    /// Header name/value pairs, in the order they appeared. A value is its bytes as sent (obs-text
-    /// included), without the optional whitespace around it.
-    pub headers: Vec<(String, Vec<u8>)>,
-    /// Everything after the blank line.
-    pub body: Vec<u8>,
+/// How a request's body is framed, as its head declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyFraming {
+    /// `Content-Length` (0 when the head declares neither coding).
+    Length(usize),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
 }
 
-/// A parsed message's header values and body can carry credentials (an `authorization` line, a
-/// captured token in a reply): wiped when the message goes.
-impl Drop for RawMessage {
-    fn drop(&mut self) {
-        for (_, v) in &mut self.headers {
-            zeroize::Zeroize::zeroize(v);
-        }
-        zeroize::Zeroize::zeroize(&mut self.body);
-    }
-}
-
-/// A header value or a target, as a `Debug` shows it: `<redacted>`.
-struct Hidden;
-
-impl std::fmt::Debug for Hidden {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
-}
-
-/// `name: <redacted>`, for a `Debug` of header pairs.
-struct Redacted<'a, N>(&'a [(String, N)]);
-
-impl<N> std::fmt::Debug for Redacted<'_, N> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_map()
-            .entries(self.0.iter().map(|(k, _)| (k, Hidden)))
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for RawStartLine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Request { method, path } => f
-                .debug_struct("Request")
-                .field("method", method)
-                .field("path", &path.as_ref().map(|_| Hidden))
-                .finish(),
-            Self::Status { code, reason } => f
-                .debug_struct("Status")
-                .field("code", code)
-                .field("reason", reason)
-                .finish(),
-        }
-    }
-}
-
-impl std::fmt::Debug for RawMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawMessage")
-            .field("start", &self.start)
-            .field("headers", &Redacted(&self.headers))
-            .field("body_len", &self.body.len())
-            .finish()
-    }
-}
-
-/// Split `bytes` into a start line, headers and body. `bytes` may end exactly at the header
-/// terminator (body empty) or carry the body already appended. Returns `None` on anything that
-/// does not look like an HTTP/1.x message (no CRLF-terminated start line, a header line with no
-/// colon, or whitespace between a field name and its colon — which the wire forbids outright).
-#[must_use]
-pub fn parse_message(bytes: &[u8]) -> Option<RawMessage> {
-    let text_end = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 2) // keep the final lone CRLF as the header block's own terminator
-        .unwrap_or(bytes.len());
-    let header_block = &bytes[..text_end];
-    let body = if text_end + 2 <= bytes.len() {
-        bytes[text_end + 2..].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    // The start line and every field name are text; a field VALUE is bytes (RFC 9110 5.5: obs-text
-    // is a value's, and 1.5.5's client carried such a value as given).
-    let mut lines = header_block
+/// The non-empty lines of `block`, each without its CR.
+fn lines(block: &[u8]) -> impl Iterator<Item = &[u8]> {
+    block
         .split(|b| *b == b'\n')
         .map(|l| l.strip_suffix(b"\r").unwrap_or(l))
-        .filter(|l| !l.is_empty());
-    let start = parse_start_line(std::str::from_utf8(lines.next()?).ok()?)?;
-
-    let mut headers = Vec::new();
-    for line in lines {
-        let colon = line.iter().position(|b| *b == b':')?;
-        let name = std::str::from_utf8(&line[..colon]).ok()?;
-        // No whitespace is allowed between a field name and its colon. Trimming it here would
-        // normalise a header no compliant peer would honour into one this transport does, and the
-        // disagreement that opens between an intermediary and its upstream is exactly the
-        // request-smuggling surface the rule exists to close. So: refuse the message.
-        if name != name.trim() {
-            return None;
-        }
-        headers.push((name.to_string(), ows_trimmed(&line[colon + 1..]).to_vec()));
-    }
-
-    Some(RawMessage {
-        start,
-        headers,
-        body,
-    })
+        .filter(|l| !l.is_empty())
 }
 
-/// `value` without the optional whitespace (SP, HTAB) a field line may carry around it (RFC 9112
-/// 5.1); every other byte stays.
-fn ows_trimmed(value: &[u8]) -> &[u8] {
+/// A field line's name and its value without the optional whitespace (SP, HTAB) around it (RFC
+/// 9112 5.1); every other byte of the value stays (obs-text included).
+fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
+    let colon = memchr::memchr(b':', line)?;
+    let value = &line[colon + 1..];
     let ows = |b: &u8| *b == b' ' || *b == b'\t';
     let start = value.iter().position(|b| !ows(b)).unwrap_or(value.len());
     let end = value
         .iter()
         .rposition(|b| !ows(b))
         .map_or(start, |at| at + 1);
-    &value[start..end]
+    Some((&line[..colon], &value[start..end]))
 }
 
-fn parse_start_line(line: &str) -> Option<RawStartLine> {
-    let mut parts = line.splitn(3, ' ');
-    let a = parts.next()?;
-    let b = parts.next()?;
-    let c = parts.next().unwrap_or("");
-    if let Some(version) = a.strip_prefix("HTTP/") {
-        if !is_http1(version) {
-            return None;
-        }
-        let code: u16 = b.parse().ok()?;
-        return Some(RawStartLine::Status {
-            code,
-            reason: c.to_string(),
-        });
-    }
-    // Otherwise: `METHOD path HTTP/version`. The version token is REQUIRED. Without the check a
-    // two-word first line — anything at all, followed by a space — parses as a request, so a blob
-    // that is not HTTP is read as one and its first two words become a method and a path this
-    // transport then acts on. The wire says every request line names its version; a line that does
-    // not is not a request line.
-    let version = c.strip_prefix("HTTP/")?;
-    if !is_http1(version) {
-        return None;
-    }
-    Some(RawStartLine::Request {
-        method: a.to_string(),
-        path: (!b.is_empty()).then(|| b.to_string()),
-    })
-}
-
-/// Whether a version token names the HTTP/1.x this reader frames.
-///
-/// The framing rules below — `Content-Length`, chunked transfer coding, a CRLF-terminated header
-/// block — are 1.x's. A `2` or a `3` names a wire made of frames this reader has never seen, and
-/// reading one with 1.x's rules would produce a message nobody sent.
-fn is_http1(version: &str) -> bool {
-    matches!(version, "1.0" | "1.1")
-}
-
-/// Find a header's value, case-insensitively, as the wire allows any casing.
-#[must_use]
-pub fn header<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .map(|(_, v)| v.as_slice())
-}
-
-/// A field's WHOLE value: every line carrying that name, joined with `", "`, or `None` when no
-/// line carries it.
-///
-/// RFC 9110 5.3 makes this the definition of a repeated field: a sender may split a comma-separated
-/// list across several lines, and the meaning is the one line those values would have made. Reading
-/// only the first line therefore reads a different field than the one that was sent — and for the
-/// framing fields below that is not a cosmetic difference, it is a body length. `Transfer-Encoding:
-/// chunked` followed by `Transfer-Encoding: gzip` is the list `chunked, gzip`, whose final coding is
-/// not `chunked` and whose length RFC 9112 6.1 leaves undeterminable; a reader that saw only the
-/// first line would frame a body the sender never described.
-#[must_use]
-pub fn field_list(headers: &[(String, Vec<u8>)], name: &str) -> Option<String> {
-    let mut out: Option<String> = None;
-    for (_, v) in headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)) {
-        // A framing field is ASCII; a byte that is not reads as U+FFFD, which no coding or length
-        // matches, so such a value is refused rather than guessed at.
-        let v = String::from_utf8_lossy(v);
-        match &mut out {
-            Some(acc) => {
-                acc.push_str(", ");
-                acc.push_str(v.trim());
+impl<'a> Head<'a> {
+    /// Read the head at the front of `bytes`, which may end exactly at the header terminator or
+    /// carry the body after it.
+    ///
+    /// # Errors
+    ///
+    /// Anything that is not an HTTP/1.x request head: no request line naming its version, a status
+    /// line, a header line with no colon, or whitespace between a field name and its colon — which
+    /// the wire forbids outright.
+    pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
+        const UNPARSABLE: &str = "unparsable request head";
+        let block = memchr::memmem::find(bytes, b"\r\n\r\n").map_or(bytes, |p| &bytes[..p + 2]);
+        let mut all = lines(block);
+        let first = std::str::from_utf8(all.next().ok_or(UNPARSABLE)?).map_err(|_| UNPARSABLE)?;
+        // The start line and every field name are text; a field VALUE is bytes (RFC 9110 5.5:
+        // obs-text is a value's, and 1.5.5's client carried such a value as given).
+        for line in all {
+            let (name, _) = split_field(line).ok_or(UNPARSABLE)?;
+            let name = std::str::from_utf8(name).map_err(|_| UNPARSABLE)?;
+            // No whitespace is allowed between a field name and its colon. Trimming it here would
+            // normalise a header no compliant peer would honour into one this transport does, and
+            // the disagreement that opens between an intermediary and its upstream is exactly the
+            // request-smuggling surface the rule exists to close. So: refuse the message.
+            if name != name.trim() {
+                return Err(UNPARSABLE);
             }
-            None => out = Some(v.trim().to_string()),
         }
-    }
-    out
-}
 
-/// Whether a header block declares a chunked body, and one this transport can actually undo.
-///
-/// `Transfer-Encoding` names a list — across as many lines as the sender chose, which is why the
-/// whole field is read rather than its first line — and this asks the wire's own two questions of
-/// it. `chunked` must be the FINAL coding (RFC 9112 6.1): a sender applying any other coding applies
-/// `chunked` last so the message stays framable, and a list where it is not last leaves the body
-/// length undeterminable, so `chunked, gzip` is not a chunked body but a message to refuse. And
-/// `chunked` may be applied only ONCE: `chunked, chunked` describes a body wrapped twice, of which
-/// undoing one layer would hand up a framing still on the bytes as though it were the body.
-#[must_use]
-pub fn is_chunked(headers: &[(String, Vec<u8>)]) -> bool {
-    let Some(list) = field_list(headers, "transfer-encoding") else {
-        return false;
-    };
-    let codings: Vec<&str> = list.split(',').map(str::trim).collect();
-    let applied = codings
-        .iter()
-        .filter(|c| c.eq_ignore_ascii_case("chunked"))
-        .count();
-    applied == 1
-        && codings
-            .last()
-            .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
-}
-
-/// Whether a header block declares a transfer coding at all, chunked or otherwise.
-///
-/// The companion question to [`is_chunked`]: a message that names a coding this transport cannot
-/// frame is a framing error, and telling that apart from a message that names none is what lets a
-/// caller refuse the first without refusing the second.
-#[must_use]
-pub fn has_transfer_encoding(headers: &[(String, Vec<u8>)]) -> bool {
-    field_list(headers, "transfer-encoding").is_some()
-}
-
-/// The declared body length, where the message declares one.
-///
-/// `Ok(None)` when no `Content-Length` header is present. `Err(())` when one is present and is not
-/// exactly `1*DIGIT` fitting a `usize` — a leading sign, a non-decimal digit, an overflowing value,
-/// or a second `Content-Length` disagreeing with the first. RFC 9112 6.3: an unparsable
-/// `Content-Length` with no `Transfer-Encoding` is unrecoverable framing, never a body-less
-/// message. RFC 9110 8.6 allows treating identical duplicate values as one, which this does.
-///
-/// # Errors
-///
-/// Returns `Err(())` when the header is present but does not name a single valid body length.
-pub fn content_length(headers: &[(String, Vec<u8>)]) -> Result<Option<usize>, ()> {
-    // The whole field, however many lines it was spelled across: a second `Content-Length` line is
-    // the same list a comma would have made, and reading only the first would take a message that
-    // declares two lengths for one that declares one.
-    let Some(list) = field_list(headers, "content-length") else {
-        return Ok(None);
-    };
-    let mut values = list.split(',').map(str::trim);
-    let Some(first) = values.next() else {
-        return Ok(None);
-    };
-    for other in values {
-        if other != first {
-            return Err(());
+        let mut words = first.splitn(3, ' ');
+        let (a, b) = (
+            words.next().ok_or(UNPARSABLE)?,
+            words.next().ok_or(UNPARSABLE)?,
+        );
+        let c = words.next().unwrap_or("");
+        if a.starts_with("HTTP/") {
+            return Err("a status line is not a request");
         }
+        // `METHOD path HTTP/version`. The version token is REQUIRED. Without the check a two-word
+        // first line — anything at all, followed by a space — parses as a request, so a blob that
+        // is not HTTP is read as one and its first two words become a method and a path this
+        // transport then acts on. And it is 1.x: the framing rules here — `Content-Length`, chunked
+        // transfer coding, a CRLF-terminated header block — are 1.x's, and a `2` or a `3` names a
+        // wire made of frames this reader has never seen.
+        if !matches!(c, "HTTP/1.0" | "HTTP/1.1") {
+            return Err(UNPARSABLE);
+        }
+        Ok(Self {
+            method: a,
+            path: (!b.is_empty()).then_some(b),
+            block,
+        })
     }
-    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(());
+
+    /// The header fields, name and value, in the order they appeared.
+    pub(crate) fn fields(&self) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+        lines(self.block).skip(1).filter_map(split_field)
     }
-    first.parse::<usize>().map(Some).map_err(|_| ())
+
+    /// Every member of the list field `name`, across every line carrying it, each trimmed (`None`
+    /// for a member that is not text, which no coding or length matches).
+    ///
+    /// RFC 9110 5.3 makes this the definition of a repeated field: a sender may split a
+    /// comma-separated list across several lines, and the meaning is the one line those values
+    /// would have made. Reading only the first line reads a different field than the one that was
+    /// sent — and for the framing fields that is a body length: `Transfer-Encoding: chunked`
+    /// followed by `Transfer-Encoding: gzip` is the list `chunked, gzip`.
+    fn members(&self, name: &'static str) -> impl Iterator<Item = Option<&'a str>> {
+        self.fields()
+            .filter(move |(k, _)| k.eq_ignore_ascii_case(name.as_bytes()))
+            .flat_map(|(_, v)| v.split(|b| *b == b','))
+            .map(|m| std::str::from_utf8(m).ok().map(str::trim))
+    }
+
+    /// How the body is framed.
+    ///
+    /// `chunked` must be the FINAL transfer coding (RFC 9112 6.1: a list where it is not last
+    /// leaves the body length undeterminable) and applied only ONCE (`chunked, chunked` is a body
+    /// wrapped twice); any other declared coding is one this transport cannot frame, and falling
+    /// through to `Content-Length` would answer a question the sender did not ask. A chunked
+    /// message naming a `Content-Length` beside it — two framings of the same bytes, the smuggling
+    /// shape itself — is refused rather than silently disambiguated. A `Content-Length` is exactly
+    /// `1*DIGIT` fitting a `usize`, every member and line naming the same value (RFC 9110 8.6);
+    /// anything else is unrecoverable framing (RFC 9112 6.3), never a body-less message.
+    ///
+    /// # Errors
+    ///
+    /// The refusals above.
+    pub(crate) fn framing(&self) -> Result<BodyFraming, &'static str> {
+        let (mut coded, mut applied, mut last) = (false, 0_usize, false);
+        for coding in self.members("transfer-encoding") {
+            coded = true;
+            last = coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
+            applied += usize::from(last);
+        }
+        if coded {
+            if applied != 1 || !last {
+                return Err("unsupported transfer coding");
+            }
+            if self.members("content-length").next().is_some() {
+                return Err("transfer-encoding with content-length");
+            }
+            return Ok(BodyFraming::Chunked);
+        }
+        const INVALID: &str = "invalid content-length";
+        let mut lengths = self.members("content-length");
+        let Some(first) = lengths.next() else {
+            return Ok(BodyFraming::Length(0));
+        };
+        if lengths.any(|other| other != first) {
+            return Err(INVALID);
+        }
+        let first = first
+            .filter(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or(INVALID)?;
+        first.parse().map(BodyFraming::Length).map_err(|_| INVALID)
+    }
 }
 
 /// A chunked-transfer-encoding reader, fed whatever bytes have arrived so far.
 ///
-/// Incremental and byte-at-a-time on purpose. A body arrives across as many reads as the network
-/// chooses, and a chunk boundary is free to fall in the middle of a size line, in the middle of the
-/// CRLF after one, or between the terminal chunk and its trailers. A decoder that re-scanned the
-/// whole buffer on every read would be quadratic in the body size, which for the megabyte bodies
-/// this path exists to carry is the difference between a transport and a stall.
-/// Its `Debug` shows where it stands, the trailer NAMES and byte counts, never a byte of a chunk.
+/// Incremental on purpose. A body arrives across as many reads as the network chooses, and a chunk
+/// boundary is free to fall in the middle of a size line, in the middle of the CRLF after one, or
+/// between the terminal chunk and its trailers. A decoder that re-scanned the whole buffer on every
+/// read would be quadratic in the body size. A chunk's data is taken a slice at a time and a line
+/// is found with `memchr`. The trailer section is read for its grammar and discarded: RFC 9110
+/// §6.5.1 lets a recipient that removes the chunked coding discard its trailers, and THE DESIGN §5
+/// carries no trailer on the transport ABI.
 #[derive(Default)]
-pub struct ChunkedDecoder {
+pub(crate) struct ChunkedDecoder {
     state: ChunkState,
     line: Vec<u8>,
     want: usize,
-    current: Vec<u8>,
-    chunks: Vec<Vec<u8>>,
-    trailers: Vec<(String, String)>,
-    /// The decoded body bytes so far, every chunk's data counted as it arrives.
-    body_len: usize,
+    body: Vec<u8>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum ChunkState {
     /// Reading the hexadecimal size line that opens a chunk.
     #[default]
@@ -337,21 +199,23 @@ enum ChunkState {
     Done,
 }
 
-impl std::fmt::Debug for ChunkedDecoder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkedDecoder")
-            .field("state", &self.state)
-            .field("want", &self.want)
-            .field("chunks", &self.chunks.len())
-            .field("trailers", &Redacted(&self.trailers))
-            .field("body_len", &self.body_len)
-            .finish_non_exhaustive()
-    }
-}
-
 /// The bytes did not follow the chunked grammar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkedMalformed;
+pub(crate) struct ChunkedMalformed;
+
+/// A size line's `1*HEXDIG` (RFC 9112 7.1: no sign, no whitespace, not empty). Chunk extensions
+/// after a semicolon are not read, and whitespace may stand between a size and them (BWS, RFC 9112
+/// 7.1.1).
+fn chunk_size(line: &str) -> Result<usize, ChunkedMalformed> {
+    let size = match line.split_once(';') {
+        Some((size, _)) => size.trim_end_matches([' ', '\t']),
+        None => line,
+    };
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ChunkedMalformed);
+    }
+    usize::from_str_radix(size, 16).map_err(|_| ChunkedMalformed)
+}
 
 impl ChunkedDecoder {
     /// Feed everything that has arrived since the last call, answering how many of `bytes` the
@@ -362,98 +226,79 @@ impl ChunkedDecoder {
     ///
     /// The bytes are not chunked-transfer-encoding: a size line that is not hexadecimal, a chunk
     /// not closed by CRLF, or a trailer line with no colon.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
-        for (i, &b) in bytes.iter().enumerate() {
-            if self.state == ChunkState::Done {
-                return Ok(i);
-            }
-            self.step(b)?;
+    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
+        let mut at = 0;
+        while at < bytes.len() {
+            let rest = &bytes[at..];
+            at += match self.state {
+                ChunkState::Done => return Ok(at),
+                ChunkState::Data => {
+                    let n = self.want.min(rest.len());
+                    self.body.extend_from_slice(&rest[..n]);
+                    self.want -= n;
+                    if self.want == 0 {
+                        self.state = ChunkState::AfterData;
+                    }
+                    n
+                }
+                ChunkState::AfterData => {
+                    match rest[0] {
+                        b'\n' => self.state = ChunkState::Size,
+                        b'\r' => {}
+                        _ => return Err(ChunkedMalformed),
+                    }
+                    1
+                }
+                ChunkState::Size | ChunkState::Trailers => {
+                    let end = memchr::memchr(b'\n', rest);
+                    let part = &rest[..end.unwrap_or(rest.len())];
+                    self.line.extend(part.iter().filter(|b| **b != b'\r'));
+                    let Some(end) = end else {
+                        return Ok(bytes.len());
+                    };
+                    self.end_line()?;
+                    end + 1
+                }
+            };
         }
         Ok(bytes.len())
     }
 
-    /// The decoded body bytes so far.
-    #[must_use]
-    pub fn body_len(&self) -> usize {
-        self.body_len
+    /// A size or trailer line has ended.
+    fn end_line(&mut self) -> Result<(), ChunkedMalformed> {
+        let line = std::str::from_utf8(&self.line).map_err(|_| ChunkedMalformed)?;
+        self.state = match self.state {
+            ChunkState::Size => match chunk_size(line)? {
+                0 => ChunkState::Trailers,
+                size => {
+                    self.want = size;
+                    ChunkState::Data
+                }
+            },
+            _ if line.is_empty() => ChunkState::Done,
+            _ if line.contains(':') => ChunkState::Trailers,
+            _ => return Err(ChunkedMalformed),
+        };
+        self.line.clear();
+        Ok(())
     }
 
-    fn step(&mut self, b: u8) -> Result<(), ChunkedMalformed> {
-        match self.state {
-            ChunkState::Data => {
-                self.current.push(b);
-                self.body_len += 1;
-                self.want -= 1;
-                if self.want == 0 {
-                    self.chunks.push(std::mem::take(&mut self.current));
-                    self.state = ChunkState::AfterData;
-                }
-            }
-            ChunkState::AfterData => {
-                if b == b'\n' {
-                    self.state = ChunkState::Size;
-                } else if b != b'\r' {
-                    return Err(ChunkedMalformed);
-                }
-            }
-            ChunkState::Size | ChunkState::Trailers => {
-                if b != b'\n' {
-                    if b != b'\r' {
-                        self.line.push(b);
-                    }
-                    return Ok(());
-                }
-                let line = String::from_utf8(std::mem::take(&mut self.line))
-                    .map_err(|_| ChunkedMalformed)?;
-                if self.state == ChunkState::Size {
-                    // A size line may carry chunk extensions after a semicolon; none is read.
-                    let (size_text, ext) = line
-                        .split_once(';')
-                        .map_or((line.as_str(), false), |(s, _)| (s, true));
-                    // Whitespace may stand between a size and its extensions (BWS, RFC 9112 7.1.1).
-                    let size_text = if ext {
-                        size_text.trim_end_matches([' ', '\t'])
-                    } else {
-                        size_text
-                    };
-                    // `1*HEXDIG` (RFC 9112 7.1): no sign, no whitespace, not empty.
-                    if size_text.is_empty() || !size_text.bytes().all(|b| b.is_ascii_hexdigit()) {
-                        return Err(ChunkedMalformed);
-                    }
-                    let size =
-                        usize::from_str_radix(size_text, 16).map_err(|_| ChunkedMalformed)?;
-                    self.state = if size == 0 {
-                        ChunkState::Trailers
-                    } else {
-                        self.want = size;
-                        ChunkState::Data
-                    };
-                } else if line.is_empty() {
-                    self.state = ChunkState::Done;
-                } else {
-                    let (name, value) = line.split_once(':').ok_or(ChunkedMalformed)?;
-                    self.trailers
-                        .push((name.trim().to_string(), value.trim().to_string()));
-                }
-            }
-            ChunkState::Done => {}
-        }
-        Ok(())
+    /// The decoded body bytes so far.
+    #[must_use]
+    pub(crate) fn body_len(&self) -> usize {
+        self.body.len()
     }
 
     /// Whether the terminal chunk and its trailer section have both arrived.
     #[must_use]
-    pub fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.state == ChunkState::Done
     }
 
-    /// The decoded chunks, in the order the sender wrote them, and the trailers that followed.
-    ///
-    /// The chunking is kept rather than flattened: a sender's chunk is the unit it chose to send,
-    /// and a reader that concatenated them would be reporting a framing the wire never had.
+    /// The decoded body.
     #[must_use]
-    pub fn take(self) -> (Vec<Vec<u8>>, Vec<(String, String)>) {
-        (self.chunks, self.trailers)
+    pub(crate) fn take(self) -> Vec<u8> {
+        self.body
     }
 }
 

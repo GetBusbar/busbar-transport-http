@@ -79,6 +79,14 @@ pub(crate) fn request_target(
     http::Uri::from_parts(parts).map_err(|_| "target not a valid path")
 }
 
+/// A whole request message: where its head ends in the buffered bytes (the head is read in place
+/// from them, `raw::Head::parse`), and its body, a chunked one already decoded.
+#[derive(Debug)]
+pub(crate) struct Whole {
+    pub(crate) head_end: usize,
+    pub(crate) body: Vec<u8>,
+}
+
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
 ///
 /// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
@@ -90,147 +98,98 @@ pub(crate) fn complete_message(
     cache: &mut EgressHead,
     max_body_bytes: usize,
     max_head_bytes: usize,
-) -> Result<Option<raw::RawMessage>, &'static str> {
-    if cache.head.is_none() {
-        // Resumed where the last call stopped: the bytes before it hold no terminator, and the
-        // search looks back from each line feed it finds, so nothing is missed.
-        let (found, scanned) = find_header_end_from(buffered, cache.searched);
-        cache.scanned += scanned;
-        cache.searched = buffered.len();
-        let Some(header_end) = found else {
-            // No terminator yet, so every buffered byte is head: past the allowance it is one the
-            // sender will not end in bounds.
-            if buffered.len() > max_head_bytes {
+) -> Result<Option<Whole>, &'static str> {
+    let (head_end, framing) = match cache.head {
+        Some(head) => head,
+        None => {
+            // Resumed where the last call stopped: the bytes before it hold no terminator, and the
+            // search looks back from each line feed it finds, so nothing is missed.
+            let (found, scanned) = find_header_end_from(buffered, cache.searched);
+            cache.scanned += scanned;
+            cache.searched = buffered.len();
+            let Some(header_end) = found else {
+                // No terminator yet, so every buffered byte is head: past the allowance it is one
+                // the sender will not end in bounds.
+                if buffered.len() > max_head_bytes {
+                    return Err("request head over its allowance");
+                }
+                return Ok(None);
+            };
+            if header_end > max_head_bytes {
                 return Err("request head over its allowance");
             }
-            return Ok(None);
-        };
-        if header_end > max_head_bytes {
-            return Err("request head over its allowance");
+            // The head is read once per message and only its framing is kept: the bytes stay
+            // where they are, and the request is built from them in place once the message is
+            // whole.
+            let framing = raw::Head::parse(&buffered[..header_end])?.framing()?;
+            cache.parses += 1;
+            cache.head = Some((header_end, framing));
+            (header_end, framing)
         }
-        let mut message =
-            raw::parse_message(&buffered[..header_end]).ok_or("unparsable request head")?;
-        cache.parses += 1;
-        if raw::has_transfer_encoding(&message.headers) {
-            if !raw::is_chunked(&message.headers) {
-                // A declared coding this transport cannot frame. Falling through to
-                // `Content-Length` would be answering a question the sender did not ask.
-                return Err("unsupported transfer coding");
-            }
-            if raw::header(&message.headers, "content-length").is_some() {
-                // Two headers describing two framings of the same bytes. The coding wins the
-                // reading, but forwarding the pair on — as this used to do — hands the next hop a
-                // length the bytes do not have, the smuggling shape itself. Refused rather than
-                // silently disambiguated.
-                return Err("transfer-encoding with content-length");
-            }
-        }
-        cache.head = Some(CachedHead {
-            end: header_end,
-            start: std::mem::replace(
-                &mut message.start,
-                crate::raw::RawStartLine::Status {
-                    code: 0,
-                    reason: String::new(),
-                },
-            ),
-            headers: std::mem::take(&mut message.headers),
-        });
-    }
-    // Read what the head says before touching the cache again: the decoder lives beside it, and
-    // feeding it is a mutation of the same cell this borrow reads.
-    let (head_end, chunked, declared) = {
-        let head = cache.head.as_ref().expect("set just above");
-        (
-            head.end,
-            raw::is_chunked(&head.headers),
-            raw::content_length(&head.headers),
-        )
     };
     let rest = &buffered[head_end..];
 
-    let body = if chunked {
-        // ONE decoder across the calls, fed only what arrived with this one. A fresh decoder per
-        // call re-decodes every byte received so far and re-allocates the decoded chunks each
-        // time — quadratic in the body, which for the megabyte bodies this path exists to carry is
-        // the difference between a transport and a stall.
-        let decoder = cache
-            .decoder
-            .get_or_insert_with(|| Box::new(raw::ChunkedDecoder::default()));
-        let fresh = &rest[cache.fed.min(rest.len())..];
-        cache.feeds += fresh.len();
-        let used = decoder.feed(fresh).map_err(|_| "malformed chunked body")?;
-        cache.fed = rest.len();
-        // The body cap is the decoded body's, as it is a declared length's, and it is held as the
-        // chunks arrive rather than once the message is whole.
-        if decoder.body_len() > max_body_bytes {
-            return Err("decoded chunked body over the body cap");
+    let body = match framing {
+        raw::BodyFraming::Chunked => {
+            // ONE decoder across the calls, fed only what arrived with this one. A fresh decoder
+            // per call re-decodes every byte received so far — quadratic in the body.
+            let decoder = cache.decoder.get_or_insert_with(Box::default);
+            let fresh = &rest[cache.fed.min(rest.len())..];
+            cache.feeds += fresh.len();
+            let used = decoder.feed(fresh).map_err(|_| "malformed chunked body")?;
+            cache.fed = rest.len();
+            // The body cap is the decoded body's, as it is a declared length's, and it is held as
+            // the chunks arrive rather than once the message is whole.
+            if decoder.body_len() > max_body_bytes {
+                return Err("decoded chunked body over the body cap");
+            }
+            if !decoder.is_done() {
+                return Ok(None);
+            }
+            // Bytes after the terminal chunk's trailer section belong to no message this stream
+            // carries: a mis-framed writer, refused rather than dropped.
+            if used < fresh.len() {
+                return Err("bytes past the end of the message");
+            }
+            cache.decoder.take().expect("set just above").take()
         }
-        if !decoder.is_done() {
-            return Ok(None);
+        raw::BodyFraming::Length(declared) => {
+            if declared > max_body_bytes {
+                return Err("declared body over the body cap");
+            }
+            if rest.len() < declared {
+                return Ok(None);
+            }
+            // Bytes past the declared length (or past a head that declares no body) are a
+            // mis-framed writer's, refused rather than dropped.
+            if rest.len() > declared {
+                return Err("bytes past the end of the message");
+            }
+            rest.to_vec()
         }
-        // Bytes after the terminal chunk's trailer section belong to no message this stream
-        // carries: a mis-framed writer, refused rather than dropped.
-        if used < fresh.len() {
-            return Err("bytes past the end of the message");
-        }
-        // The trailer section is discarded: RFC 9110 §6.5.1 lets a recipient that removes the
-        // chunked coding discard its trailers, and forbids merging them into the header section
-        // (a trailer `host` or `connection` would become a second header of that name). THE
-        // DESIGN §5 carries no trailer on the transport ABI, so there is nowhere else to send
-        // them.
-        let (chunks, _trailers) = cache.decoder.take().expect("set just above").take();
-        chunks.concat()
-    } else {
-        let declared = declared
-            .map_err(|()| "invalid content-length")?
-            .unwrap_or(0);
-        if declared > max_body_bytes {
-            return Err("declared body over the body cap");
-        }
-        if rest.len() < declared {
-            return Ok(None);
-        }
-        // Bytes past the declared length (or past a head that declares no body) are a mis-framed
-        // writer's, refused rather than dropped.
-        if rest.len() > declared {
-            return Err("bytes past the end of the message");
-        }
-        rest.to_vec()
     };
 
     // Whole: the head is spent with the message it belonged to, so the next one parses its own,
     // and the decoder that read this body is spent with it too.
-    let head = cache.head.take().expect("set just above");
+    cache.head = None;
     cache.decoder = None;
     cache.fed = 0;
     cache.searched = 0;
-    Ok(Some(raw::RawMessage {
-        start: head.start,
-        headers: head.headers,
-        body,
-    }))
+    Ok(Some(Whole { head_end, body }))
 }
 
-/// The parsed header block of the message the door's `emit` is still accumulating.
+/// Where the message the door's `emit` is still accumulating stands.
 ///
 /// `emit` asks whether the message is whole on EVERY chunk, and the header prefix does not change
-/// between those asks. Parsing it each time allocates a fresh vector and two strings per header and
-/// throws them away — the same waste the chunked decoder was written incrementally to avoid. Held
-/// beside the pending bytes, and taken when the message completes so it can never outlive it.
-pub(crate) struct CachedHead {
-    pub(crate) end: usize,
-    pub(crate) start: raw::RawStartLine,
-    pub(crate) headers: Vec<(String, Vec<u8>)>,
-}
-
-/// [`CachedHead`], plus this connection's own count of how many times it has parsed one — the cell
-/// that pins the egress side to one parse per message rather than one per `emit` call. Per
-/// instance rather than a crate-global counter, so a test reading it back sees only its own
-/// connection's work, never a sibling test's sharing the same binary.
+/// between those asks: its end and framing are held here, and taken when the message completes so
+/// they can never outlive it. Also this connection's own count of how many times it has parsed a
+/// head — the cell that pins the egress side to one parse per message rather than one per `emit`
+/// call. Per instance rather than a crate-global counter, so a test reading it back sees only its
+/// own connection's work, never a sibling test's sharing the same binary.
 #[derive(Default)]
 pub(crate) struct EgressHead {
-    pub(crate) head: Option<CachedHead>,
+    /// Where the parsed head ends, and how its body is framed.
+    pub(crate) head: Option<(usize, raw::BodyFraming)>,
     pub(crate) parses: usize,
     /// The chunked decoder this message is being decoded by, kept across `emit` calls so each
     /// call feeds only the bytes that arrived with it. Behind a box because it is a per-message working set that most
