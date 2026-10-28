@@ -10,7 +10,7 @@ fn parses_a_request_line_and_headers() {
     let msg = parse_message(raw).unwrap();
     assert_eq!(
         msg.start,
-        RawStartLine {
+        RawStartLine::Request {
             method: "GET".to_string(),
             path: Some("/v1/models".to_string())
         }
@@ -51,6 +51,20 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
+/// RED: the size is `1*HEXDIG` (RFC 9112 7.1): no sign, no surrounding whitespace.
+#[test]
+fn a_signed_or_padded_chunk_size_is_a_framing_error() {
+    for line in [
+        &b"+5\r\nhello\r\n0\r\n\r\n"[..],
+        b" 5\r\nhello\r\n0\r\n\r\n",
+        b"5 \r\nhello\r\n0\r\n\r\n",
+        b"\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(decoder.feed(line), Err(ChunkedMalformed), "{line:?}");
+    }
+}
+
 #[test]
 fn chunk_extensions_are_ignored_rather_than_read() {
     let mut decoder = ChunkedDecoder::default();
@@ -66,9 +80,9 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
         ("Transfer-Encoding".to_string(), b"gzip, Chunked".to_vec()),
     ];
     assert_eq!(content_length(&headers), Ok(Some(12)));
-    assert!(has_transfer_encoding(&headers));
-    assert!(has_transfer_encoding(&[(
-        "transfer-ENCODING".to_string(),
+    assert!(is_chunked(&headers));
+    assert!(!is_chunked(&[(
+        "Transfer-Encoding".to_string(),
         b"gzip".to_vec()
     )]));
 }
@@ -91,45 +105,6 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     // The legal shape still parses, value whitespace and all.
     let ok = parse_message(b"GET / HTTP/1.1\r\nContent-Length:  5 \r\n\r\n").unwrap();
     assert_eq!(ok.headers[0].1, b"5");
-}
-
-/// Any coding, on any line, is a declared coding: the question `complete_message` refuses on.
-///
-/// A coding list split across lines is one field (RFC 9110 5.3), so a second line naming
-/// `chunked` after a first naming `gzip` is still a coding; and a message naming only a length
-/// declares none.
-#[test]
-fn a_transfer_coding_on_any_line_is_a_declared_coding() {
-    for list in [
-        &b"chunked"[..],
-        b"chunked, gzip",
-        b"gzip, chunked",
-        b"identity",
-    ] {
-        assert!(has_transfer_encoding(&[(
-            "Transfer-Encoding".to_string(),
-            list.to_vec()
-        )]));
-    }
-    assert!(has_transfer_encoding(&[
-        ("Content-Length".to_string(), b"5".to_vec()),
-        ("Transfer-Encoding".to_string(), b"gzip".to_vec()),
-        ("transfer-encoding".to_string(), b"chunked".to_vec()),
-    ]));
-    assert!(!has_transfer_encoding(&[(
-        "Content-Length".to_string(),
-        b"5".to_vec()
-    )]));
-}
-
-/// A status line is not a request: the envelope `emit` is handed always is one, so a message that
-/// opens with a status line does not parse (and `complete_message` refuses it as framing).
-#[test]
-fn a_status_line_is_not_a_request() {
-    assert_eq!(
-        parse_message(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
-        None
-    );
 }
 
 /// `chunked` is the LAST coding or the message is not chunked at all.
@@ -157,4 +132,59 @@ fn chunked_counts_only_as_the_final_transfer_coding() {
         "Content-Length".to_string(),
         b"5".to_vec()
     )]));
+}
+
+#[test]
+fn parses_a_status_line() {
+    let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+    let msg = parse_message(raw).unwrap();
+    assert_eq!(
+        msg.start,
+        RawStartLine::Status {
+            code: 404,
+            reason: "Not Found".to_string()
+        }
+    );
+    assert!(msg.body.is_empty());
+}
+
+/// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
+/// size may be followed by whitespace before its extensions (codeaudit review of D8).
+#[test]
+fn whitespace_before_a_chunk_extension_is_allowed() {
+    let mut decoder = ChunkedDecoder::default();
+    decoder
+        .feed(b"3 \t;name=value\r\nabc\r\n0\r\n\r\n")
+        .unwrap();
+    assert!(decoder.is_done());
+    assert_eq!(decoder.take().0, vec![b"abc".to_vec()]);
+}
+
+/// RED: `RawMessage` and `ChunkedDecoder` derived `Debug`, so a message logged with `{:?}` printed
+/// its target, every header value (an `authorization` among them) and its body, and a decoder
+/// printed the chunks it held. A Debug now shows the method, header NAMES, `<redacted>` values and
+/// the body as a length.
+#[test]
+fn a_message_debug_shows_names_and_lengths_never_values() {
+    let msg = parse_message(
+        b"POST /v1/SECRETP?key=SECRETQ HTTP/1.1\r\nAuthorization: Bearer SECRETH\r\n\
+          Content-Length: 7\r\n\r\nSECRETB",
+    )
+    .unwrap();
+    let d = format!("{msg:?}");
+    assert!(d.contains("POST"), "{d}");
+    assert!(d.contains("Authorization"), "{d}");
+    assert!(d.contains("<redacted>"), "{d}");
+    assert!(d.contains("body_len: 7"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"7\r\nSECRETB\r\n0\r\nX-T: SECRETT\r\n\r\n")
+        .unwrap();
+    let d = format!("{c:?}");
+    assert!(d.contains("X-T"), "{d}");
+    assert!(!d.contains("SECRET"), "{d}");
+    let mut c = ChunkedDecoder::default();
+    c.feed(b"9\r\nSECR").unwrap();
+    assert!(!format!("{c:?}").contains("SECR"), "{c:?}");
 }

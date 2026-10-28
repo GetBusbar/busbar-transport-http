@@ -49,7 +49,7 @@ pub mod linked {
 
     /// The `http` framer's memory-ABI door: the one entry, linked here and exported by the
     /// dropped-in build alike.
-    pub use crate::door::door;
+    pub use crate::door::{door, MACRO_DOOR};
 }
 
 #[cfg(test)]
