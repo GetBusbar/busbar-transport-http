@@ -81,6 +81,7 @@ pub(crate) fn request_target(
 
 /// A whole request message: where its head ends in the buffered bytes (the head is read in place
 /// from them, `raw::Head::parse`), and its body, a chunked one already decoded.
+#[derive(Debug)]
 pub(crate) struct Whole {
     pub(crate) head_end: usize,
     pub(crate) body: Vec<u8>,
