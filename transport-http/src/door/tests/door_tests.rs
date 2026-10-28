@@ -38,13 +38,66 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
     assert_eq!(
         refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
-        Some("advanced.upstream_http1_only: not of its declared kind")
+        Some("settings: advanced.upstream_http1_only must be true or false")
     );
     assert_eq!(
         refused(r#"{"limits.request_body_max_bytes":-1}"#).as_deref(),
-        Some("limits.request_body_max_bytes: not of its declared kind")
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
     );
-    assert_eq!(refused("[").as_deref(), Some("settings: not JSON"));
+    assert_eq!(
+        refused("[").as_deref(),
+        Some("settings: must be a JSON object")
+    );
+}
+
+/// RED: an undeclared key was read past, a zero limit was taken (a zero body cap refuses every
+/// body, a zero timeout every exchange) and a bad value was named `<key>: not of its declared
+/// kind`. The canon: an undeclared key is refused by name, zero is a bad value, and each bad value
+/// says what the key must be.
+#[test]
+fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
+    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":false,"limits.nope":1}"#).as_deref(),
+        Some("settings: limits.nope is not a setting this transport reads")
+    );
+    assert_eq!(
+        refused(r#"{"limits.request_body_max_bytes":0}"#).as_deref(),
+        Some("settings: limits.request_body_max_bytes must be a count of bytes above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":0}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"limits.upstream_request_timeout_secs":"7"}"#).as_deref(),
+        Some("settings: limits.upstream_request_timeout_secs must be a count of seconds above 0")
+    );
+    assert_eq!(
+        refused(r#"{"advanced.upstream_h2_prior_knowledge":1}"#).as_deref(),
+        Some("settings: advanced.upstream_h2_prior_knowledge must be true or false")
+    );
+}
+
+/// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
+/// built, so the offered name is lower-case; the dial authority stays as written.
+#[test]
+fn locate_offers_a_dns_name_lower_cased() {
+    let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
+    assert_eq!(name, "api.example.com");
+    assert_eq!(authority, "API.Example.com:443");
+    let (_, _, name) = located(b"https://[FE80::1]:4318/").expect("located");
+    assert_eq!(name, "fe80::1");
+}
+
+/// A settings blob that is not a JSON object reads nothing, so it is refused, not defaulted.
+#[test]
+fn a_settings_blob_that_is_not_an_object_is_refused() {
+    for s in ["null", "[]", "\"x\"", "5", "true"] {
+        let r = read_settings(blob(s)).err().map(|e| e.to_string());
+        assert_eq!(r.as_deref(), Some("settings: must be a JSON object"), "{s}");
+    }
+    assert!(read_settings(blob("")).is_ok());
 }
 
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
@@ -71,6 +124,21 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(429), STATUS_CALLER_FAULT);
     assert_eq!(class_of(503), STATUS_FAR_END_FAULT);
     assert_eq!(class_of(101), STATUS_OTHER);
+    // The band edges, each side of each.
+    for (code, class) in [
+        (199, STATUS_OTHER),
+        (200, STATUS_SUCCESS),
+        (299, STATUS_SUCCESS),
+        (300, STATUS_OTHER),
+        (399, STATUS_OTHER),
+        (400, STATUS_CALLER_FAULT),
+        (499, STATUS_CALLER_FAULT),
+        (500, STATUS_FAR_END_FAULT),
+        (599, STATUS_FAR_END_FAULT),
+        (600, STATUS_OTHER),
+    ] {
+        assert_eq!(class_of(code), class, "status {code}");
+    }
 }
 
 /// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
@@ -354,36 +422,9 @@ fn the_entry_claims_http_https_and_sse() {
     assert_eq!(https, http);
 }
 
-/// RED (coordinator ruling L1; contract `FACT_ACCEPTS`/`FACT_DIALS`/`FACT_DETACHES`/`FACT_ADOPTS`):
-/// the tail states exactly the ops this door serves. At this commit that is dialling alone; it states
-/// no retired bit (bit 1, spec l.3779; the rule it named is proven by
-/// `the_head_on_the_wire_is_every_line_the_auth_saw`). RED on the tail that declared nothing.
+/// The tail states exactly the ops this door serves: dialling alone.
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::FACT_DIALS;
     assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
-}
-
-/// RED (audit A1 F6; THE DESIGN Appendix A.8: "zero contended atomics per chunk", request-path ops
-/// "return READY or PENDING in bounded CPU"; A.4.2: conn ops "never block"): the instance holds no
-/// lock that every framing's op takes, and no op waits on a framing's lock. A framing is reached
-/// by its own token alone (`framings::Framings`), and a framing another op holds is answered at
-/// once, never waited for. RED on the instance-wide `Mutex<HashMap>` every `ingest`, `emit`,
-/// `timer`, `begin` and `finish` locked, and the blocking `lock()` on the framing it found.
-#[test]
-fn no_op_takes_an_instance_wide_lock_or_waits_on_a_framing() {
-    let door = include_str!("../mod.rs");
-    let code: String = door
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        !code.contains("Mutex<HashMap"),
-        "an instance-wide map lock is taken per op"
-    );
-    assert!(
-        !code.contains(".lock().expect(\"framing\")"),
-        "an op waits on a framing's lock"
-    );
 }

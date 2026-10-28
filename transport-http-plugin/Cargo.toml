@@ -4,7 +4,7 @@ name = "busbar-transport-http-plugin"
 version = "1.6.0"
 publish = false            # first-party signed cdylib, shipped as a packed/signed tarball, not to crates.io
 edition = "2021"
-rust-version = "1.97"
+rust-version.workspace = true
 description = "First-party signed kind:transport plugin cdylib: the `http` transport, packaged as a droppable busbar plugin. Drop the signed tarball into `plugins/` and the boot seal folds the wire beside the linked ones."
 license = "Apache-2.0"
 
@@ -26,3 +26,6 @@ hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
+
+[lints]
+workspace = true
