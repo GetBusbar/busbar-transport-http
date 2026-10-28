@@ -110,6 +110,7 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
     let mut i: BeginIn = z();
     i.head = in_head();
     i.side = SIDE_DIAL;
+    i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
     i.target = s("http://127.0.0.1:40123");
     i.facts = &facts;
     i.sink = sink();
@@ -186,9 +187,9 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
+// THE PUBLISHED SUITE (busbar-test-kit's `conformance_suite!`): both legs through the one
 // loader, every step at its pinned crossing count, over `conformance.json`.
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_transport_http::door::door,
     cdylib: "busbar_transport_http_plugin",
     inputs: include_str!("conformance.json"),

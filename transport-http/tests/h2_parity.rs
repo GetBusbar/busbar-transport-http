@@ -115,7 +115,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool) -> (Vec<u8>, u16) {
 fn capture_door(port: u16, h2: bool) -> Vec<u8> {
     let d = busbar_transport_http::door::door();
     // SAFETY: the door's `'static` table.
-    let ops: &Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+    let ops: &Ops = unsafe { &*(*d).ops().cast::<Ops>() };
     let settings = if h2 {
         r#"{"advanced.upstream_h2_prior_knowledge":true}"#
     } else {
@@ -159,6 +159,7 @@ fn capture_door(port: u16, h2: bool) -> Vec<u8> {
     let target = format!("http://127.0.0.1:{port}");
     let mut b: BeginIn = z();
     b.side = SIDE_DIAL;
+    b.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
     b.target = s(&target);
     b.facts = &facts;
     b.sink = sink();

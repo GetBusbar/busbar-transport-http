@@ -344,6 +344,7 @@ impl Host {
         }
         let mut i: BeginIn = z();
         i.side = SIDE_DIAL;
+        i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
         i.target = s("http://upstream.test");
         i.facts = &facts;
         i.sink = self.sink();
@@ -637,7 +638,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 fn linked() -> &'static Ops {
     let d = busbar_transport_http_plugin::door::door();
     // SAFETY: the door's `'static` table.
-    unsafe { &*(*d).ops.cast::<Ops>() }
+    unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
 fn dropped() -> (&'static Ops, &'static libloading::Library) {
@@ -662,7 +663,7 @@ fn dropped() -> (&'static Ops, &'static libloading::Library) {
         unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
     let d = door();
     // SAFETY: the dropped-in door's `'static` table.
-    (unsafe { &*(*d).ops.cast::<Ops>() }, lib)
+    (unsafe { &*(*d).ops().cast::<Ops>() }, lib)
 }
 
 #[test]
