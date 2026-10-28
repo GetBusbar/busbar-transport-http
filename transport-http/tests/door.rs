@@ -60,7 +60,7 @@ fn ops() -> &'static Ops {
     #[allow(unused_unsafe)]
     let d: *const Door = unsafe { door::door() };
     // SAFETY: the door answers a `'static` door whose table is this kind's `Ops`.
-    unsafe { &*(*d).ops.cast::<Ops>() }
+    unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
 fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {

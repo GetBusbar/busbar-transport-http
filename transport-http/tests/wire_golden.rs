@@ -242,7 +242,7 @@ impl Door {
     fn open_at(settings: &str, agreed: &str, target: &str) -> Self {
         let d = busbar_transport_http::door::door();
         // SAFETY: the door's `'static` table.
-        let ops: &'static Ops = unsafe { &*(*d).ops.cast::<Ops>() };
+        let ops: &'static Ops = unsafe { &*(*d).ops().cast::<Ops>() };
         let mut i: OpenIn = z();
         i.settings = Blob {
             ptr: settings.as_ptr(),
