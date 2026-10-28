@@ -31,6 +31,7 @@ use http_body_util::Full;
 use hyper::body::{Body, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::rt::{Executor, Sleep};
+use zeroize::Zeroizing;
 
 use crate::raw::RawStartLine;
 use crate::{complete_message, request_target, retry_after_secs, EgressHead};
@@ -74,7 +75,11 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// the wait for the connection, the head and every byte of the body spend the same clock.
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
-    Writing(Vec<u8>, EgressHead, u64),
+    /// The raw buffer is zeroed when it is dropped (the message complete, refused, or the framing
+    /// gone), and when it grows (`append_zeroizing`). Only this buffer is wiped: the parsed head
+    /// (`EgressHead`), the `RawMessage` and the `http::Request` built from it still hold header
+    /// values in ordinary memory, until credentials stop reaching the framer as plaintext.
+    Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
     /// Sent; waiting for the response head.
@@ -165,7 +170,8 @@ impl Framing {
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let dial = canonical_host(
             dial.parse()
-                .map_err(|_| Failure(format!("not a target: {dial}")))?,
+                // The dial is not repeated: a target may carry a credential.
+                .map_err(|_| Failure("the target is not a URL".into()))?,
         );
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
@@ -235,13 +241,13 @@ impl Framing {
     /// A message that cannot be sent fails its STREAM on HTTP/2 (a failure piece, its siblings
     /// untouched), and the framing on HTTP/1.1, where the connection carries one exchange.
     ///
-    /// # Errors
-    ///
-    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
-    ///
     /// `deadline_ns` is the attempt's deadline as the caller stamped it at the attempt's start (the
     /// connect spent part of it); `0` counts the configured request timeout from `now_ns`. Only a
     /// stream's first `emit` reads it.
+    ///
+    /// # Errors
+    ///
+    /// HTTP/1.1 only: the message is malformed, over the body cap, or is not a request.
     pub fn emit(
         &mut self,
         stream: u64,
@@ -322,7 +328,7 @@ impl Framing {
             None => {
                 self.exchanges.push((
                     stream,
-                    Stage::Writing(Vec::new(), EgressHead::default(), deadline),
+                    Stage::Writing(Zeroizing::default(), EgressHead::default(), deadline),
                 ));
                 self.exchanges.len() - 1
             }
@@ -332,19 +338,21 @@ impl Framing {
                 "stream {stream} already carries a request"
             )));
         };
-        buf.extend_from_slice(bytes);
+        append_zeroizing(buf, bytes);
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
             return Err(Failure("request message over the body cap".into()));
         }
-        let raw = complete_message(buf, head, max)
-            .map_err(|e| Failure(format!("request message: {e:?}")))?;
-        let Some(raw) = raw else { return Ok(()) };
-        let RawStartLine { method, path } = &raw.start;
+        let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
+            .map_err(|e| Failure(format!("request message: {e}")))?;
+        let Some(mut raw) = raw else { return Ok(()) };
+        let RawStartLine::Request { method, path } = &raw.start else {
+            return Err(Failure("a status line is not a request".into()));
+        };
+        // The path is not repeated: a path (and its query) may carry a token.
         let target = request_target(&self.dial, path.as_deref(), !self.carried)
-            .map_err(|e| Failure(format!("{e:?}")))?;
-        self.carried = true;
+            .map_err(|e| Failure(format!("request target: {e}")))?;
         let mut b = http::Request::builder().method(method.as_str()).uri(target);
         for (k, v) in &raw.headers {
             // A chunked body was decoded by `complete_message`, so its coding describes the wire
@@ -358,16 +366,21 @@ impl Framing {
             b = b.header(k.as_str(), v.as_slice());
         }
         let mut req = b
-            .body(Full::new(Bytes::from(raw.body)))
+            .body(Full::new(Bytes::from(std::mem::take(&mut raw.body))))
             .map_err(|e| Failure(format!("request: {e}")))?;
         target_form(&mut req, self.proto)?;
+        // Spent only by a request that was built: one the builder refuses leaves the dial path to
+        // the next that names no target.
+        self.carried = true;
         let wait = self.io.timer().sleep_until_ns(*deadline);
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
     }
 
     /// Drive the connection at host time (`now_ns` monotonic, `now_unix_ns` wall) until nothing
-    /// inside it has more to do.
+    /// inside it has more to do. A framing failure with output still owed is also stated on each
+    /// live stream (a failure piece after that output): the host never calls an ended connection
+    /// again. With nothing owed no piece is pushed and the door answers the failure at once.
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
@@ -378,6 +391,7 @@ impl Framing {
         let io = self.io.clone();
         if let Err(f) = io.rounds(|cx| self.step(cx)) {
             self.failed = Some(f);
+            self.fail_streams();
             return;
         }
         let err = self.conn_err.lock().expect("err").clone();
@@ -388,8 +402,26 @@ impl Framing {
                 .any(|(_, s)| !matches!(s, Stage::Refused))
             {
                 self.failed = Some(Failure(e));
+                self.fail_streams();
             }
         }
+    }
+
+    /// With output pending, state the recorded failure on every stream not already finished, then
+    /// drop the exchanges (so a later call pushes nothing).
+    fn fail_streams(&mut self) {
+        if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
+            return;
+        }
+        let Some(Failure(why)) = &self.failed else {
+            return;
+        };
+        for (id, stage) in &self.exchanges {
+            if !matches!(stage, Stage::Done) {
+                self.out.push(Piece::failure(*id, why));
+            }
+        }
+        self.exchanges.clear();
     }
 
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
@@ -453,10 +485,23 @@ impl Owed for Framing {
     }
 }
 
-/// The dial target with its authority as 1.5.5's client sent it (its URL parser, WHATWG in
-/// reqwest 0.12, normalised the host before the request was built): the host lower-cased, an IPv4
-/// spelling written as the dotted quad it names ([`super::offered_name`]; `https://127.1:4318/`
-/// went out as `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
+/// Append `bytes` to `buf`, never leaving a copy of what it held behind: where it must grow, the
+/// bytes move to a new allocation and the old one is zeroed as it drops (a `Vec`'s own growth
+/// frees the old allocation as it was).
+fn append_zeroizing(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    let need = buf.len().saturating_add(bytes.len());
+    if need > buf.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity(need.max(buf.capacity() * 2)));
+        grown.extend_from_slice(buf);
+        *buf = grown;
+    }
+    buf.extend_from_slice(bytes);
+}
+
+/// The dial target with its authority as 1.5.5's client sent it (its URL parser normalised the
+/// host before the request was built): the host lower-cased, an IPv4 spelling written as the
+/// dotted quad it names ([`super::offered_name`]; `https://127.1:4318/` went out as
+/// `127.0.0.1:4318`), and the scheme's own port dropped. One string, so the request's
 /// `:authority` (HTTP/2) and the `host` line the framer states (HTTP/1.1) agree.
 fn canonical_host(dial: http::Uri) -> http::Uri {
     let Some(host) = dial.host() else {
@@ -527,7 +572,7 @@ fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(),
         Some(p) if p.as_str() != "/" => p
             .as_str()
             .parse()
-            .map_err(|_| Failure(format!("not an origin-form target: {p}")))?,
+            .map_err(|_| Failure("request target: not an origin-form target".into()))?,
         _ => http::Uri::default(),
     };
     Ok(())
@@ -664,9 +709,15 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
 /// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6). `None` where the head
-/// names none, or names one that is not a single valid length (the field block never carries it,
-/// so a head without one states nothing).
+/// carries a `Transfer-Encoding` (the coding frames the body), names none, or names one that is
+/// not a single valid length (the field block never carries it, so a head without one states
+/// nothing).
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
+    // A coding overrides the length (RFC 9112 6.3): hyper frames such a body by the coding, so a
+    // `Content-Length` beside it states a length the body does not have.
+    if headers.contains_key(http::header::TRANSFER_ENCODING) {
+        return None;
+    }
     let mut one: Option<u64> = None;
     for v in headers.get_all(http::header::CONTENT_LENGTH) {
         for s in v.to_str().ok()?.split(',').map(str::trim) {

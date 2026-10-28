@@ -15,14 +15,8 @@ use busbar_contract::abi::transport::{
 /// The `http` claim: the entry's first claim and the row's key.
 pub const KEY: &str = "http";
 
-/// The `sse` claim: an HTTP response body read as a stream of events, framed as `http` is.
-pub mod sse {
-    /// The `sse` claim's key.
-    pub const KEY: &str = "sse";
-}
-
-/// The `sse` claim's key, by its own name.
-pub(crate) const SSE_KEY: &str = sse::KEY;
+/// The `sse` claim's key: an HTTP response body read as a stream of events, framed as `http` is.
+pub(crate) const SSE_KEY: &str = "sse";
 
 /// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
 /// secures before they leave (THE DESIGN §5: "http claims `http`, `https` and `sse`").
@@ -44,27 +38,12 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    // Bit 1 is not stated: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH HAS RUN (BUSBAR-1.6.0.md
-    // l.3779, §4 item 5; ruling 23) is a rule this transport keeps and proves in its own suite
-    // (`the_head_on_the_wire_is_every_line_the_auth_saw`), not a fact a tail states. The framer's
-    // own lines (`accept`, `host`) are stated at `locate` and the length line for a non-empty body
-    // is stated by the host, all before the auth runs; the framer renders exactly that head and
-    // adds no line at `encode` or `emit`.
-    //
-    // THE ONE EXCEPTION to that rule, scoped exactly (Q128 transport-http, ruling (D)): HTTP/2, a
-    // payload method (hyper's `method_has_defined_payload_semantics`: any but GET, HEAD, DELETE and
-    // CONNECT), an EMPTY body. The host states no length for an empty body (1.5.5's HTTP/1.1 wire
-    // carries none), and the h2 framing adds `content-length: 0` at send, exactly as 1.5.5's client
-    // (reqwest 0.12 over hyper 1.11.0, v1.5.5 Cargo.lock) did: hyper `src/proto/h2/client.rs`
-    // l.710-713, `set_content_length_if_missing` when the body's exact size is 0 and
-    // `method_has_defined_payload_semantics`. A 1.5.5 parity exception, recorded as the
-    // coordinator's ruling (D) on Q128 transport-http. That line is added after the auth, and it
-    // is not one an auth could sign: a header-signing auth style (one declaring
-    // `STYLE_NEEDS_HEADERS`) signs a fixed set that never names `content-length`, and every other
-    // style is handed no head at all. Pinned: `tests/h2_parity.rs` (both wires against 1.5.5's
-    // client), and the header-signing style's own no-length-signed cell.
-    // The ops this door serves (coordinator ruling L1): it dials. It states no retired bit (bit 1,
-    // spec l.3779): the rule that bit named is proven in this suite, not stated.
+    // Nothing is added to the head after the auth has run: the framer's own lines (`accept`,
+    // `host`) are stated at `locate` and the length line by the host, all before the auth, and the
+    // framer renders exactly that head (`the_head_on_the_wire_is_every_line_the_auth_saw`). The one
+    // exception is 1.5.5's: HTTP/2, a payload method, an empty body gets `content-length: 0` at
+    // send, as hyper's client did (`set_content_length_if_missing`); no auth style signs that line
+    // (`tests/h2_parity.rs`). The door dials and serves no other op.
     facts: busbar_contract::abi::transport::FACT_DIALS,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,

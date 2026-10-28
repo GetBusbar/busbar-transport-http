@@ -4,8 +4,8 @@ name = "busbar-transport-http"
 version = "1.6.0"
 publish = false            # a first-party plugin crate; shipped linked into busbar or as a signed tarball
 edition = "2021"
-rust-version = "1.97"
-description = "The http transport: request/response frames over tcp, and the http framer door."
+rust-version.workspace = true
+description = "The http transport: a sans-IO http framer door that composes over nothing."
 license = "Apache-2.0"
 
 [lib]
@@ -18,13 +18,13 @@ crate-type = ["rlib"]
 #
 # AND NO SIBLING TRANSPORT. This crate once declared `busbar-transport-tcp` and a `tls` transport
 # crate (retired: TLS is core's connection security) and referenced neither in
-# any of its source files: `listen`/`accept` bind their own socket through `tokio::net`, and this
+# any of its source files: `listen`/`accept` are refused (this door binds no socket), and this
 # crate dials nothing (an upstream connection is the connector's, TLS included). Those names put a capability crate in the
 # dependency closure of four plugin crates by two lines that compiled nothing (DECISIONS #40 — the
 # wall is over the CLOSURE, and a transitive member is invisible in the manifest that causes it).
 # What `http` composes over is still stated, but it is stated where it is true: `COMPOSES_OVER =
-# &["tcp"]` in `meta.rs` is a declared wire fact the registry reads, and it needs no link edge to be
-# true.
+# &[]` in `meta.rs` is a declared wire fact the registry reads (the carrier is the connector's
+# choice), and it needs no link edge to be true.
 [dependencies]
 memchr = { workspace = true }
 busbar-contract = { workspace = true }
@@ -32,8 +32,12 @@ hyper = { workspace = true }
 http-body-util = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
+# `Retry-After` HTTP-date forms (`message::parse_retry_after`), the parser 1.5.5 used.
+httpdate = { workspace = true }
 # The door's settings blob is JSON (`door::read_settings`).
 serde_json = { workspace = true }
+# The request message `emit` collects is zeroed as it is dropped (`door::engine::Stage::Writing`).
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
@@ -53,3 +57,6 @@ busbar-contract = { workspace = true, features = ["test-seal"] }
 h2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
+
+[lints]
+workspace = true
