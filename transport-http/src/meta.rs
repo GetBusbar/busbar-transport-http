@@ -38,8 +38,14 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     // framer renders exactly that head (`the_head_on_the_wire_is_every_line_the_auth_saw`). The one
     // exception is 1.5.5's: HTTP/2, a payload method, an empty body gets `content-length: 0` at
     // send, as hyper's client did (`set_content_length_if_missing`); no auth style signs that line
-    // (`tests/h2_parity.rs`). The door dials and serves no other op.
-    facts: busbar_contract::abi::transport::FACT_DIALS,
+    // (`tests/h2_parity.rs`).
+    //
+    // The ops this door serves: it dials; it serves the accepted side (`begin` on `SIDE_ACCEPT`,
+    // `door::accept`); and it detaches an upgrade line, which the upgrade's transport adopts. It
+    // does not adopt: nothing hands a connection to http.
+    facts: busbar_contract::abi::transport::FACT_DIALS
+        | busbar_contract::abi::transport::FACT_ACCEPTS
+        | busbar_contract::abi::transport::FACT_DETACHES,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,

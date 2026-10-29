@@ -414,9 +414,78 @@ fn the_entry_claims_http_https_and_sse() {
     assert_eq!(https, http);
 }
 
-/// The tail states exactly the ops this door serves: dialling alone.
+/// The tail states exactly the ops this door serves: dialling, the accepted side (`begin` on
+/// `SIDE_ACCEPT`), and `detach` on an upgrade line. Not adopting: nothing hands a connection to
+/// http.
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
-    use busbar_contract::abi::transport::FACT_DIALS;
-    assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
+    use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
+    assert_eq!(
+        crate::meta::TAIL.facts,
+        FACT_DIALS | FACT_ACCEPTS | FACT_DETACHES
+    );
+    assert_eq!(
+        crate::meta::TAIL.facts & FACT_ADOPTS,
+        0,
+        "adopt stays declined"
+    );
+}
+
+/// THE INBOUND CLAIM ROWS ARE WHAT THE ACCEPT SIDE MATCHES (`BUSBAR-1.6.0.md` §6 "Auth points and
+/// guest lists" item 3: "The match vocabulary is defined once in `abi/transport`"; item 4: the
+/// listener's transport "matches the route on its guest list"). Every selector form the `http`
+/// claim row declares (`claims::SELECTOR_FORMS`) is one a guest-list line's route
+/// (`abi::transport::route::RouteMatch`) carries: a `PATH_*` form or a `FIELD_*` predicate. A form
+/// with no route spelling is a claim the door could never honour. RED before the fix: the row
+/// declared `HeaderExact`, which no `FIELD_*` predicate spells.
+#[test]
+fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
+    use busbar_contract::abi::transport::route::{
+        FIELD_PRESENT, FIELD_VALUE_PREFIX, PATH_CONTAINS, PATH_EXACT, PATH_PATTERN, PATH_PREFIX,
+        PATH_SUFFIX,
+    };
+    use busbar_contract::SelectorForm;
+    let spelled = |f: SelectorForm| match f {
+        SelectorForm::ExactPath => Some(PATH_EXACT),
+        SelectorForm::PrefixOneLevel => Some(PATH_PREFIX),
+        SelectorForm::PathPattern => Some(PATH_PATTERN),
+        SelectorForm::PathSuffix => Some(PATH_SUFFIX),
+        SelectorForm::PathContains => Some(PATH_CONTAINS),
+        SelectorForm::HeaderPresent => Some(FIELD_PRESENT),
+        SelectorForm::HeaderPrefix => Some(FIELD_VALUE_PREFIX),
+        _ => None,
+    };
+    let unspelled: Vec<SelectorForm> = crate::claims::SELECTOR_FORMS
+        .iter()
+        .copied()
+        .filter(|f| spelled(*f).is_none())
+        .collect();
+    assert_eq!(
+        unspelled,
+        Vec::<SelectorForm>::new(),
+        "a declared inbound form no guest-list route spells"
+    );
+    assert!(crate::claims::SSE_SELECTOR_FORMS.is_empty());
+}
+
+/// THE `sse` CLAIM IS SERVED, FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584: "http claims
+/// `http`, `https` and `sse`"; Q128 reader B, coordinator ruling: plain, port 80, the same target,
+/// host line and protocol offer as `http`). `locate` on an `sse` target answers what it answers for
+/// the `http` one, and the framer's own head lines are the same. RED before the fix: `locate`
+/// refused every `sse` target.
+#[test]
+fn an_sse_target_locates_as_its_http_twin() {
+    for (sse, http) in [
+        ("sse://peer.test/x", "http://peer.test/x"),
+        (
+            "sse://peer.test:8080/x?alt=sse",
+            "http://peer.test:8080/x?alt=sse",
+        ),
+        ("sse://127.1/x", "http://127.1/x"),
+    ] {
+        assert_eq!(located(sse.as_bytes()), located(http.as_bytes()), "{sse}");
+        assert!(located(sse.as_bytes()).is_ok(), "{sse}");
+        let defaults = |t: &str| engine::client_defaults(&t.parse::<http::Uri>().expect("a URI"));
+        assert_eq!(defaults(sse), defaults(http), "{sse}");
+    }
 }

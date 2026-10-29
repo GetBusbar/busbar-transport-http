@@ -18,6 +18,7 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
+use super::accept::Accepted;
 use super::engine::Framing;
 
 /// The first segment's slots; segment `k` holds `BASE << k`.
@@ -25,9 +26,13 @@ const BASE: usize = 64;
 /// Segments: `BASE * (2^SEGMENTS - 1)` framings at most (about four million).
 const SEGMENTS: usize = 16;
 
-/// One framing the instance holds.
-pub(super) struct Held {
-    pub(super) framing: Framing,
+/// One framing the instance holds: a dialled connection's client, or an accepted connection's
+/// server.
+pub(super) enum Held {
+    /// A dialled connection (`SIDE_DIAL`).
+    Dial(Framing),
+    /// An accepted connection (`SIDE_ACCEPT`).
+    Accept(Accepted),
 }
 
 /// A slot's state: the generation of the token that last named it, and the framing it holds.
@@ -110,8 +115,14 @@ fn untoken(token: u64) -> Option<(u32, u32)> {
 }
 
 impl Framings {
-    /// Hold `framing`, answering its token, or `None` when every slot is in use.
+    /// Hold the dialled `framing`, answering its token, or `None` when every slot is in use.
+    #[cfg(test)]
     pub(super) fn insert(&self, framing: Framing) -> Option<u64> {
+        self.insert_held(Held::Dial(framing))
+    }
+
+    /// Hold `held`, answering its token, or `None` when every slot is in use.
+    pub(super) fn insert_held(&self, held: Held) -> Option<u64> {
         let index = {
             let mut free = self
                 .free
@@ -138,7 +149,7 @@ impl Framings {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.generation = slot.generation.wrapping_add(1);
-        slot.held = Some(Box::new(Held { framing }));
+        slot.held = Some(Box::new(held));
         Some(token(index, slot.generation))
     }
 
@@ -166,6 +177,21 @@ impl Framings {
             return Err(Reach::Gone);
         }
         Ok(state)
+    }
+
+    /// Visit every framing no op holds right now, `f` on each. Never waits: a framing another op
+    /// holds is skipped, as that op is running, not parked. Once per call over every minted slot,
+    /// for the rare op that names no framing (`cancel` names only a ticket).
+    pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) {
+        for segment in self.segments.iter().filter_map(OnceLock::get) {
+            for slot in segment.iter() {
+                if let Ok(mut state) = slot.0.try_lock() {
+                    if let Some(held) = state.held.as_mut() {
+                        f(held);
+                    }
+                }
+            }
+        }
     }
 
     /// Drop the framing `token` names and give its slot back.
