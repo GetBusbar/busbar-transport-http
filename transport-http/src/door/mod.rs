@@ -883,9 +883,7 @@ impl SafeSlot for Begin {
                     .with_scheme(scheme)
                     .with_alpn(alpn),
             );
-            let r = step("begin", &mut h, i.field(|x| &x.sink), &mut o, None, |_| {
-                Ok(())
-            });
+            let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
             if r != Outcome::Ready {
                 return r;
             }
@@ -932,9 +930,7 @@ impl SafeSlot for Begin {
         // The framing joins the instance's table only once its first step is READY: a begin that
         // fails hands the host no token, so nothing would ever release an entry it left behind.
         let mut h = Held::Dial(framing);
-        let r = step("begin", &mut h, i.field(|x| &x.sink), &mut o, None, |_| {
-            Ok(())
-        });
+        let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
         if r != Outcome::Ready {
             return r;
         }
@@ -1264,9 +1260,9 @@ fn with(
         Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
     };
     if head.flags & FLAG_RESUME != 0 {
-        return step(op.name, slot.held(), sink, o, kernel, |_| Ok(()));
+        return step(slot.held(), sink, o, kernel, |_| Ok(()));
     }
-    step(op.name, slot.held(), sink, o, kernel, f)
+    step(slot.held(), sink, o, kernel, f)
 }
 
 /// `<op>: no open instance`, for each op [`with`] runs.
@@ -1279,9 +1275,13 @@ fn no_open_instance(op: &str) -> &'static str {
     }
 }
 
-/// Run `f` on `h`'s framing, drive it and fill the sink; a failure text leads with `op`.
+/// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
+/// system's or the far end's words alone, never led by the op's name: a plane passes it on to its
+/// caller (a far end that closed unanswered is "connection closed before message completed", as
+/// 1.5.5's client said it), and this door has no log or audit channel to keep the op name in; the
+/// host knows which op it crossed. The door's own refusals (no open instance, no such framing) keep
+/// their op-named words.
 fn step(
-    op: &'static str,
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -1289,7 +1289,7 @@ fn step(
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(h) {
-        return failed(o, format!("{op}: {}", e.0));
+        return failed(o, e.0);
     }
     match h {
         Held::Dial(framing) => {
@@ -1297,7 +1297,7 @@ fn step(
             let pending = framing.wire_pending() || !framing.pieces().is_empty();
             if let Some(e) = framing.failure().cloned() {
                 if !pending {
-                    return failed(o, format!("{op}: {}", e.0));
+                    return failed(o, e.0);
                 }
             }
             fill(framing, sink, o, class_of, fault_of);
