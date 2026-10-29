@@ -28,7 +28,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@7840242505d812f5d123c4e88a9f30137aa5ce86
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@46423abd1bcd01990e2ba756bb718465f18805e5
     with:
       plugin_crate: busbar-transport-http-plugin
       manifest_name: busbar-transport-http
@@ -49,7 +49,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@7840242505d812f5d123c4e88a9f30137aa5ce86
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@46423abd1bcd01990e2ba756bb718465f18805e5
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-transport-http
