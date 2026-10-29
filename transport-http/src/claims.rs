@@ -11,13 +11,19 @@ use busbar_contract::SelectorForm;
 
 /// The forms an INGRESS claim over this wire may take.
 ///
-/// `http` carries a request line and headers, so a claim on this wire can be about either, in each
-/// of the path shapes the grammar spells.
+/// `http` carries a request line and headers, so a claim on this wire can be about either. The
+/// accepted side honours EXACTLY these (`door::accept`, `door::guest`): a claim becomes a guest-list
+/// line whose route the door matches in the contract's one route vocabulary
+/// (`abi::transport::route`; `BUSBAR-1.6.0.md` §6 "Auth points and guest lists" item 3, l.906-910:
+/// "The match vocabulary is defined once in `abi/transport`"), so a form is declared here only
+/// where that vocabulary spells it: the five path forms (`PATH_EXACT`, `PATH_PREFIX`,
+/// `PATH_PATTERN`, `PATH_SUFFIX`, `PATH_CONTAINS`) and the two field predicates (`FIELD_PRESENT`,
+/// `FIELD_VALUE_PREFIX`). `HeaderExact` is not declared: no route predicate spells an exact value,
+/// so the door could never honour a claim in it.
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,
     SelectorForm::PathPattern,
-    SelectorForm::HeaderExact,
     SelectorForm::HeaderPresent,
     SelectorForm::HeaderPrefix,
     SelectorForm::PathSuffix,

@@ -268,7 +268,8 @@ fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, String) {
 }
 
 /// RED: every op of the role this framer does not play answered a bare REFUSED, with no words.
-/// Each is now REFUSED in the canon's words, naming the op.
+/// Each is now REFUSED in the canon's words, naming the op. (`refuse` and `detach` are the accepted
+/// side's, served.)
 #[test]
 fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words() {
     let inst = open("");
@@ -310,14 +311,6 @@ fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words(
     assert_eq!(
         op::<ArrivalIn, ArrivalOut>(o.arrival, inst, slot::ARRIVAL),
         refused("arrival")
-    );
-    assert_eq!(
-        op::<RefuseIn, FramerOut>(o.refuse, inst, slot::REFUSE),
-        refused("refuse")
-    );
-    assert_eq!(
-        op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH),
-        refused("detach")
     );
     assert_eq!(
         op::<AdoptIn, FramerOut>(o.adopt, inst, slot::ADOPT),
@@ -378,6 +371,14 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
     assert_eq!(
         op::<FinishIn, FramerOut>(o.finish, inst, slot::FINISH),
         gone("finish")
+    );
+    assert_eq!(
+        op::<RefuseIn, FramerOut>(o.refuse, inst, slot::REFUSE),
+        gone("refuse")
+    );
+    assert_eq!(
+        op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH),
+        gone("detach")
     );
 }
 
