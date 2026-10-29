@@ -640,10 +640,9 @@ impl SafeSlot for Refuse {
         let stream = (i.has_stream != 0).then_some(i.stream);
         let (status, head_sent) = (i.status, i.head_sent != 0);
         with(
-            "refuse",
+            REFUSE,
             &p,
             i.head,
-            false,
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -961,10 +960,9 @@ impl SafeSlot for Ingest {
     ) -> Outcome {
         let bytes = i.bytes();
         with(
-            "ingest",
+            INGEST,
             &p,
             i.head,
-            true,
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -994,10 +992,9 @@ impl SafeSlot for Emit {
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
         let mut full = false;
         let r = with(
-            "emit",
+            EMIT,
             &p,
             i.head,
-            true,
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -1035,10 +1032,9 @@ impl SafeSlot for Timer {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         with(
-            "timer",
+            TIMER,
             &p,
             i.head,
-            false,
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -1204,14 +1200,44 @@ impl SafeSlot for Encode {
     }
 }
 
-/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with `op`. An
-/// op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its input
-/// whole the first time: `f` is not run again.
+/// A framer op [`with`] runs: its name, which every failure text leads with, and whether it runs
+/// guest-list admission.
+#[derive(Clone, Copy)]
+struct FramerOp {
+    /// The op's name.
+    name: &'static str,
+    /// Whether the op runs guest-list admission: only the ticketed input ops do.
+    admits: bool,
+}
+
+/// `ingest`: a ticketed input op, so it admits.
+const INGEST: FramerOp = FramerOp {
+    name: "ingest",
+    admits: true,
+};
+/// `emit`: a ticketed input op, so it admits.
+const EMIT: FramerOp = FramerOp {
+    name: "emit",
+    admits: true,
+};
+/// `refuse`: drives only what is already admitted.
+const REFUSE: FramerOp = FramerOp {
+    name: "refuse",
+    admits: false,
+};
+/// `timer`: drives only what is already admitted.
+const TIMER: FramerOp = FramerOp {
+    name: "timer",
+    admits: false,
+};
+
+/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
+/// name. An op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its
+/// input whole the first time: `f` is not run again.
 fn with(
-    op: &'static str,
+    op: FramerOp,
     p: &sdk::Instance<'_, Instance>,
     head: InHead,
-    admit: bool,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -1219,7 +1245,7 @@ fn with(
 ) -> Outcome {
     let Some(inst) = p.get() else {
         // A static text: with no instance there is nowhere to keep an owned one.
-        o.error(no_open_instance(op));
+        o.error(no_open_instance(op.name));
         return Outcome::Failed;
     };
     let mut kernel = HostKernel {
@@ -1231,16 +1257,16 @@ fn with(
     // and B): it calls the host auth handle, a may-pend service callable only inside a ticketed op
     // (THE DESIGN §11.12 l.1602-1604; Appendix A.4.6 l.3646). `timer` and `refuse` never pend and
     // only drive what is already admitted.
-    let kernel = (admit && !head.ticket.is_none()).then_some(&mut kernel);
+    let kernel = (op.admits && !head.ticket.is_none()).then_some(&mut kernel);
     // Reached by its token alone; a framing another op holds is answered at once (audit A1 F6).
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
-        Err(why) => return failed(o, format!("{op}: {}", why.why())),
+        Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
     };
     if head.flags & FLAG_RESUME != 0 {
-        return step(op, slot.held(), sink, o, kernel, |_| Ok(()));
+        return step(op.name, slot.held(), sink, o, kernel, |_| Ok(()));
     }
-    step(op, slot.held(), sink, o, kernel, f)
+    step(op.name, slot.held(), sink, o, kernel, f)
 }
 
 /// `<op>: no open instance`, for each op [`with`] runs.

@@ -2560,7 +2560,7 @@ fn offers_the_peer_point(label: &str, door: *const Door) {
     use busbar_contract::abi::transport::check::check_offered_points;
     // SAFETY: the door's `'static` Statement and its `'static` extensions blob.
     let ext = unsafe {
-        let st = &*(*door).statement;
+        let st = &*(*door).statement();
         if st.extensions.ptr.is_null() {
             &[][..]
         } else {
