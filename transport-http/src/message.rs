@@ -93,7 +93,8 @@ pub(crate) struct Whole {
 /// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk of
 /// a chunked body seen, or a message that declares neither coding and therefore carries no body at
 /// all. A chunked message is decoded here, so what comes back always carries the body itself rather
-/// than a framing of it. The head is held to `max_head_bytes` and the body to `max_body_bytes`.
+/// than a framing of it. The head is held to `max_head_bytes` and the body to `max_body_bytes`; a
+/// byte past either ending is refused (`Framing`).
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,

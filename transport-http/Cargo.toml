@@ -51,6 +51,10 @@ url = { workspace = true }
 # fixture implementor of the SEALED `KernelSeal` trait; this crate's test harnesses used to
 # forge their own. Dev-only and feature-gated, so it is absent from every release build.
 busbar-contract = { workspace = true, features = ["test-seal"] }
+# THE FAR END THAT READS THE HEAD (`door/tests`, ruling 23): an HTTP/2 server reading the door's
+# own wire, so the cell compares the head the auth saw with every line a far end receives. Already
+# in this lock through hyper's `http2` feature: no crate is added.
+h2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "io-util", "time", "macros"] }
 
 

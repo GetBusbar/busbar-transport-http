@@ -77,8 +77,7 @@ fn retry_after_reads_every_http_date_form() {
 ///
 /// `write` accumulates, and it asks "is this message whole yet?" on every chunk. Answering that
 /// used to re-run the whole header parse over the same unchanged prefix each time — a fresh Vec and
-/// two Strings per header, allocated and dropped, for every chunk of the body. Same standard the
-/// crate holds its chunked decoding to, now applied here.
+/// two Strings per header, allocated and dropped, for every chunk of the body.
 #[test]
 fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".to_vec();
@@ -239,6 +238,7 @@ fn the_envelope_encodes_as_an_http_message() {
             ("method", b"POST".as_slice()),
             ("path", b"/v1/messages".as_slice()),
             ("authorization", b"Token substituted".as_slice()),
+            ("content-length", b"13".as_slice()),
         ],
         b"{\"model\":\"m\"}",
     )
@@ -252,7 +252,7 @@ fn the_envelope_encodes_as_an_http_message() {
     assert!(text.contains("authorization: Token substituted\r\n"));
     assert!(
         text.contains("content-length: 13\r\n"),
-        "the length is a fact about the bytes below, stated by the transport"
+        "the length the head states, rendered where it was stated"
     );
     assert!(text.ends_with("\r\n\r\n{\"model\":\"m\"}"));
 
@@ -300,7 +300,7 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
         ("path", b"/a\r\nHost: elsewhere".as_slice()),
     ];
     for field in poisoned {
-        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"body")
+        let err = crate::transport::render_envelope(std::slice::from_ref(field), b"")
             .expect_err("a field carrying a line ending is not encodable");
         assert_eq!(
             err,
@@ -311,8 +311,14 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     }
     // And an ordinary envelope beside them still encodes, so the check refuses injection rather
     // than refusing headers.
-    crate::transport::render_envelope(&[("x-note", b"ok".as_slice())], b"body")
-        .expect("a clean field still encodes");
+    crate::transport::render_envelope(
+        &[
+            ("x-note", b"ok".as_slice()),
+            ("content-length", b"4".as_slice()),
+        ],
+        b"body",
+    )
+    .expect("a clean field still encodes");
 }
 
 /// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
@@ -348,6 +354,24 @@ fn a_field_name_that_is_not_a_token_is_refused() {
     .expect("token names still encode");
     let text = String::from_utf8(ok).unwrap();
     assert_eq!(text.matches("authorization").count(), 1);
+}
+
+/// `encode` refuses a method that is not an RFC 9110 token, and a target carrying a space, as
+/// `Unrepresentable`, never answering READY with a request line its own `emit` then refuses.
+#[test]
+fn encode_refuses_a_request_line_its_emit_could_not_read() {
+    let refused = |method: &[u8], path: &[u8]| {
+        crate::transport::render_envelope(&[("method", method), ("path", path)], b"").is_err()
+    };
+    assert!(refused(b"GE T", b"/x"), "a space in the method");
+    assert!(refused(b"G(T", b"/x"), "a separator in the method");
+    assert!(refused(b"", b"/x"), "an empty method");
+    assert!(refused(b"GET", b"/a b"), "a space in the target");
+    assert!(
+        !refused(b"GET", b"/x"),
+        "a token method and a clean target render"
+    );
+    assert!(!refused(b"M-SEARCH", b"/x"), "any token method renders");
 }
 
 /// RED (audit A1 F10; `limits.request_body_max_bytes` is the BODY's cap, held to a `Content-Length`

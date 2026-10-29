@@ -134,15 +134,35 @@ fn refresh(inst: *mut c_void, json: &str) -> (Outcome, String) {
 
 /// `locate` of `target`: its outcome, the protocol offer it answered and its text.
 fn locate(inst: *mut c_void, target: &str) -> (Outcome, Vec<u8>, String) {
+    let (r, l, why, _) = locate_lending(inst, target, 512);
+    (r, l, why)
+}
+
+/// `locate` of `target` with a defaults buffer of `cap` bytes (none lent at 0): its outcome, the
+/// protocol offer, its text, and the defaults bytes it wrote and needs.
+fn locate_lending(
+    inst: *mut c_void,
+    target: &str,
+    cap: usize,
+) -> (Outcome, Vec<u8>, String, (u64, u64)) {
     let (mut a, mut n, mut l) = ([0_u8; 256], [0_u8; 256], [0_u8; 64]);
+    let mut d = vec![0_u8; cap];
     let mut i: LocateIn = z();
     i.target = s(target);
     (i.authority_buf, i.authority_cap) = (a.as_mut_ptr(), a.len());
     (i.name_buf, i.name_cap) = (n.as_mut_ptr(), n.len());
     (i.alpn_buf, i.alpn_cap) = (l.as_mut_ptr(), l.len());
+    if cap > 0 {
+        (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), cap);
+    }
     let mut o: LocateOut = z();
     let r = call(ops().locate, inst, &mut i, &mut o, slot::LOCATE);
-    (r, l[..o.alpn_written as usize].to_vec(), text(o.head.error))
+    (
+        r,
+        l[..o.alpn_written as usize].to_vec(),
+        text(o.head.error),
+        (o.defaults_written, o.defaults_needed),
+    )
 }
 
 // ── refresh ──────────────────────────────────────────────────────────────────────────────────────
@@ -179,6 +199,29 @@ fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
         (Outcome::Ready, String::new())
     );
     assert_eq!(locate(inst, "http://a.test/").1, b"\x02h2");
+}
+
+// ── locate ───────────────────────────────────────────────────────────────────────────────────────
+
+/// The framer's own head lines (`accept`, `host`) are owed to every request, so a host that lends
+/// no room for them, or too little, is answered short with the size they need, never READY with no
+/// lines (a request that would go out with no `host` on HTTP/1.1).
+#[test]
+fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
+    let inst = open("");
+    let want = "accept: */*\r\nhost: 127.0.0.1:9\r\n".len() as u64;
+    for cap in [0, 4] {
+        let (r, _, _, (written, needed)) = locate_lending(inst, "http://127.0.0.1:9", cap);
+        assert_eq!(r, Outcome::Failed, "a {cap}-byte defaults buffer is short");
+        assert_eq!(written, 0, "nothing is written on a short answer");
+        assert_eq!(
+            needed, want,
+            "the short answer names the size the lines need"
+        );
+    }
+    let (r, _, _, (written, _)) = locate_lending(inst, "http://127.0.0.1:9", 512);
+    assert_eq!(r, Outcome::Ready);
+    assert_eq!(written, want);
 }
 
 // ── settings, through the door ───────────────────────────────────────────────────────────────────
