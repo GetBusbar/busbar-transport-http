@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 
 use busbar_contract::abi::mechanism::call::{
-    AbiStr, Blob, InHead, Op, OutHead, Outcome, BLOB_ABSENT, BLOB_JSON,
+    AbiStr, Blob, Field, InHead, Op, OutHead, Outcome, BLOB_ABSENT, BLOB_JSON,
 };
 use busbar_contract::abi::mechanism::door::Door;
 use busbar_contract::abi::mechanism::lifecycle::{
@@ -19,8 +19,8 @@ use busbar_contract::abi::mechanism::lifecycle::{
 use busbar_contract::abi::mechanism::ticket::Ticket;
 use busbar_contract::abi::transport::{
     slot, AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, ConnIn, ConnOut, DialIn,
-    EmitIn, FinishIn, FramerOut, FramingIn, IngestIn, IoOut, ListenIn, ListenOut, LocateIn,
-    LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, SIDE_DIAL,
+    EmitIn, EncodeIn, FinishIn, FramePiece, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
+    ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, ShutIn, WriteIn, SIDE_DIAL,
 };
 use busbar_transport_http::door;
 
@@ -379,6 +379,101 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
     assert_eq!(
         op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH),
         gone("detach")
+    );
+}
+
+// ── what a failure a caller sees says ────────────────────────────────────────────────────────────
+
+/// RED (coordinator ruling 2026-10-29, as transport-tcp #42's): a failure a caller sees carries the
+/// host's or the system's words alone. A far end that closes before it answers fails the framing in
+/// hyper's words, `connection closed before message completed`, which the a2a card fetch passes on
+/// to its caller as 1.5.5's client did (`client error (SendRequest): connection closed before
+/// message completed`). RED on the door that led every framing failure with its op's name
+/// (`ingest: connection closed before message completed`). This door has no log or audit channel
+/// to keep the op name in, so it says none; its own refusals (no open instance, no such framing)
+/// keep theirs (`a_framer_op_on_an_unknown_framing_names_its_op`).
+#[test]
+fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
+    let inst = open(r#"{"advanced.upstream_http1_only":true}"#);
+    let o = ops();
+    let (mut wire, mut frame) = (vec![0_u8; 1 << 16], vec![0_u8; 1 << 16]);
+    // SAFETY: all-zero is a valid `FramePiece`.
+    let mut pieces: Vec<FramePiece> = vec![z(); 16];
+    let (wp, fp, pp) = (wire.as_mut_ptr(), frame.as_mut_ptr(), pieces.as_mut_ptr());
+    let sink = || FramerSink {
+        wire: wp,
+        wire_cap: 1 << 16,
+        frame: fp,
+        frame_cap: 1 << 16,
+        pieces: pp,
+        pieces_cap: 16,
+        now_monotonic_ns: 5_000_000_000,
+        now_unix_ns: 1_790_000_000_000_000_000,
+        heads: std::ptr::null_mut(),
+        heads_cap: 0,
+    };
+    let target = "http://127.0.0.1:9/.well-known/agent.json";
+    let mut b: BeginIn = z();
+    b.side = SIDE_DIAL;
+    b.target = s(target);
+    b.sink = sink();
+    let mut bo: FramerOut = z();
+    assert_eq!(
+        call(o.begin, inst, &mut b, &mut bo, slot::BEGIN),
+        Outcome::Ready
+    );
+    let framing = bo.framing;
+    let fields = [
+        Field {
+            name: s("method"),
+            value: s("GET"),
+        },
+        Field {
+            name: s("path"),
+            value: s("/.well-known/agent.json"),
+        },
+        Field {
+            name: s("host"),
+            value: s("127.0.0.1:9"),
+        },
+    ];
+    let mut e: EncodeIn = z();
+    e.fields = fields.as_ptr();
+    e.fields_len = fields.len();
+    e.sink = sink();
+    let mut eo: FramerOut = z();
+    assert_eq!(
+        call(o.encode, inst, &mut e, &mut eo, slot::ENCODE),
+        Outcome::Ready
+    );
+    let message = wire[..eo.yielded.wire_len as usize].to_vec();
+    let mut m: EmitIn = z();
+    m.framing = framing;
+    m.stream = 1;
+    m.bytes = message.as_ptr();
+    m.len = message.len();
+    m.end_of_frame = 1;
+    m.sink = sink();
+    let mut mo: FramerOut = z();
+    assert_eq!(
+        call(o.emit, inst, &mut m, &mut mo, slot::EMIT),
+        Outcome::Ready
+    );
+    // The far end closes: no byte, the end of its stream.
+    let mut i: IngestIn = z();
+    i.framing = framing;
+    i.end = 1;
+    i.sink = sink();
+    let mut io: FramerOut = z();
+    let r = call(o.ingest, inst, &mut i, &mut io, slot::INGEST);
+    // SAFETY: every `out` leads with an `OutHead`.
+    let said = text(unsafe { std::ptr::from_ref(&io).cast::<OutHead>().read() }.error);
+    assert_eq!(
+        (r, said.as_str()),
+        (
+            Outcome::Failed,
+            "connection closed before message completed"
+        )
     );
 }
 
