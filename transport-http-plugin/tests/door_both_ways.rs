@@ -375,6 +375,7 @@ impl Host {
 
     /// `encode` an envelope, then `emit` it on `stream`.
     fn ask(&mut self, stream: u64, path: &'static str, body: &'static str) -> Vec<Got> {
+        let len = body.len().to_string();
         let fields = [
             Field {
                 name: s("method"),
@@ -391,6 +392,14 @@ impl Host {
             Field {
                 name: s("content-type"),
                 value: s("application/json"),
+            },
+            // The length line the host states before the auth (THE DESIGN §6 step 5).
+            Field {
+                name: s("content-length"),
+                value: AbiStr {
+                    ptr: len.as_ptr(),
+                    len: len.len(),
+                },
             },
         ];
         let mut i: EncodeIn = z();

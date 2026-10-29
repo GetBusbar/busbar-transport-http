@@ -413,3 +413,10 @@ fn the_entry_claims_http_https_and_sse() {
         .collect();
     assert_eq!(https, http);
 }
+
+/// The tail states exactly the ops this door serves: dialling alone.
+#[test]
+fn the_tail_states_the_ops_the_door_serves() {
+    use busbar_contract::abi::transport::FACT_DIALS;
+    assert_eq!(crate::meta::TAIL.facts, FACT_DIALS);
+}

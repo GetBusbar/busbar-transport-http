@@ -639,21 +639,40 @@ impl SafeSlot for Locate {
         });
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, 1);
+        // The framer's own head lines: stated here and added by the host before the auth signs
+        // the head, never by `encode`.
+        let defaults = i
+            .field(|x| &x.target)
+            .as_str()
+            .ok()
+            .and_then(|t| t.parse::<http::Uri>().ok())
+            .map(|u| engine::client_defaults(&u))
+            .unwrap_or_default();
         let (mut a, mut n, mut l) = (i.authority_buf(), i.name_buf(), i.alpn_buf());
+        let mut d = i.defaults_buf();
         a.extend(authority.as_bytes());
         n.extend(name.as_bytes());
         l.extend(offer);
-        // One short answer for all three buffers, each at its full size.
-        let short = !(a.fits() && n.fits() && l.fits());
+        d.extend(defaults.as_bytes());
+        // One short answer for every buffer, each at its full size. The framer's own lines are owed
+        // to every request, so a defaults buffer too small for them, an unlent one included, is a
+        // short answer, never READY with no lines (an h1 request would go out with no `host`).
+        let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
         let (lw, lnd) = l.settle(short);
+        let (dw, dnd) = d.settle(short);
         o.set(|x| &x.authority_written, aw as u64);
         o.set(|x| &x.authority_needed, and as u64);
         o.set(|x| &x.name_written, nw as u64);
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
+        // The length line is the host's to state, before the auth: for a fixed, non-empty body,
+        // last, after these lines. `encode` renders it and adds none.
+        o.set(|x| &x.states_length, 1u8);
+        o.set(|x| &x.defaults_written, dw as u64);
+        o.set(|x| &x.defaults_needed, dnd as u64);
         if short {
             o.error("locate: a host buffer is too small");
             return Outcome::Failed;
@@ -711,18 +730,19 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
-        let Some(token) = inst.framings.insert(framing) else {
+        // The framing joins the instance's table only once its first step is READY: a begin that
+        // fails hands the host no token, so nothing would ever release an entry it left behind.
+        let mut h = Held { framing };
+        let r = step("begin", &mut h, i.field(|x| &x.sink), &mut o, |_| Ok(()));
+        if r != Outcome::Ready {
+            return r;
+        }
+        let Some(token) = inst.framings.insert(h.framing) else {
             o.error("begin: every framing slot is in use");
             return Outcome::Failed;
         };
         o.set(|x| &x.framing, token);
-        let mut slot = match inst.framings.reach(token) {
-            Ok(s) => s,
-            Err(why) => return failed(&mut o, format!("begin: {}", why.why())),
-        };
-        step("begin", slot.held(), i.field(|x| &x.sink), &mut o, |_| {
-            Ok(())
-        })
+        r
     }
 }
 
@@ -759,7 +779,7 @@ impl SafeSlot for Emit {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
         with("emit", &p, i.framing, i.field(|x| &x.sink), &mut o, |f| {
-            f.emit(i.stream, bytes, now, deadline)
+            f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
         })
     }
 }

@@ -16,7 +16,7 @@
     },
     "dial": {
       "target": "http://peer.test:8080/v1/x",
-      "emit": "POST /v1/x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhi",
+      "request": { "fields": [["method", "POST"], ["path", "/v1/x"]], "body": "hi" },
       "wire": "POST /v1/x HTTP/1.1\r\naccept: */*\r\nhost: peer.test:8080\r\ncontent-length: 2\r\n\r\nhi",
       "ingest": "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok",
       "frames": [
@@ -37,6 +37,10 @@
           [
             "path",
             "/v1/x"
+          ],
+          [
+            "content-length",
+            "1"
           ]
         ],
         "wire": "POST /v1/x HTTP/1.1\r\ncontent-length: 1\r\n\r\nb"

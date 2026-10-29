@@ -10,7 +10,8 @@
 //! composes over nothing (`COMPOSES_OVER` is empty: no transport names another). An `sse` stream is
 //! an HTTP response body, so the `sse` claim is framed exactly as `http` is; a plane reads the event
 //! boundaries in the body it is handed.
-//! gRPC is its own transport plugin (OWNER 2026-09-29), not a claim of this one.
+//! A framing that rides HTTP/2 but is its own wire is its own transport plugin (OWNER
+//! 2026-09-29), not a claim of this one.
 //!
 //! `http` carries no session and its status class rides the first response frame: the
 //! kernel-derived leg of the fee decision the design's settlement table reads.
@@ -45,8 +46,6 @@ pub mod linked {
     /// The layers this framer declares it is built over: none. The connector chooses the carrier
     /// from the target's scheme (`BUSBAR-1.6.0.md`: "no transport names another").
     pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
-    /// Whether this wire carries sessions.
-    pub const SESSION: bool = crate::meta::SESSION;
 
     /// The `http` framer's memory-ABI door: the one entry, linked here and exported by the
     /// dropped-in build alike.

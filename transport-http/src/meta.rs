@@ -26,9 +26,6 @@ pub(crate) const SECURE_KEY: &str = "https";
 /// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
-/// None of the three claimed schemes carries a session.
-pub(crate) const SESSION: bool = false;
-
 pub(crate) const TAIL: TransportTail = TransportTail {
     head: KindTailHead {
         size: std::mem::size_of::<TransportTail>() as u32,
@@ -36,7 +33,13 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
-    facts: 0,
+    // Nothing is added to the head after the auth has run: the framer's own lines (`accept`,
+    // `host`) are stated at `locate` and the length line by the host, all before the auth, and the
+    // framer renders exactly that head (`the_head_on_the_wire_is_every_line_the_auth_saw`). The one
+    // exception is 1.5.5's: HTTP/2, a payload method, an empty body gets `content-length: 0` at
+    // send, as hyper's client did (`set_content_length_if_missing`); no auth style signs that line
+    // (`tests/h2_parity.rs`). The door dials and serves no other op.
+    facts: busbar_contract::abi::transport::FACT_DIALS,
     handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
     _reserved: 0,
