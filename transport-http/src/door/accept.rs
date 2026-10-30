@@ -1186,6 +1186,11 @@ impl Accepted {
             return did;
         }
         while self.peer_done < self.peer_auths.len() {
+            // `auth.call` may pend, so it is made only on a ticketed op: an op with none waits for
+            // the next that has one, and no request is admitted before the peer point decides.
+            if k.ticket().is_none() {
+                return did;
+            }
             // A peer call parked on another op's ticket is that op's to resume: no request is
             // admitted before the peer point decides (item 7).
             let seq = match self.peer_parked {
@@ -1306,6 +1311,11 @@ impl Accepted {
                     a.gate = Gate::Auth(n);
                 }
                 Gate::Auth(n) => {
+                    // A may-pend `auth.call`, made only on a ticketed op: on one with none the
+                    // request waits for the next that has one.
+                    if k.ticket().is_none() {
+                        return;
+                    }
                     let l = &self.lines[n];
                     let (auth, line, body_point) =
                         (l.auth, l.line, l.points & POINT_HEAD_BODY != 0);
