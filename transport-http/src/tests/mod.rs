@@ -44,6 +44,9 @@ fn retry_after_parses_both_normative_forms() {
     assert_eq!(crate::message::parse_retry_after("soon", 0), None);
     assert_eq!(crate::message::parse_retry_after("-5", 0), None);
     assert_eq!(crate::message::parse_retry_after("7.5", 0), None);
+    // RED (codeaudit conformance L message.rs:38, tests-A L tests/mod.rs:45): delay-seconds is
+    // 1*DIGIT, so a sign is no wait (Rust's integer parse takes a leading `+`).
+    assert_eq!(crate::message::parse_retry_after("+7", 0), None);
     // Right length, wrong month.
     assert_eq!(
         crate::message::parse_retry_after("Sun, 06 Xxx 1994 08:49:37 GMT", 0),
