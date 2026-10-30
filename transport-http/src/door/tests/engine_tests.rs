@@ -1225,3 +1225,18 @@ fn an_answer_with_no_body_states_no_declared_length() {
     f.drive(SEC, 0);
     assert_eq!(declared(&mut f), Some(Some(0)), "an empty body's length stands");
 }
+
+/// RED (codeaudit resource M engine.rs:186): hyper's HTTP/2 client task holds a clone of its
+/// executor, and the executor's task list held that task: a cycle, so a dialled HTTP/2 framing
+/// the host finished before its connection task ended never freed it (hyper's connection state,
+/// the pipe, any request not yet sent). Dropping the framing frees all of it.
+#[test]
+fn a_dropped_h2_framing_frees_its_connection() {
+    let f = asked(Proto::H2, 300);
+    let task = Arc::downgrade(&f.conn_err);
+    drop(f);
+    assert!(
+        task.upgrade().is_none(),
+        "the connection task went with the framing"
+    );
+}

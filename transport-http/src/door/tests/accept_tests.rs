@@ -749,3 +749,27 @@ fn an_answer_head_with_a_malformed_field_line_is_refused() {
         assert!(a.answers_head(stream), "still answerable");
     }
 }
+
+/// RED (codeaudit resource M engine.rs:186, its accepted half): hyper's HTTP/2 server spawns each
+/// stream's task with a clone of its executor, and the executor's task list held that task: a
+/// cycle, so an accepted connection dropped with a stream in flight never freed the stream's task
+/// (its service future, hyper's and h2's stream state). Dropping the framing frees it: the
+/// stream's answer channel then has no one waiting on it.
+#[test]
+fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
+    let (a, stream) = h2_request();
+    let respond = a
+        .shared
+        .lock()
+        .expect("shared")
+        .streams
+        .get_mut(&stream)
+        .and_then(|s| s.respond.take())
+        .expect("the stream's answer is owed");
+    assert!(!respond.is_canceled(), "the stream's task waits on it");
+    drop(a);
+    assert!(
+        respond.is_canceled(),
+        "the stream's task went with the framing"
+    );
+}
