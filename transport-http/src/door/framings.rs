@@ -179,19 +179,28 @@ impl Framings {
         Ok(state)
     }
 
-    /// Visit every framing no op holds right now, `f` on each. Never waits: a framing another op
-    /// holds is skipped, as that op is running, not parked. Once per call over every minted slot,
-    /// for the rare op that names no framing (`cancel` names only a ticket).
-    pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) {
+    /// Visit every framing no op holds right now, `f` on each. Never waits (the op holding a
+    /// framing may be the very one whose host call crossed here): a framing another op holds is
+    /// skipped, and the answer says one was (`true`), so the caller never reads a skipped framing
+    /// as one with nothing on it. Once per call over every minted slot, for the rare op that names
+    /// no framing (`cancel` names only a ticket).
+    pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) -> bool {
+        let mut skipped = false;
         for segment in self.segments.iter().filter_map(OnceLock::get) {
             for slot in segment.iter() {
-                if let Ok(mut state) = slot.0.try_lock() {
-                    if let Some(held) = state.held.as_mut() {
-                        f(held);
+                match slot.0.try_lock() {
+                    Ok(mut state) => {
+                        if let Some(held) = state.held.as_mut() {
+                            f(held);
+                        }
                     }
+                    Err(TryLockError::WouldBlock) => skipped = true,
+                    // A poisoned framing is reached by no op: nothing parks on it.
+                    Err(TryLockError::Poisoned(_)) => {}
                 }
             }
         }
+        skipped
     }
 
     /// Drop the framing `token` names and give its slot back. The one op that WAITS for its slot:

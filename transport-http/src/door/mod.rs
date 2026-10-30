@@ -494,18 +494,27 @@ slot!(
     /// `ingest` or `emit` on the accepted side; the transport contract's "a framer pends only on a
     /// ticketed auth call"). Its bytes were taken, so its cancel is PARTIAL, and the parked call is
     /// let go ([`Accepted::cancel`]): a later op calls afresh, under a new handle. A ticket nothing
-    /// is parked on moved nothing.
+    /// is parked on moved nothing. A framing another op holds right now cannot be looked at (it is
+    /// never waited for): with nothing found elsewhere the cancel is FAILED, the framing busy, so
+    /// the host cancels again rather than read NOTHING_MOVED.
     Cancel, CancelIn, CancelOut, |instance, i, o| {
         let ticket = i.ticket;
         // The parked op answered PENDING and holds no framing, so every framing a parked call
         // sits on is visited ([`framings::Framings::each`]); none is waited for.
         let mut partial = false;
+        let mut skipped = false;
         if let Some(h) = instance.get() {
-            h.life().framings.each(|h| {
+            skipped = h.life().framings.each(|h| {
                 if let Held::Accept(a) = h {
                     partial |= a.cancel(ticket);
                 }
             });
+        }
+        if skipped && !partial {
+            return o.fail(Refusal::failed(format!(
+                "cancel: {}",
+                framings::Reach::Busy.why()
+            )));
         }
         o.set(
             |x| &x.disposition,
