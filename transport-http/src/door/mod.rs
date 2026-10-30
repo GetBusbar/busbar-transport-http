@@ -559,7 +559,8 @@ busbar_contract::not_served! {
 /// stream the host was handed or the whole connection
 /// ([`Accepted::refuse`]). The kernel's refusal of a request before its hand-in stays
 /// `unit.refuse`'s, framed inside the accepted side; this op is the host's, after it. It never
-/// pends and calls no host service. A dialled connection is refused by its far end, never here.
+/// pends: a request its drive decodes goes through the guest list's steps that never pend
+/// ([`with`]). A dialled connection is refused by its far end, never here.
 pub(crate) struct Refuse;
 impl SafeSlot for Refuse {
     type In = RefuseIn;
@@ -1138,36 +1139,21 @@ impl SafeSlot for Encode {
     }
 }
 
-/// A framer op [`with`] runs: its name, which every failure text leads with, and whether it runs
-/// guest-list admission.
+/// A framer op [`with`] runs: its name, which every failure text leads with.
 #[derive(Clone, Copy)]
 struct FramerOp {
     /// The op's name.
     name: &'static str,
-    /// Whether the op runs guest-list admission: only the ticketed input ops do.
-    admits: bool,
 }
 
-/// `ingest`: a ticketed input op, so it admits.
-const INGEST: FramerOp = FramerOp {
-    name: "ingest",
-    admits: true,
-};
-/// `emit`: a ticketed input op, so it admits.
-const EMIT: FramerOp = FramerOp {
-    name: "emit",
-    admits: true,
-};
-/// `refuse`: drives only what is already admitted.
-const REFUSE: FramerOp = FramerOp {
-    name: "refuse",
-    admits: false,
-};
-/// `timer`: drives only what is already admitted.
-const TIMER: FramerOp = FramerOp {
-    name: "timer",
-    admits: false,
-};
+/// `ingest`.
+const INGEST: FramerOp = FramerOp { name: "ingest" };
+/// `emit`.
+const EMIT: FramerOp = FramerOp { name: "emit" };
+/// `refuse`.
+const REFUSE: FramerOp = FramerOp { name: "refuse" };
+/// `timer`.
+const TIMER: FramerOp = FramerOp { name: "timer" };
 
 /// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
 /// name. An op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its
@@ -1193,10 +1179,13 @@ fn with(
         ticket: head.ticket,
         conn: token,
     };
-    // GUEST-LIST ADMISSION RUNS ONLY ON THE TICKETED INPUT OPS (`ingest`, `emit`): it calls the
-    // host auth handle, a may-pend service callable only inside a ticketed op. `timer` and `refuse`
-    // never pend and only drive what is already admitted.
-    let kernel = (op.admits && !head.ticket.is_none()).then_some(&mut kernel);
+    // GUEST-LIST ADMISSION RUNS ON EVERY OP THAT DRIVES: a drive may decode a request (a
+    // pipelined HTTP/1.1 request is read as soon as the answer before it is written, in whichever
+    // op wrote it), and no later op is owed to it. On an op with no ticket (`timer`, `refuse`, a
+    // re-call) the may-pend `auth.call` is never made ([`Accepted::admit`]): a request whose line's
+    // auth must be called waits for the next ticketed op; every other step (the match, the
+    // kernel's refusals, the size gate, the hand-in) runs.
+    let kernel = Some(&mut kernel);
     // Reached by its token alone; a framing another op holds is answered at once.
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
