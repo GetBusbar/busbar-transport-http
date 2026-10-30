@@ -96,7 +96,7 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
         Ok(BodyFraming::Length(12))
     );
     assert_eq!(
-        framing("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n"),
+        framing("POST / HTTP/1.1\r\nTransfer-Encoding: Chunked\r\n\r\n"),
         Ok(BodyFraming::Chunked)
     );
     assert_eq!(
@@ -125,10 +125,20 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
 /// the message stays framable; a `Transfer-Encoding` where it is not final leaves the body
 /// length undeterminable, and a reader that took it for chunked anyway would be decoding a
 /// framing the sender never wrote.
+///
+/// RED (codeaudit tests-A L tests/raw.rs:131): and `chunked` ALONE is the coding this transport
+/// reads. `gzip, chunked` was read as plain chunked: the chunk framing undone, the `gzip` coding
+/// dropped with the `transfer-encoding` line, and the still-compressed bytes sent on under a
+/// length with nothing naming their coding. A coding this transport does not implement is refused
+/// (RFC 9112 6.1).
 #[test]
 fn chunked_counts_only_as_the_final_transfer_coding() {
     assert_eq!(
         framing("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"),
+        Err("unsupported transfer coding")
+    );
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
         Ok(BodyFraming::Chunked)
     );
     // And a coding list that names one at all is still a declared coding, chunked or not: it is
@@ -160,7 +170,8 @@ fn a_coding_list_spans_every_line_of_the_field() {
     }
     assert_eq!(
         framing("POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n"),
-        Ok(BodyFraming::Chunked)
+        Err("unsupported transfer coding"),
+        "`gzip, chunked` across two lines"
     );
     assert_eq!(
         framing("POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\n"),
