@@ -685,3 +685,46 @@ fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
         "its record and queued bytes are let go"
     );
 }
+
+/// One GET admitted on a fresh connection: the connection and its stream.
+fn one_get() -> (Accepted, u64) {
+    let mut a = accepted();
+    a.ingest(GET, false);
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert_eq!(u.heads.len(), 1, "one request");
+    (a, u.heads[0].0)
+}
+
+/// RED (codeaudit correctness M accept.rs:649, error-handling L accept.rs:649, conformance L
+/// accept.rs:656): an answer head was judged only after its stream's answer sender was taken, so a
+/// head no answer can carry lost the stream (hyper ended it unanswered, and a corrected head found
+/// no answer to give); and a status of 600 to 999 was written as an answer (`http` takes any three
+/// digits, RFC 9110 15 names 100 to 599). A head that cannot be an answer is refused and the stream
+/// is still answerable.
+#[test]
+fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
+    let (mut a, stream) = one_get();
+    for (status, block) in [
+        (700, &b"content-type: text/plain\r\n"[..]),
+        (999, b""),
+        (99, b""),
+        (200, b"x-bad: a\x01b\r\n"),
+    ] {
+        let r = a.emit(stream, block, true, status);
+        assert!(r.is_err(), "status {status}: refused: {r:?}");
+        assert!(a.answers_head(stream), "status {status}: still answerable");
+    }
+    assert!(
+        a.emit(stream, b"content-type: text/plain\r\n", true, 599)
+            .is_ok(),
+        "the corrected head is the answer"
+    );
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 599 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
