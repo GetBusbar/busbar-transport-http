@@ -193,6 +193,8 @@ enum ChunkState {
     Data,
     /// Reading the CRLF that closes a chunk's data.
     AfterData,
+    /// Read the CR that closes a chunk's data: its LF is next.
+    AfterDataCr,
     /// Reading trailer lines, terminated by an empty one.
     Trailers,
     /// The terminal chunk and its trailers have both arrived.
@@ -241,18 +243,26 @@ impl ChunkedDecoder {
                     }
                     n
                 }
+                // One CRLF (or a bare LF, RFC 9112 2.2) closes a chunk's data; nothing else.
                 ChunkState::AfterData => {
                     match rest[0] {
                         b'\n' => self.state = ChunkState::Size,
-                        b'\r' => {}
+                        b'\r' => self.state = ChunkState::AfterDataCr,
                         _ => return Err(ChunkedMalformed),
                     }
+                    1
+                }
+                ChunkState::AfterDataCr => {
+                    if rest[0] != b'\n' {
+                        return Err(ChunkedMalformed);
+                    }
+                    self.state = ChunkState::Size;
                     1
                 }
                 ChunkState::Size | ChunkState::Trailers => {
                     let end = memchr::memchr(b'\n', rest);
                     let part = &rest[..end.unwrap_or(rest.len())];
-                    self.line.extend(part.iter().filter(|b| **b != b'\r'));
+                    self.line.extend_from_slice(part);
                     let Some(end) = end else {
                         return Ok(bytes.len());
                     };
@@ -264,8 +274,15 @@ impl ChunkedDecoder {
         Ok(bytes.len())
     }
 
-    /// A size or trailer line has ended.
+    /// A size or trailer line has ended: its one CR before the LF is the line end's; a CR anywhere
+    /// else makes it malformed (RFC 9112 7.1), never a byte spliced out.
     fn end_line(&mut self) -> Result<(), ChunkedMalformed> {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        if self.line.contains(&b'\r') {
+            return Err(ChunkedMalformed);
+        }
         let line = std::str::from_utf8(&self.line).map_err(|_| ChunkedMalformed)?;
         self.state = match self.state {
             ChunkState::Size => match chunk_size(line)? {
