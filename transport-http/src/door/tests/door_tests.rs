@@ -27,7 +27,11 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
         (p.request_timeout, p.max_body_bytes),
         (Duration::from_secs(7), 9)
     );
-    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
+    let refused = |s: &'static str| {
+        read_settings(blob(s))
+            .err()
+            .and_then(|e| e.text().map(str::to_owned))
+    };
     assert_eq!(
         refused(r#"{"advanced.upstream_http1_only":"yes"}"#).as_deref(),
         Some("settings: advanced.upstream_http1_only must be true or false")
@@ -48,7 +52,11 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
 /// says what the key must be.
 #[test]
 fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
-    let refused = |s: &'static str| read_settings(blob(s)).err().map(|e| e.to_string());
+    let refused = |s: &'static str| {
+        read_settings(blob(s))
+            .err()
+            .and_then(|e| e.text().map(str::to_owned))
+    };
     assert_eq!(
         refused(r#"{"advanced.upstream_h2_prior_knowledge":false,"limits.nope":1}"#).as_deref(),
         Some("settings: limits.nope is not a setting this transport reads")
@@ -86,7 +94,9 @@ fn locate_offers_a_dns_name_lower_cased() {
 #[test]
 fn a_settings_blob_that_is_not_an_object_is_refused() {
     for s in ["null", "[]", "\"x\"", "5", "true"] {
-        let r = read_settings(blob(s)).err().map(|e| e.to_string());
+        let r = read_settings(blob(s))
+            .err()
+            .and_then(|e| e.text().map(str::to_owned));
         assert_eq!(r.as_deref(), Some("settings: must be a JSON object"), "{s}");
     }
     assert!(read_settings(blob("")).is_ok());

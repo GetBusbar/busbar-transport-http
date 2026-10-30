@@ -55,8 +55,8 @@ pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
 /// (`first`); a later request naming none goes to `/`, never to whatever path the exchange that
 /// dialled the line happened to name.
 ///
-/// A stated target is ORIGIN form (`/` and a path, RFC 9112 §3.2.1), the one form this door sends
-/// (THE DESIGN §5: the http transport owns "on h1 the host header and origin-form target"). Any
+/// A stated target is ORIGIN form (`/` and a path, RFC 9112 §3.2.1), the one form this door sends.
+/// Any
 /// other is refused, never rewritten: `v1/chat` would have gone to `/`, and an absolute-form
 /// `http://other/x` to whatever host it names on the dialled address (RFC 9112 §3.2.2), each
 /// without an error.

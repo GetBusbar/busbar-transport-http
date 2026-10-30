@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The framer entry's own message rendering, as the kind's entry file (`BUSBAR-1.6.0.md` THE
-//! DESIGN, §2): an outbound envelope rendered as the one HTTP/1.1 request message the door's
-//! `encode` answers, the bytes the egress cross-check reads. The framing itself is the door's
-//! (`crate::door::engine`).
+//! The framer entry's own message rendering: an outbound envelope rendered as the one HTTP/1.1
+//! request message the door's `encode` answers, the bytes the egress cross-check reads. The framing
+//! itself is the door's (`crate::door::engine`).
 
 use zeroize::Zeroizing;
 
@@ -46,7 +45,7 @@ fn is_token(name: &[u8]) -> bool {
 /// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
 /// reparse): `Encode::Unrepresentable`. So is a length that does not frame the body: a stated
 /// `content-length` other than `body_len`, or a non-empty body with none stated. The length is one
-/// of the transport's own lines the host states BEFORE the auth (THE DESIGN §6 step 5): this
+/// of the transport's own lines the host states BEFORE the auth: this
 /// renders it where the host put it and adds no line of its own.
 pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
