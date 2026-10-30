@@ -471,8 +471,9 @@ impl Framing {
         }
     }
 
-    /// With output pending, state the recorded failure on every stream not already finished, then
-    /// drop the exchanges (so a later call pushes nothing).
+    /// With output pending, state the recorded failure on every stream not already finished nor
+    /// already told it failed (a `Refused` one's failure piece is out), then drop the exchanges (so
+    /// a later call pushes nothing).
     fn fail_streams(&mut self) {
         if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
             return;
@@ -481,7 +482,7 @@ impl Framing {
             return;
         };
         for (id, stage) in &self.exchanges {
-            if !matches!(stage, Stage::Done) {
+            if !matches!(stage, Stage::Done | Stage::Refused) {
                 self.out.push(Piece::failure(*id, why));
             }
         }
