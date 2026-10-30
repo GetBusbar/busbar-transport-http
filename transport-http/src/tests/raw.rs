@@ -189,3 +189,37 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
     assert!(decoder.is_done());
     assert_eq!(decoder.take(), b"abc");
 }
+
+/// RED (codeaudit correctness L raw.rs:255): the decoder deleted EVERY CR in a size or trailer
+/// line, so `1\r0` read as the size `10`, and took any run of CRs after a chunk's data. RFC 9112
+/// 7.1: a line ends in CRLF; a CR anywhere else makes it malformed, and a chunk's data is closed
+/// by one CRLF. (A bare LF ending a line is still read, RFC 9112 2.2.)
+#[test]
+fn a_cr_that_does_not_end_a_line_is_malformed() {
+    for wire in [
+        &b"1\r0\r\n0123456789abcdef\r\n0\r\n\r\n"[..],
+        b"5\r\nhello\r\r\r\n0\r\n\r\n",
+        b"5\r\nhello\r\n0\r\nx-t: a\rb\r\n\r\n",
+        b"5\r\r\nhello\r\n0\r\n\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(
+            decoder.feed(wire),
+            Err(ChunkedMalformed),
+            "{:?}",
+            String::from_utf8_lossy(wire)
+        );
+    }
+    // Split anywhere, the CRLF still reads as one line end.
+    let whole = b"5\r\nhello\r\n0\r\n\r\n";
+    for at in 0..whole.len() {
+        let mut decoder = ChunkedDecoder::default();
+        decoder.feed(&whole[..at]).expect("the first part");
+        decoder.feed(&whole[at..]).expect("the rest");
+        assert!(decoder.is_done(), "split at {at}");
+        assert_eq!(decoder.take(), b"hello");
+    }
+    let mut decoder = ChunkedDecoder::default();
+    decoder.feed(b"5\nhello\n0\n\n").expect("bare LFs");
+    assert_eq!(decoder.take(), b"hello");
+}
