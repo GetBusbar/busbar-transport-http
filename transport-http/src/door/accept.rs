@@ -625,6 +625,19 @@ impl Accepted {
         Ok(())
     }
 
+    /// Whether `stream`'s answer queue is at its high-water mark (its emits held until a
+    /// `PIECE_WRITABLE`).
+    #[must_use]
+    pub fn stream_full(&self, stream: u64) -> bool {
+        self.shared
+            .lock()
+            .expect("shared")
+            .streams
+            .get(&stream)
+            .and_then(|a| a.reply.as_ref())
+            .is_some_and(|q| q.lock().expect("reply").full)
+    }
+
     /// Whether `stream`'s next emit carries its answer's head.
     #[must_use]
     pub fn answers_head(&self, stream: u64) -> bool {
