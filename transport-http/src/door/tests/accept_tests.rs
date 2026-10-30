@@ -828,3 +828,26 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
     let rest: Vec<u8> = rest.drain(..).collect();
     assert_eq!(rest, b"\x81\x05hello", "the bytes after the request");
 }
+
+/// RED (codeaudit error-handling L accept.rs:720): the accepted connection's own end (hyper's
+/// error: a header-read timeout, an HTTP/2 protocol violation, a malformed request) was dropped, so
+/// every stream it ended was told the same words as a far side that merely went away. The cause
+/// rides the stream's failure words (hyper's text, which repeats no request byte).
+#[test]
+fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
+    let (mut a, stream) = h2_request();
+    // DATA on stream 0: a connection error (RFC 9113 6.1).
+    a.ingest(&frame(0, 0, 0, b"x"), false);
+    run(&mut a, SEC);
+    let told: Vec<String> = a
+        .pieces()
+        .drain(..)
+        .filter(|p| p.failed && p.stream == stream)
+        .map(|p| String::from_utf8_lossy(&p.bytes).into_owned())
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].starts_with("the far side gave the stream up: ") && told[0].len() > 33,
+        "the cause rides the words: {told:?}"
+    );
+}
