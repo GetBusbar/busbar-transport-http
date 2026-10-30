@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE GUEST LIST an accepted connection is framed under (`BUSBAR-1.6.0.md` §6, "Auth points and
-//! guest lists", items 3 and 4, l.904-962): the listener's lines as `begin` lent them
+//! THE GUEST LIST an accepted connection is framed under: the listener's lines as `begin` lent them
 //! (`BeginIn::lines`, in the kernel's match order), owned for the framing's life; the match of a
 //! decoded head against them in the contract's ONE route vocabulary
 //! (`abi::transport::route::RouteView`: `path_and_fields_match`, then `admits`); and the strip of
-//! what a line's auth named (item 4, l.943-945: "the transport strips both, so the plane never
-//! sees a credential").
+//! what a line's auth named, so the plane never sees a credential.
 
 use busbar_contract::abi::host::service::AuthRef;
 use busbar_contract::abi::sdk::services::Place;
@@ -116,8 +114,7 @@ pub enum Matched {
     NoRoute,
 }
 
-/// Match `method`, `path` and the head's field lines against `lines`, in list order (item 4,
-/// l.939: the transport "matches the route on its guest list").
+/// Match `method`, `path` and the head's field lines against `lines`, in list order.
 #[must_use]
 pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])]) -> Matched {
     let mut miss = None;

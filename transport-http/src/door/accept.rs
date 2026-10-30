@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE ACCEPTED SIDE: hyper's server, run as a sans-IO framer over a connection the connector
-//! accepted (`BUSBAR-1.6.0.md` l.477-478: per accepted connection the connector runs the framer's
-//! accept side, under the TLS server wrap when configured; the ALPN offer is the framer's).
+//! accepted (under the TLS server wrap when configured; the ALPN offer is the framer's).
 //!
 //! One [`Accepted`] is one connection, served exactly as v1.5.5's data listener served it: through
 //! `hyper_util::server::conn::auto::Builder`, so a cleartext connection that opens with the HTTP/2
@@ -24,18 +23,17 @@
 //! `101`, and `detach` hands the host every byte the far side sent after the request, for the
 //! claimed upgrade framer to adopt.
 //!
-//! NO REQUEST GOES UP UNADMITTED (`BUSBAR-1.6.0.md` §6, "Auth points and guest lists", item 4,
-//! l.938-962). The connection is framed under its listener's guest list ([`guest::Line`], lent at
-//! `begin`). Each decoded head waits in [`Gate`] until [`Accepted::admit`] has run it through the
-//! host auth handle ([`Kernel`]): matched against the lines in order (no line: `NO_ROUTE`; a path
-//! with no method admitted: `METHOD_MISS`); the matched line's auth called at its points (`Peer`
-//! once per connection before any request, l.953 item 7; `Head` with the head; `HeadBody` with the
-//! whole body held up to the line's `body_limit`, over which the size gate refuses BEFORE any
-//! verdict, l.940-942); what the auth names stripped (field lines ASCII case-insensitively, query
-//! keys case-sensitively, l.943-945); then handed in with the line it matched (l.951-957). Only
-//! then does its head go up, stripped. Every refusal is the KERNEL's (`unit.refuse`, l.958-961):
-//! its status, fields and body framed verbatim by hyper as any answer, and nothing goes up. A
-//! refusal the kernel cannot give leaves the stream unanswered: hyper ends it with no bytes, for
+//! NO REQUEST GOES UP UNADMITTED. The connection is framed under its listener's guest list
+//! ([`guest::Line`], lent at `begin`). Each decoded head waits in [`Gate`] until
+//! [`Accepted::admit`] has run it through the host auth handle ([`Kernel`]): matched against the
+//! lines in order (no line: `NO_ROUTE`; a path with no method admitted: `METHOD_MISS`); the matched
+//! line's auth called at its points (`Peer` once per connection before any request; `Head` with
+//! the head; `HeadBody` with the whole body held up to the line's `body_limit`, over which the size
+//! gate refuses BEFORE any verdict); what the auth names stripped (field lines ASCII
+//! case-insensitively, query keys case-sensitively); then handed in with the line it matched. Only
+//! then does its head go up, stripped. Every refusal is the KERNEL's (`unit.refuse`): its status,
+//! fields and body framed verbatim by hyper as any answer, and nothing goes up. A refusal the
+//! kernel cannot give leaves the stream unanswered: hyper ends it with no bytes, for
 //! this transport writes no refusal bytes of its own.
 
 use std::collections::{HashMap, VecDeque};
@@ -183,7 +181,7 @@ struct Answer {
     told: bool,
 }
 
-/// Where a request stands on its way through the guest list (`BUSBAR-1.6.0.md` §6 item 4).
+/// Where a request stands on its way through the guest list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gate {
     /// Decoded, not yet matched.
@@ -327,7 +325,7 @@ pub struct Accepted {
 impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
-        // A body held for a `HeadBody` auth when the framing is torn down mid-hold (Q128 r232).
+        // A body held for a `HeadBody` auth when the framing is torn down mid-hold.
         if let Ok(mut sh) = self.shared.lock() {
             for a in sh.streams.values_mut() {
                 let_held_go(&mut a.held);
@@ -409,7 +407,7 @@ impl Accepted {
         self
     }
 
-    /// THE PROTOCOL AGREED (`FramerYield::agreed`, busbar #1446): its 1-based position in the
+    /// THE PROTOCOL AGREED (`FramerYield::agreed`): its 1-based position in the
     /// door's accepting offer (`super::ACCEPT_OFFER`), `0` = not stated. The protocol hyper serves
     /// once the first bytes show it (the HTTP/2 preface: h2, by prior knowledge in the clear;
     /// anything else: HTTP/1.1); until then the handshake's ALPN result, where one ran.
@@ -445,8 +443,7 @@ impl Accepted {
             extend_wiped(raw, bytes);
             raw.starts_with(H2_PREFACE)
         });
-        // An HTTP/2 connection is never handed over (`detach`): it keeps no copy (Q128 reader A
-        // finding 1).
+        // An HTTP/2 connection is never handed over (`detach`): it keeps no copy.
         if h2 {
             self.h2 = true;
             self.let_raw_go();
@@ -454,12 +451,12 @@ impl Accepted {
         self.io.ingest(bytes, end);
     }
 
-    /// Bound the copy kept for a hand-over as sent (Q128 reader A finding 1; THE DESIGN §1
-    /// l.199-201, a bound on live work is a refusal at admission): it goes once a request asking no
+    /// Bound the copy kept for a hand-over as sent (a bound on live work is a refusal at
+    /// admission): it goes once a request asking no
     /// upgrade, or one carrying a body, was decoded (no hand-over as sent is possible after it),
     /// and past the head limit hyper reads a head under (`engine::HEAD_MAX_BYTES`, all an upgrade
     /// request and what follows it may hold before it is answered) it goes too: the connection is
-    /// served on, as v1.5.5's server served it (Q128 reader B finding 2).
+    /// served on, as v1.5.5's server served it.
     fn bound_raw(&mut self) {
         if std::mem::take(&mut self.shared.lock().expect("shared").no_hand_over) {
             self.let_raw_go();
@@ -502,8 +499,7 @@ impl Accepted {
         self.refused_whole
     }
 
-    /// THE HOST'S REFUSAL (`refuse`, the transport ABI's `RefuseIn`; Q128 reader B finding 2,
-    /// ruling 22):
+    /// THE HOST'S REFUSAL (`refuse`, the transport ABI's `RefuseIn`):
     ///
     /// * for the WHOLE connection (`stream` `None`): `bytes` are the transport's whole envelope, as
     ///   the host rendered it (the connector's `unit0_refusal`), written as they are; hyper is let
@@ -556,7 +552,7 @@ impl Accepted {
             };
             let mut q = q.lock().expect("reply");
             // The answer ends failed and nothing more is owed on it: its record goes once hyper
-            // let it go (Q128 reader A: the same release as a stream the far side gave up).
+            // let it go (the same release as a stream the far side gave up).
             q.broken = true;
             q.ended = true;
             q.chunks.clear();
@@ -578,11 +574,11 @@ impl Accepted {
             )));
         }
         if status == 0 {
-            // THE HOST'S WHOLE ENVELOPE (D3, row 192 ruling: `RefuseIn` carries bytes by design, and
-            // the host frames the refusal, its fields included, before it calls `refuse`): written
-            // byte for byte, nothing of this door's added; hyper is let go and the connection is
-            // over. HTTP/2 frames every answer itself, so an HTTP/1.1 envelope has no place on one
-            // of its streams.
+            // THE HOST'S WHOLE ENVELOPE (`RefuseIn` carries bytes by design, and the host frames
+            // the refusal, its fields included, before it calls `refuse`): written byte for byte,
+            // nothing of this door's added; hyper is let go and the connection is over. HTTP/2
+            // frames every answer itself, so an HTTP/1.1 envelope has no place on one of its
+            // streams.
             if self.h2 {
                 return Err(Failure(format!(
                     "refuse: stream {stream}: an HTTP/1.1 envelope on an HTTP/2 connection"
@@ -752,7 +748,7 @@ impl Accepted {
                 ));
             }
         }
-        // A stream the far side gave up (Q128 reader A, MEDIUM: an HTTP/2 reset, or the request
+        // A stream the far side gave up (an HTTP/2 reset, or the request
         // dropped before or during its answer): the host is told it ended, once (its failure
         // piece, which also ends any hold on a full stream), and the stream is over on both sides,
         // its queued answer let go, so its record goes below and a later emit on it is refused.
@@ -958,7 +954,7 @@ fn serve(
             },
         );
         s.waiting.push(id);
-        // The copy holds an upgrade request's HEAD only (Q128 reader B finding 2): a request that
+        // The copy holds an upgrade request's HEAD only: a request that
         // asks no upgrade, or one that carries a body, ends any hand-over as sent.
         if !asks_upgrade || !bodiless {
             s.no_hand_over = true;
@@ -1023,10 +1019,9 @@ fn carry_bodies(sh: &mut Shared, lines: &[Line], cx: &mut Context<'_>) {
     }
 }
 
-/// Hold a `HeadBody` request's body as it arrives, up to `limit` bytes (THE DESIGN §6 item 4,
-/// l.940-942: "`HeadBody`'s bound is the size gate's limit; over it is 413, answered before the
-/// verdict"). Past the limit the body is let go (zeroised) and no more is read; whole, it waits for
-/// the auth.
+/// Hold a `HeadBody` request's body as it arrives, up to `limit` bytes (the size gate's limit; over
+/// it is 413, answered before the verdict). Past the limit the body is let go (zeroised) and no
+/// more is read; whole, it waits for the auth.
 fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
     let Some(body) = a.body.as_mut() else {
         return;
@@ -1099,7 +1094,7 @@ fn field_lines(parts: &http::request::Parts) -> Vec<(&str, &[u8])> {
         .collect()
 }
 
-/// Strip from `parts` what the auth named (THE DESIGN §6 item 4, l.943-945): every field line it
+/// Strip from `parts` what the auth named: every field line it
 /// names (ASCII case-insensitively) and every query key (case-sensitively), the target rewritten
 /// without those keys.
 ///
@@ -1164,10 +1159,10 @@ fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
 }
 
 impl Accepted {
-    /// ADMIT what the guest list holds (`BUSBAR-1.6.0.md` §6 item 4, l.938-962; item 7, l.952-956):
-    /// the peer point first, once per connection, then every waiting request in arrival order, each
-    /// as far as it can go now. A pending `auth.call` parks only its own stream (or, at the peer
-    /// point, the connection's requests) until the next drive re-issues it.
+    /// ADMIT what the guest list holds: the peer point first, once per connection, then every
+    /// waiting request in arrival order, each as far as it can go now. A pending `auth.call` parks
+    /// only its own stream (or, at the peer point, the connection's requests) until the next drive
+    /// re-issues it.
     pub fn admit(&mut self, k: &mut dyn Kernel) -> Admitted {
         let mut did = Admitted::default();
         if self.ended && self.conn.is_none() {
@@ -1201,8 +1196,7 @@ impl Accepted {
                     self.peer_done += 1;
                     did.moved = true;
                 }
-                // A `Peer` refusal (or no answer) closes the connection with no response bytes
-                // (item 7, l.955-956).
+                // A `Peer` refusal (or no answer) closes the connection with no response bytes.
                 Poll::Ready(_) => {
                     self.conn = None;
                     self.ended = true;
@@ -1219,11 +1213,11 @@ impl Accepted {
                 continue;
             };
             let before = a.gate;
-            // A request parked on this op's ticket parks only its own stream (THE DESIGN §6 item
-            // 7, l.975-976; Q128 r231): every other waiting request is still matched, called and
-            // handed in here, each under its own completion sequence. The op then answers PENDING
-            // and yields nothing (the transport contract), so what the others produced goes to the
-            // host with the op's resume or the next op on another ticket.
+            // A request parked on this op's ticket parks only its own stream: every other waiting
+            // request is still matched, called and handed in here, each under its own completion
+            // sequence. The op then answers PENDING and yields nothing (the transport contract), so
+            // what the others produced goes to the host with the op's resume or the next op on
+            // another ticket.
             self.admit_one(id, &mut a, &mut sh.out, k, &mut did);
             // A request that moved on (to holding its body, say) is driven again before the op
             // answers.
@@ -1380,13 +1374,13 @@ impl Accepted {
     ) {
         let seq = self.next_seq();
         let_held_go(&mut a.held);
-        // A request with no line has no unit (l.947: "A request that matches no line has no unit").
+        // A request that matches no line has no unit.
         let unit = if line == LINE_NONE {
             UnitRef::NONE
         } else {
             a.unit
         };
-        // The request being refused, as decoded (busbar step 2, `UnitRefuseIn::request`), with the
+        // The request being refused, as decoded (`UnitRefuseIn::request`), with the
         // connection's scheme: for every cause, the no-route one included.
         let fields = a.parts.as_ref().map(field_lines).unwrap_or_default();
         let view = a.parts.as_ref().map_or_else(HeadViewArgs::default, |p| {
@@ -1407,7 +1401,7 @@ impl Accepted {
 
 /// Append `bytes` to `buf`, a buffer of the transport's own that may hold credential bytes: when
 /// they do not fit, the bytes move to a new allocation and the one outgrown is zeroised before it
-/// is freed, so no copy is freed unzeroised (Q128 reader B r212).
+/// is freed, so no copy is freed unzeroised.
 fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     if buf.capacity() - buf.len() < bytes.len() {
         let want = (buf.len() + bytes.len()).max(buf.capacity().saturating_mul(2));
@@ -1419,7 +1413,7 @@ fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-/// THE REQUEST BODY AN ANSWER ENDED BEFORE (row 192): once the host's answer on `a`'s stream is
+/// THE REQUEST BODY AN ANSWER ENDED BEFORE: once the host's answer on `a`'s stream is
 /// whole and its request body has not all arrived (the over-cap case: the host answers `413` while
 /// the body is still coming), the body is let go unread, as 1.5.5's server let it go (axum's body
 /// limit answered, and the handler dropped the request). hyper then ends the stream as it did then:
@@ -1457,14 +1451,14 @@ fn offer_position(protocol: &[u8]) -> u32 {
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
-/// it (Q128 reader B finding 1).
+/// it.
 fn let_held_go(held: &mut Vec<u8>) {
     held.zeroize();
     *held = Vec::new();
 }
 
-/// Whether request `a` is over on both sides and its record can go (Q128 reader B finding 1; THE
-/// DESIGN §1 l.199-203, retention bounds only settled handles): its request side is done (refused,
+/// Whether request `a` is over on both sides and its record can go (retention bounds only settled
+/// handles): its request side is done (refused,
 /// failed, or admitted and whole) and its answer is done (no head owed, and any body hyper still
 /// had to take taken). A request that asked to upgrade is kept while its answer is owed or it
 /// switched, for `detach`. What stays is therefore what hyper itself holds live, bounded as
