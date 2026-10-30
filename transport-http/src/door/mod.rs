@@ -1020,17 +1020,24 @@ impl SafeSlot for Detach {
         let sink = i.field(|x| &x.sink);
         a.drive(sink.now_monotonic_ns);
         let agreed = a.agreed();
-        let mut wire_buf = sink.wire();
-        let wire = a.take_wire(wire_buf.cap());
-        wire_buf.extend(&wire);
-        let wire_pending = a.wire_pending();
-        let rest = match a.detach() {
-            Ok(Some(rest)) => rest,
+        // Whether the connection goes, decided BEFORE a wire byte is taken: a detach that is not
+        // READY hands the host nothing, so the bytes still owed to the far side stay owed (the
+        // next op hands them over), never taken into a buffer the host does not read.
+        match a.detach() {
+            Ok(Some(_)) => {}
             Ok(None) => {
                 o.error("detach: nothing on this connection switched protocols");
                 return Outcome::Refused;
             }
             Err(e) => return failed(&mut o, e.0),
+        }
+        let mut wire_buf = sink.wire();
+        let wire = a.take_wire(wire_buf.cap());
+        wire_buf.extend(&wire);
+        let wire_pending = a.wire_pending();
+        // The connection went above: this answers what it handed over, and moves nothing.
+        let Ok(Some(rest)) = a.detach() else {
+            return failed(&mut o, "detach: the switch has not completed".into());
         };
         let mut frame = sink.frame();
         let n = rest.len().min(frame.cap());
