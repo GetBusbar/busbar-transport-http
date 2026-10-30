@@ -1493,6 +1493,11 @@ struct Script {
     asked: Vec<Asked>,
     /// The fields `unit.refuse` answers, in order; empty: `content-type: application/json` alone.
     refusal_fields: Vec<(&'static str, &'static str)>,
+    /// The next `auth.call` first crosses a `cancel` into the door (`table`, instance), while the
+    /// op that made the call holds its framing.
+    reenter: Option<(&'static Ops, usize)>,
+    /// What that `cancel` answered: its outcome and disposition.
+    reentered: Option<(Outcome, u32)>,
 }
 
 /// Which of the auth handle's services answer FAILED.
@@ -1592,6 +1597,29 @@ fn outcome(out: *mut ServiceOut, o: Outcome) -> RawOutcome {
 }
 
 extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    let reenter = SCRIPTS
+        .lock()
+        .expect("scripts")
+        .get_mut(&ctx.handle)
+        .and_then(|s| s.reenter.take());
+    if let Some((ops, inst)) = reenter {
+        let mut i: CancelIn = z();
+        i.ticket = Ticket {
+            slot: 77,
+            generation: 1,
+        };
+        let mut o: CancelOut = z();
+        let r = call(
+            ops.head.cancel,
+            inst as *mut c_void,
+            &mut i,
+            &mut o,
+            life::CANCEL,
+        );
+        if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&ctx.handle) {
+            s.reentered = Some((r, o.disposition));
+        }
+    }
     // SAFETY: the SDK wrapper hands a live `AuthCallIn`, its buffers and a live `out`.
     unsafe {
         let i = input.cast::<AuthCallIn>().read_unaligned();
@@ -2348,6 +2376,30 @@ fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
         "{label}: the cancelled call is not re-issued: {seqs:?}"
     );
     assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// RED (codeaudit concurrency L mod.rs:504): a `cancel` that meets a framing another op holds
+/// right now cannot look at it, and answered NOTHING_MOVED as if no parked call could sit there. It
+/// says it could not look (FAILED, the framing busy), never that nothing moved.
+fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+    );
+    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+        s.reenter = Some((ops, h.inst as usize));
+    }
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+    let reentered = SCRIPTS.lock().expect("scripts")[&h.ctx].reentered;
+    let (r, disposition) = reentered.expect("the cancel crossed while the framing was held");
+    assert_eq!(
+        r,
+        Outcome::Failed,
+        "{label}: a cancel that could not look at a held framing says so, not NOTHING_MOVED \
+         (disposition {disposition})"
+    );
     h.close();
 }
 
@@ -3328,6 +3380,11 @@ fn a_resumed_op_reissues_the_same_handle_and_takes_no_byte_twice() {
 #[test]
 fn a_cancel_of_a_parked_op_is_partial_and_lets_the_call_go() {
     both(cancel_of_a_parked_op);
+}
+
+#[test]
+fn a_cancel_meeting_a_held_framing_is_not_nothing_moved() {
+    both(cancel_meeting_a_held_framing);
 }
 
 #[test]
