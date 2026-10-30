@@ -283,6 +283,10 @@ pub struct Accepted {
     /// hyper's executor (`engine::Tasks`): held weakly by the tasks hyper spawns on it.
     tasks: Tasks,
     conn: Option<BoxFut<ConnResult>>,
+    /// Why hyper ended the connection, when it ended in an error (its own text: a header-read
+    /// timeout, a protocol violation, a malformed request; it repeats no request byte): the words
+    /// every stream it ended is told after its own.
+    ended_by: Option<String>,
     shared: Arc<Mutex<Shared>>,
     out: VecDeque<Piece>,
     ended: bool,
@@ -369,6 +373,7 @@ impl Accepted {
             io,
             tasks,
             conn: Some(Box::pin(conn)),
+            ended_by: None,
             shared,
             out: VecDeque::new(),
             ended: false,
@@ -733,16 +738,20 @@ impl Accepted {
         let io = self.io.clone();
         let conn = &mut self.conn;
         let ended = &mut self.ended;
+        let ended_by = &mut self.ended_by;
         let shared = &self.shared;
         let lines = &self.lines;
         let tasks = &self.tasks;
         let _ = io.rounds(|cx| {
             tasks.run(cx);
             if let Some(c) = conn.as_mut() {
-                if let Poll::Ready(_r) = c.as_mut().poll(cx) {
+                if let Poll::Ready(r) = c.as_mut().poll(cx) {
                     // The connection is over: closed by the far side, refused by hyper (it
                     // answered a malformed request itself, as v1.5.5's did), past its header-read
-                    // bound, or switched.
+                    // bound, or switched. An error's words are kept for the streams it ended.
+                    if let Err(e) = r {
+                        *ended_by = Some(e.to_string());
+                    }
                     *conn = None;
                     *ended = true;
                 }
@@ -766,7 +775,10 @@ impl Accepted {
                 }
                 sh.out.push_back(Piece::failure(
                     s,
-                    "the connection ended before the request was whole",
+                    &with_cause(
+                        "the connection ended before the request was whole",
+                        self.ended_by.as_deref(),
+                    ),
                 ));
             }
         }
@@ -800,8 +812,10 @@ impl Accepted {
             }
             let_held_go(&mut a.held);
             if tell {
-                sh.out
-                    .push_back(Piece::failure(s, "the far side gave the stream up"));
+                sh.out.push_back(Piece::failure(
+                    s,
+                    &with_cause("the far side gave the stream up", self.ended_by.as_deref()),
+                ));
             }
         }
         let mut writable = Vec::new();
@@ -1534,6 +1548,15 @@ fn given_up(a: &Answer) -> bool {
         q.gone && !q.broken && !(q.ended && q.chunks.is_empty())
     });
     !a.switched && (before_head || mid_answer)
+}
+
+/// A stream's failure `words`, followed by why hyper ended the connection, where it ended in an
+/// error.
+fn with_cause(words: &str, cause: Option<&str>) -> String {
+    match cause {
+        Some(cause) => format!("{words}: {cause}"),
+        None => words.to_owned(),
+    }
 }
 
 /// Leave request `a` unanswered: its answer's sender dropped, hyper ends the stream (HTTP/2) or
