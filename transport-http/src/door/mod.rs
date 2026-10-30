@@ -590,9 +590,10 @@ impl SafeSlot for Refuse {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| match h {
-                Held::Accept(a) => a.refuse(stream, bytes, status, head_sent),
-                Held::Dial(_) => Ok(()),
+            |h, resumed| match h {
+                // `refuse` never pends, so it is never resumed.
+                Held::Accept(a) if !resumed => a.refuse(stream, bytes, status, head_sent),
+                _ => Ok(()),
             },
         )
     }
@@ -905,8 +906,10 @@ impl SafeSlot for Ingest {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| {
+            |h, resumed| {
+                // A resumed op took its bytes whole the first time.
                 match h {
+                    _ if resumed => {}
                     Held::Dial(f) => f.ingest(bytes, i.end != 0),
                     Held::Accept(a) => a.ingest(bytes, i.end != 0),
                 }
@@ -937,11 +940,19 @@ impl SafeSlot for Emit {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| match h {
+            |h, resumed| match h {
+                // A resumed op took its bytes whole the first time.
+                Held::Dial(_) if resumed => Ok(()),
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_status(&i, false).map_err(refused_status)?;
                     f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+                }
+                Held::Accept(a) if resumed => {
+                    // Its answer states the stream's queue as it stands: the first run's
+                    // fullness was answered PENDING, never to the host.
+                    full = a.stream_full(i.stream);
+                    Ok(())
                 }
                 Held::Accept(a) => {
                     // The first emit on an accepted stream is its answer's head, with its status;
@@ -977,7 +988,7 @@ impl SafeSlot for Timer {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| {
+            |h, _| {
                 // A connection the host refused whole is over: no deadline of it is owed.
                 match h {
                     Held::Accept(a) if a.refused_whole() => {
@@ -1163,8 +1174,9 @@ const REFUSE: FramerOp = FramerOp { name: "refuse" };
 const TIMER: FramerOp = FramerOp { name: "timer" };
 
 /// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
-/// name. An op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its
-/// input whole the first time: `f` is not run again.
+/// name. `f` is told whether the op was re-entered with `FLAG_RESUME` (it answered PENDING on a
+/// parked `auth.call`): such an op took its input whole the first time and takes none again, but
+/// what it answers is read afresh.
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,
@@ -1172,7 +1184,7 @@ fn with(
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Held, bool) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(held) = p.get() else {
         // A static text: with no instance there is nowhere to keep an owned one.
@@ -1198,10 +1210,8 @@ fn with(
         Ok(slot) => slot,
         Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
     };
-    if head.flags & FLAG_RESUME != 0 {
-        return step(slot.held(), sink, o, kernel, |_| Ok(()));
-    }
-    step(slot.held(), sink, o, kernel, f)
+    let resumed = head.flags & FLAG_RESUME != 0;
+    step(slot.held(), sink, o, kernel, |h| f(h, resumed))
 }
 
 /// `<op>: no open instance`, for each op [`with`] runs.
