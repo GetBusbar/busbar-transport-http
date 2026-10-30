@@ -866,21 +866,22 @@ impl Accepted {
             }
         }
         if self.leftover.is_none() {
-            let mut up = {
-                let mut sh = self.shared.lock().expect("shared");
-                let Some(up) = sh
-                    .streams
-                    .values_mut()
-                    .find(|a| a.switched)
-                    .and_then(|a| a.upgrade.take())
-                else {
-                    return Ok(None);
-                };
-                up
-            };
+            // The switched stream's upgrade handle stays where it is until the switch completes:
+            // a detach made before then fails, and the next one finds it again.
+            let owed = self
+                .shared
+                .lock()
+                .expect("shared")
+                .streams
+                .values()
+                .any(|a| a.switched && a.upgrade.is_some());
+            if !owed {
+                return Ok(None);
+            }
             let io = self.io.clone();
             let conn = &mut self.conn;
             let tasks = &self.tasks;
+            let shared = &self.shared;
             let mut got = None;
             let _ = io.rounds(|cx| {
                 tasks.run(cx);
@@ -890,8 +891,14 @@ impl Accepted {
                     }
                 }
                 if got.is_none() {
-                    if let Poll::Ready(r) = Pin::new(&mut up).poll(cx) {
-                        got = Some(r);
+                    let mut sh = shared.lock().expect("shared");
+                    if let Some(a) = sh.streams.values_mut().find(|a| a.switched) {
+                        if let Some(up) = a.upgrade.as_mut() {
+                            if let Poll::Ready(r) = Pin::new(up).poll(cx) {
+                                a.upgrade = None;
+                                got = Some(r);
+                            }
+                        }
                     }
                 }
                 Ok::<(), Failure>(())
