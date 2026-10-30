@@ -2403,6 +2403,34 @@ fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// RED (codeaudit correctness M mod.rs:1153): a request hyper decodes during the host's `refuse`
+/// (a pipelined HTTP/1.1 request, read as soon as the refused answer is written) was never put
+/// through the guest list: `refuse` admitted nothing and no later op was owed to the connection,
+/// so the client waited for an answer that never came. Every admission step that calls no
+/// may-pend service runs on it: here the request's `none` line hands it in and it goes up.
+fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
+    let one = b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello";
+    let two: Vec<u8> = one.iter().chain(one.iter()).copied().collect();
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        &two,
+    );
+    assert_eq!(h.heads_up(), 1, "{label}: one request at a time on HTTP/1.1");
+    assert_eq!(
+        h.refuse(Some(1), b"no", 403, false),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        h.heads_up(),
+        2,
+        "{label}: the request decoded during the refuse went up in it"
+    );
+    h.close();
+}
+
 /// Requests pipelined past any per-op bound are each answered in the op that decoded them: none is
 /// left waiting for a wake that never comes (Q128 reader B finding 1).
 fn pipelined_refusals(label: &str, ops: &'static Ops) {
@@ -3380,6 +3408,11 @@ fn a_resumed_op_reissues_the_same_handle_and_takes_no_byte_twice() {
 #[test]
 fn a_cancel_of_a_parked_op_is_partial_and_lets_the_call_go() {
     both(cancel_of_a_parked_op);
+}
+
+#[test]
+fn a_request_decoded_during_a_refuse_is_admitted_in_it() {
+    both(a_request_decoded_during_refuse_is_admitted);
 }
 
 #[test]
