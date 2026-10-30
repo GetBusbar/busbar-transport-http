@@ -35,8 +35,9 @@ pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Opti
 /// exception — the sentence says the same thing without one.)
 pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
     let s = value.trim();
-    if let Ok(n) = s.parse::<u64>() {
-        return Some(n);
+    // `delay-seconds = 1*DIGIT` (RFC 9110 10.2.3): no sign, which `u64`'s parse would take.
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<u64>().ok();
     }
     let at = httpdate::parse_http_date(s).ok()?;
     let epoch_secs = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
