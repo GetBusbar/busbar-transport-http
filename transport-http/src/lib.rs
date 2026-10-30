@@ -3,27 +3,22 @@
 
 //! The `http` transport: ONE framer entry, claiming the `http`, `https` and `sse` schemes.
 //!
-//! A plugin exports one entry and its schemes are its claims (`BUSBAR-1.6.0.md` TRANSPORT-STACK,
-//! ARCHITECT correction 2026-09-27: "ONE ENTRY PER PLUGIN"). This crate's entry is its memory-ABI
+//! A plugin exports one entry and its schemes are its claims. This crate's entry is its memory-ABI
 //! [`door`], a sans-IO framer: no socket, no waker, no clock of its own. The connector owns the
 //! socket and connection security and chooses the carrier from the target's scheme, so the framer
 //! composes over nothing (`COMPOSES_OVER` is empty: no transport names another). An `sse` stream is
 //! an HTTP response body, so the `sse` claim is framed exactly as `http` is; a plane reads the event
 //! boundaries in the body it is handed.
-//! A framing that rides HTTP/2 but is its own wire is its own transport plugin (OWNER
-//! 2026-09-29), not a claim of this one.
+//! A framing that rides HTTP/2 but is its own wire is its own transport plugin, not a claim of this
+//! one.
 //!
 //! `http` carries no session and its status class rides the first response frame: the
 //! kernel-derived leg of the fee decision the design's settlement table reads.
-//!
-//! The in-process `impl Transport` rows (`HttpTransport`, `SseTransport`) and their ingress reader
-//! are gone: they were built only for the boot seal and carried no byte. The root folds this row
-//! from the door's Statement on the transport-door axis.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// THE KIND'S SHAPE (`BUSBAR-1.6.0.md` THE DESIGN, §2): what it declares (`meta`), what it claims
+// THE KIND'S SHAPE: what it declares (`meta`), what it claims
 // (`claims`), the entry's own message rendering (`transport`), and the door that states them.
 mod claims;
 // THE ABI BOUNDARY: the door reads and writes the host's C buffers through the SDK's safe surface
@@ -36,7 +31,7 @@ mod transport;
 
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
 
-/// THE TRANSPORT AXIS ENTRY (#3, #30): what the composition root folds for this row: its key, the
+/// THE TRANSPORT AXIS ENTRY: what the composition root folds for this row: its key, the
 /// layers it declares (none: the carrier is the connector's choice) and its door. The root names
 /// none of them. The door's Statement claims `http`, `https` and `sse`; the root registers each
 /// from it.
@@ -44,7 +39,7 @@ pub mod linked {
     /// The row's registry key: the entry's first claim.
     pub const KEY: &str = crate::meta::KEY;
     /// The layers this framer declares it is built over: none. The connector chooses the carrier
-    /// from the target's scheme (`BUSBAR-1.6.0.md`: "no transport names another").
+    /// from the target's scheme: no transport names another.
     pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
 
     /// The `http` framer's memory-ABI door: the one entry, linked here and exported by the

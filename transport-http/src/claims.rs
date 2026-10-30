@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The claim shapes this transport declares, as the kind's own file (`BUSBAR-1.6.0.md` THE DESIGN, §2).
+//! The claim shapes this transport declares.
 //!
 //! A transport's claim is a SELECTOR FORM: the shape of question a plane may ask of arriving bytes
 //! on this wire. It is a declaration and nothing else — data read once at registration — which is
@@ -14,8 +14,7 @@ use busbar_contract::SelectorForm;
 /// `http` carries a request line and headers, so a claim on this wire can be about either. The
 /// accepted side honours EXACTLY these (`door::accept`, `door::guest`): a claim becomes a guest-list
 /// line whose route the door matches in the contract's one route vocabulary
-/// (`abi::transport::route`; `BUSBAR-1.6.0.md` §6 "Auth points and guest lists" item 3, l.906-910:
-/// "The match vocabulary is defined once in `abi/transport`"), so a form is declared here only
+/// (`abi::transport::route`), so a form is declared here only
 /// where that vocabulary spells it: the five path forms (`PATH_EXACT`, `PATH_PREFIX`,
 /// `PATH_PATTERN`, `PATH_SUFFIX`, `PATH_CONTAINS`) and the two field predicates (`FIELD_PRESENT`,
 /// `FIELD_VALUE_PREFIX`). `HeaderExact` is not declared: no route predicate spells an exact value,

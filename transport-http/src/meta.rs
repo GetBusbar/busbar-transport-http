@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! What this transport declares about itself, as the kind's own file (`BUSBAR-1.6.0.md` THE
-//! DESIGN, §2): the schemes it claims, how each is framed, and the transport kind's tail its door
-//! states. Read once at registration and sealed, so it is data, held apart from the framing code it
-//! describes.
+//! What this transport declares about itself: the schemes it claims, how each is framed, and the
+//! transport kind's tail its door states. Read once at registration and sealed, so it is data, held
+//! apart from the framing code it describes.
 
-use busbar_contract::abi::mechanism::call::AbiStr;
-use busbar_contract::abi::mechanism::door::KindTailHead;
 use busbar_contract::abi::transport::{
     TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
 };
@@ -19,18 +16,14 @@ pub const KEY: &str = "http";
 pub(crate) const SSE_KEY: &str = "sse";
 
 /// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
-/// secures before they leave (THE DESIGN §5: "http claims `http`, `https` and `sse`").
+/// secures before they leave.
 pub(crate) const SECURE_KEY: &str = "https";
 
 /// The layers this framer is built over: none. The carrier is the connector's choice from the
-/// target's scheme; no transport names another (`BUSBAR-1.6.0.md` TRANSPORT-STACK (2)).
+/// target's scheme; no transport names another.
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
 pub(crate) const TAIL: TransportTail = TransportTail {
-    head: KindTailHead {
-        size: std::mem::size_of::<TransportTail>() as u32,
-        _reserved: 0,
-    },
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,
     // Nothing is added to the head after the auth has run: the framer's own lines (`accept`,
@@ -46,24 +39,14 @@ pub(crate) const TAIL: TransportTail = TransportTail {
     facts: busbar_contract::abi::transport::FACT_DIALS
         | busbar_contract::abi::transport::FACT_ACCEPTS
         | busbar_contract::abi::transport::FACT_DETACHES,
-    handshake_max_steps: 0,
     frame_piece_size: FRAME_PIECE_SIZE,
-    _reserved: 0,
-    // No transport names another: the carrier is the connector's choice from the target's scheme.
-    composes_over: std::ptr::null(),
-    composes_over_len: 0,
     claim_rows: crate::door::CLAIMS.as_ptr(),
     claim_rows_len: crate::door::CLAIMS.len(),
-    upgrades_to: std::ptr::null(),
-    upgrades_to_len: 0,
-    handoff_from: AbiStr::ABSENT,
-    handoff_to: AbiStr::ABSENT,
-    handoff_binding_fact: AbiStr::ABSENT,
-    handshake_frame_kind: AbiStr::ABSENT,
     status_rows: crate::door::STATUS_ROWS.as_ptr(),
     status_rows_len: crate::door::STATUS_ROWS.len(),
     settings: crate::door::SETTINGS.as_ptr(),
     settings_len: crate::door::SETTINGS.len(),
     fault_rows: crate::door::FAULT_ROWS.as_ptr(),
     fault_rows_len: crate::door::FAULT_ROWS.len(),
+    ..TransportTail::EMPTY
 };
