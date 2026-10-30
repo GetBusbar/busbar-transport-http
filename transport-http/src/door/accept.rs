@@ -656,8 +656,18 @@ impl Accepted {
                 .and_then(|s| http::StatusCode::from_u16(s).ok())
                 .ok_or_else(|| Failure(format!("emit: {status} is not an HTTP status")))?;
             let mut b = http::Response::builder().status(code);
+            // Every byte of the block is a line `fields::lines` reads: it stops at the first that
+            // is not `name: value` CRLF, and a head cut short there is no answer the host gave.
+            let mut read = 0;
             for (name, value) in fields::lines(bytes) {
+                read += name.len() + fields::SEPARATOR.len() + value.len() + fields::LINE_END.len();
                 b = b.header(name, value);
+            }
+            if read != bytes.len() {
+                return Err(Failure(
+                    "emit: the head is not an answer: a field line is not `name: value` CRLF"
+                        .into(),
+                ));
             }
             let q = Arc::new(Mutex::new(ReplyQ {
                 ended: end,
