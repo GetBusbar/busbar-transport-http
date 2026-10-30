@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -134,6 +134,49 @@ impl Queue {
     }
 }
 
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A FRAMING'S OWN TASK LIST, hyper's executor, run once per round of the framing's drive. hyper
+/// keeps a clone of its executor inside the tasks it spawns (HTTP/2's connection task, each
+/// stream's task), so the executor holds the list only WEAKLY ([`Spawner`]): the framing alone owns
+/// it, and the framing's drop drops every task in it. An executor holding its list strongly (the
+/// SDK drive's own) would be held by its own tasks, and a framing dropped before they ended would
+/// keep them, hyper's connection state and the pipe, for good.
+#[derive(Default)]
+pub(crate) struct Tasks(Arc<Mutex<Vec<Task>>>);
+
+/// hyper's executor over a framing's [`Tasks`], holding it weakly: a task spawned once the framing
+/// is gone is dropped unrun.
+#[derive(Clone)]
+pub(crate) struct Spawner(Weak<Mutex<Vec<Task>>>);
+
+impl<F: Future<Output = ()> + Send + 'static> Executor<F> for Spawner {
+    fn execute(&self, fut: F) {
+        if let Some(list) = self.0.upgrade() {
+            list.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Box::pin(fut));
+        }
+    }
+}
+
+impl Tasks {
+    /// The executor hyper is handed.
+    pub(crate) fn spawner(&self) -> Spawner {
+        Spawner(Arc::downgrade(&self.0))
+    }
+
+    /// Poll every task once; one that ends is dropped, one spawned meanwhile runs next round.
+    pub(crate) fn run(&self, cx: &mut Context<'_>) {
+        let mut tasks =
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        tasks.retain_mut(|t| t.as_mut().poll(cx).is_pending());
+        let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        tasks.append(&mut list);
+        *list = tasks;
+    }
+}
+
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure(pub String);
@@ -141,6 +184,8 @@ pub struct Failure(pub String);
 /// One connection's HTTP machine.
 pub struct Framing {
     io: HostIo,
+    /// hyper's executor ([`Tasks`]).
+    tasks: Tasks,
     handshake: Option<BoxFut<hyper::Result<Sender>>>,
     sender: Option<Sender>,
     conn_err: Arc<Mutex<Option<String>>>,
@@ -176,7 +221,8 @@ impl Framing {
         );
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
-        let (exec, timer) = (io.exec(), io.timer());
+        let tasks = Tasks::default();
+        let (exec, timer) = (tasks.spawner(), io.timer());
         let conn_err = Arc::new(Mutex::new(None));
         let conn_done = Arc::new(AtomicBool::new(false));
         let (ex, err, done) = (exec.clone(), conn_err.clone(), conn_done.clone());
@@ -214,6 +260,7 @@ impl Framing {
         };
         Ok(Self {
             io,
+            tasks,
             handshake: Some(handshake),
             sender: None,
             conn_err,
@@ -403,7 +450,10 @@ impl Framing {
             return;
         }
         let io = self.io.clone();
-        if let Err(f) = io.rounds(|cx| self.step(cx)) {
+        if let Err(f) = io.rounds(|cx| {
+            self.tasks.run(cx);
+            self.step(cx)
+        }) {
             self.failed = Some(f);
             self.fail_streams();
             return;
