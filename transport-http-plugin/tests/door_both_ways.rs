@@ -49,7 +49,7 @@ use busbar_contract::abi::transport::{
     HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL,
     PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
     PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    YIELD_HAS_DEADLINE, YIELD_MORE, YIELD_STREAM_FULL,
 };
 use busbar_contract::abi::transport::{
     FAULT_NONE, FAULT_TRANSIENT, STATUS_CALLER_FAULT, STATUS_SUCCESS,
@@ -1173,8 +1173,22 @@ impl AcceptHost {
     }
 
     fn emit(&mut self, stream: u64, bytes: &[u8], end: bool, status: u32) -> Outcome {
+        self.emit_with(stream, bytes, end, status, 0).0
+    }
+
+    /// `emit` with head flags `flags` (`FLAG_RESUME`: the host re-issuing the op that answered
+    /// PENDING): its outcome and its yield's flags.
+    fn emit_with(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        status: u32,
+        flags: u32,
+    ) -> (Outcome, u32) {
         let mut i: EmitIn = z();
         i.head.ticket = self.ticket;
+        i.head.flags = flags;
         i.framing = self.framing;
         i.stream = stream;
         i.bytes = bytes.as_ptr();
@@ -1184,7 +1198,7 @@ impl AcceptHost {
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
-        self.take(r, &o)
+        (self.take(r, &o), o.yielded.flags)
     }
 
     /// `refuse`: `bytes` for `stream` (`None`: the whole connection), with the neutral `status`
@@ -2462,6 +2476,70 @@ fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// RED (codeaudit error-handling L mod.rs:940): an `emit` that left its stream's queue at the
+/// high-water mark AND parked on a pending `auth.call` (another request's, decoded and waiting)
+/// answered PENDING; its resume ran nothing and answered READY without `YIELD_STREAM_FULL`, so the
+/// host kept writing a stream that was full. The resume states the stream's fullness as it stands.
+fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![
+            line(3, POINT_HEAD, METHOD_ANY, "/a", 0),
+            line(5, 0, METHOD_ANY, "/b", 0),
+        ],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    // A's auth pends on this op's ticket; B is admitted and goes up.
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/a"), (3, "/b")])),
+        Outcome::Pending,
+        "{label}"
+    );
+    let parked = h.ticket;
+    h.ticket = Ticket {
+        slot: 2,
+        generation: 1,
+    };
+    assert_eq!(h.ingest(b""), Outcome::Ready, "{label}");
+    let b = h
+        .words
+        .iter()
+        .find(|(_, _, t)| t == b"/b")
+        .map(|(s, _, _)| *s)
+        .expect("B went up");
+    // B's answer, streamed: the far side's window takes the first chunk, the rest queue.
+    assert_eq!(h.emit(b, b"", false, 200), Outcome::Ready, "{label}");
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..3 {
+        assert_eq!(h.emit(b, &chunk, false, 0), Outcome::Ready, "{label}");
+    }
+    // A's parked call is let go, and its next call pends: on the emit that fills B's queue.
+    assert_eq!(h.cancel(parked), CANCEL_PARTIAL, "{label}");
+    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+        s.pend = 1;
+    }
+    h.ticket = Ticket {
+        slot: 3,
+        generation: 1,
+    };
+    assert_eq!(
+        h.emit_with(b, &chunk, false, 0, 0).0,
+        Outcome::Pending,
+        "{label}: the emit parks on A's auth"
+    );
+    let (r, flags) = h.emit_with(b, &chunk, false, 0, FLAG_RESUME);
+    assert_eq!(r, Outcome::Ready, "{label}: resumed");
+    assert_ne!(
+        flags & YIELD_STREAM_FULL,
+        0,
+        "{label}: the resume states B's queue full"
+    );
+    h.close();
+}
+
 /// Requests pipelined past any per-op bound are each answered in the op that decoded them: none is
 /// left waiting for a wake that never comes (Q128 reader B finding 1).
 fn pipelined_refusals(label: &str, ops: &'static Ops) {
@@ -3449,6 +3527,11 @@ fn a_request_decoded_during_a_refuse_is_admitted_in_it() {
 #[test]
 fn a_refused_detach_hands_over_no_owed_byte_and_loses_none() {
     both(a_refused_detach_keeps_the_owed_bytes);
+}
+
+#[test]
+fn a_resumed_emit_states_its_stream_full_linked_and_dropped_in() {
+    both(a_resumed_emit_states_its_stream_full);
 }
 
 #[test]
