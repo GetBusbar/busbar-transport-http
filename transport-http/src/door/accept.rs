@@ -56,7 +56,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::server::conn::auto;
 use zeroize::Zeroize;
 
-use super::engine::{Failure, HEAD_MAX_BYTES};
+use super::engine::{Failure, Tasks, HEAD_MAX_BYTES};
 use super::guest::{self, Line, Matched};
 use super::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 
@@ -280,6 +280,8 @@ pub struct Admitted {
 /// One accepted connection's HTTP machine.
 pub struct Accepted {
     io: HostIo,
+    /// hyper's executor (`engine::Tasks`): held weakly by the tasks hyper spawns on it.
+    tasks: Tasks,
     conn: Option<BoxFut<ConnResult>>,
     shared: Arc<Mutex<Shared>>,
     out: VecDeque<Piece>,
@@ -354,7 +356,8 @@ impl Accepted {
         let sh = shared.clone();
         let service =
             hyper::service::service_fn(move |req: http::Request<Incoming>| serve(sh.clone(), req));
-        let mut builder = auto::Builder::new(io.exec());
+        let tasks = Tasks::default();
+        let mut builder = auto::Builder::new(tasks.spawner());
         builder
             .http1()
             .timer(io.timer())
@@ -364,6 +367,7 @@ impl Accepted {
             .into_owned();
         Self {
             io,
+            tasks,
             conn: Some(Box::pin(conn)),
             shared,
             out: VecDeque::new(),
@@ -731,7 +735,9 @@ impl Accepted {
         let ended = &mut self.ended;
         let shared = &self.shared;
         let lines = &self.lines;
+        let tasks = &self.tasks;
         let _ = io.rounds(|cx| {
+            tasks.run(cx);
             if let Some(c) = conn.as_mut() {
                 if let Poll::Ready(_r) = c.as_mut().poll(cx) {
                     // The connection is over: closed by the far side, refused by hyper (it
@@ -874,8 +880,10 @@ impl Accepted {
             };
             let io = self.io.clone();
             let conn = &mut self.conn;
+            let tasks = &self.tasks;
             let mut got = None;
             let _ = io.rounds(|cx| {
+                tasks.run(cx);
                 if let Some(c) = conn.as_mut() {
                     if c.as_mut().poll(cx).is_ready() {
                         *conn = None;
