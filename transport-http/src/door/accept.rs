@@ -646,13 +646,13 @@ impl Accepted {
         let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
             return Err(Failure(format!("emit: no request on stream {stream}")));
         };
-        if let Some(respond) = a.respond.take() {
-            // The connection answers: it is no longer one to hand over as sent.
-            if let Some(mut raw) = self.raw.take() {
-                raw.zeroize();
-            }
+        if a.respond.is_some() {
+            // The head is judged whole BEFORE the answer is given: one no answer can carry is
+            // refused with the stream still answerable. A status is RFC 9110's three digits from
+            // 100 to 599 (15), as the host's own refusal is clamped (`refuse`).
             let code = u16::try_from(status)
                 .ok()
+                .filter(|s| (100..=599).contains(s))
                 .and_then(|s| http::StatusCode::from_u16(s).ok())
                 .ok_or_else(|| Failure(format!("emit: {status} is not an HTTP status")))?;
             let mut b = http::Response::builder().status(code);
@@ -666,6 +666,13 @@ impl Accepted {
             let resp = b
                 .body(Reply(q.clone(), None))
                 .map_err(|e| Failure(format!("emit: the head is not an answer: {e}")))?;
+            let Some(respond) = a.respond.take() else {
+                unreachable!("checked above, under the same lock")
+            };
+            // The connection answers: it is no longer one to hand over as sent.
+            if let Some(mut raw) = self.raw.take() {
+                raw.zeroize();
+            }
             a.switched = code.as_u16() == SWITCHING_PROTOCOLS && a.upgrade.is_some();
             a.reply = Some(q);
             // The far side may have gone; its stream's end says so.
