@@ -2510,10 +2510,11 @@ fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
         .find(|(_, _, t)| t == b"/b")
         .map(|(s, _, _)| *s)
         .expect("B went up");
-    // B's answer, streamed: the far side's window takes the first chunk, the rest queue.
+    // B's answer, streamed: the far side's window takes the first chunks, the rest queue; the
+    // sixth fills the queue to its high-water mark.
     assert_eq!(h.emit(b, b"", false, 200), Outcome::Ready, "{label}");
     let chunk = vec![b'x'; 64 * 1024];
-    for _ in 0..3 {
+    for _ in 0..5 {
         assert_eq!(h.emit(b, &chunk, false, 0), Outcome::Ready, "{label}");
     }
     // A's parked call is let go, and its next call pends: on the emit that fills B's queue.
