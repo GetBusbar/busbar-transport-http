@@ -41,12 +41,14 @@ fn is_token(name: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// A CR, LF or NUL in the method, the path, a field name or a value, or a field name that is not
-/// an RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
-/// reparse): `Encode::Unrepresentable`. So is a length that does not frame the body: a stated
-/// `content-length` other than `body_len`, or a non-empty body with none stated. The length is one
-/// of the transport's own lines the host states BEFORE the auth: this
-/// renders it where the host put it and adds no line of its own.
+/// A CR, LF or NUL in the method, the path, a field name or a value, a field name that is not an
+/// RFC 9110 token (a `:` in a name would be re-read as a different field on the door's own
+/// reparse), or a value `emit`'s request builder refuses (a control byte): `Encode::Unrepresentable`.
+/// So is a head whose framing the door's own reading (`raw::Head::framing`, the one `emit` reads
+/// it by) does not take as exactly `body_len` bytes: a `content-length` other than `body_len`, two
+/// that disagree, a signed one, any `transfer-encoding`, or a non-empty body with no length stated.
+/// The length is one of the transport's own lines the host states BEFORE the auth: this renders it
+/// where the host put it and adds no line of its own.
 pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
     body_len: usize,
@@ -78,27 +80,15 @@ pub(crate) fn render_head(
     }
     let mut size = method.len() + path.len() + 64;
     for (name, value) in fields {
-        if !is_token(name.as_bytes()) || !clean(value) {
+        // A value is what `emit`'s request builder takes as one (`http::HeaderValue`: visible
+        // bytes, SP, HTAB and obs-text, RFC 9110 5.5), judged here, not there.
+        if !is_token(name.as_bytes())
+            || !clean(value)
+            || http::HeaderValue::from_bytes(value).is_err()
+        {
             return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
         }
         size += name.len() + value.len() + 4;
-    }
-
-    // THE LENGTH is a fact about the bytes below, stated in the head the auth saw: it must frame
-    // them exactly, and an empty body states none (1.5.5's client sent none for one on HTTP/1.1;
-    // on HTTP/2 its framing added `content-length: 0` for a payload method, as this door's does:
-    // the one exception `meta::TAIL` names).
-    let framed = match field("content-length") {
-        Some(v) => {
-            std::str::from_utf8(v)
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                == Some(body_len)
-        }
-        None => body_len == 0,
-    };
-    if !framed {
-        return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
     }
 
     let mut out = Zeroizing::new(Vec::with_capacity(size));
@@ -116,6 +106,19 @@ pub(crate) fn render_head(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
+
+    // THE LENGTH is a fact about the bytes below, stated in the head the auth saw: it must frame
+    // them exactly, and an empty body states none (1.5.5's client sent none for one on HTTP/1.1;
+    // on HTTP/2 its framing added `content-length: 0` for a payload method, as this door's does:
+    // the one exception `meta::TAIL` names). It is judged by the reading `emit` frames the message
+    // by, so the two never disagree.
+    let framed = crate::raw::Head::parse(&out)
+        .ok()
+        .and_then(|h| h.framing().ok())
+        == Some(crate::raw::BodyFraming::Length(body_len));
+    if !framed {
+        return Err(busbar_contract::transport::wire::Encode::Unrepresentable);
+    }
     Ok(out)
 }
 
