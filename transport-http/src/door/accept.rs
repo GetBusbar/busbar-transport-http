@@ -221,9 +221,8 @@ pub type AuthCalled = (u32, UnitRef, Vec<(String, Place)>);
 /// ticket; the door's is the SDK's `Services` (`door::HostKernel`).
 pub trait Kernel {
     /// The ticket of the op the calls are made on; a call that pends is parked on it.
-    fn ticket(&self) -> Ticket {
-        Ticket::NONE
-    }
+    /// [`Ticket::NONE`] on an op with no ticket, where no `auth.call` is made.
+    fn ticket(&self) -> Ticket;
 
     /// `auth.call`: the flow, the request's unit and the names to strip.
     #[allow(clippy::too_many_arguments)]
