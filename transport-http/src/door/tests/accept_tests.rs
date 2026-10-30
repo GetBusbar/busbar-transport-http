@@ -15,7 +15,16 @@ const SEC: u64 = 1_000_000_000;
 /// refused.
 struct Open;
 
+/// The ticket a test kernel's op runs on: a ticketed one, where `auth.call` may be made.
+const OP_TICKET: Ticket = Ticket {
+    slot: 1,
+    generation: 1,
+};
+
 impl Kernel for Open {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
         &mut self,
@@ -435,6 +444,9 @@ fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
 struct Refusing;
 
 impl Kernel for Refusing {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
         &mut self,
