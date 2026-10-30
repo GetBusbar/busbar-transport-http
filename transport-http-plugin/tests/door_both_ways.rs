@@ -2431,6 +2431,37 @@ fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// RED (codeaudit error-handling M mod.rs:1014, correctness L mod.rs:1014): `detach` took the
+/// answer bytes still owed to the far side into the host's wire buffer before it knew it would
+/// answer READY; answering REFUSED (nothing switched protocols) it handed the host none of them,
+/// and they were gone: the far side read an answer with a hole in it. A detach that is not READY
+/// takes nothing, and the bytes go out with the next op.
+fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    // A host wire buffer of 16 bytes: the answer is owed over several ops.
+    h.wire = vec![0; 16];
+    assert_eq!(
+        h.emit(1, b"content-length: 5\r\n", false, 200),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(h.emit(1, b"hello", true, 0), Outcome::Ready, "{label}");
+    assert_eq!(h.detach().0, Outcome::Refused, "{label}: nothing switched");
+    h.wire = vec![0; 64 * 1024];
+    assert_eq!(h.timer(), Outcome::Ready, "{label}");
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello",
+        "{label}: every answer byte reached the far side"
+    );
+    h.close();
+}
+
 /// Requests pipelined past any per-op bound are each answered in the op that decoded them: none is
 /// left waiting for a wake that never comes (Q128 reader B finding 1).
 fn pipelined_refusals(label: &str, ops: &'static Ops) {
@@ -3413,6 +3444,11 @@ fn a_cancel_of_a_parked_op_is_partial_and_lets_the_call_go() {
 #[test]
 fn a_request_decoded_during_a_refuse_is_admitted_in_it() {
     both(a_request_decoded_during_refuse_is_admitted);
+}
+
+#[test]
+fn a_refused_detach_hands_over_no_owed_byte_and_loses_none() {
+    both(a_refused_detach_keeps_the_owed_bytes);
 }
 
 #[test]
