@@ -1240,3 +1240,38 @@ fn a_dropped_h2_framing_frees_its_connection() {
         "the connection task went with the framing"
     );
 }
+
+/// RED (codeaudit correctness/error-handling L engine.rs:434): a stream refused partway (its
+/// failure piece out, the rest of its message still arriving) was failed AGAIN when the connection
+/// failed with output owed: two terminal pieces for one stream. A connection's failure is stated
+/// once on each stream the host was not already told failed.
+#[test]
+fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
+    f.drive(0, 0);
+    // Refused partway: bytes past the stated length, the host's end of it not yet come.
+    f.emit(
+        3,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
+        false,
+        0,
+        0,
+    )
+    .expect("an h2 stream's refusal is a failure piece");
+    // The far end breaks the connection (DATA on stream 0: a connection error), output owed.
+    f.ingest(&h2(0, 0, 0, b"x"), false);
+    f.drive(SEC, 0);
+    let failed_on = |s: u64, f: &mut Framing| {
+        f.pieces()
+            .iter()
+            .filter(|p| p.stream == s && p.failed)
+            .count()
+    };
+    assert_eq!(failed_on(1, &mut f), 1, "the live stream is told once");
+    assert_eq!(failed_on(3, &mut f), 1, "the refused stream is told once");
+}
