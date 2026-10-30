@@ -497,3 +497,46 @@ fn a_transfer_encoding_other_than_chunked_is_refused() {
         );
     }
 }
+
+/// RED (codeaudit correctness L transport.rs:91, conformance NIT transport.rs:95): `encode`
+/// promises to refuse what the framing's own reading of its message refuses, rather than answer
+/// READY and fail at `emit`, but it judged the length by the FIRST `content-length` alone (read as
+/// a `usize`, so `+5` passed), never looked at `transfer-encoding`, and let through value bytes
+/// `emit`'s request builder refuses. Each is refused at encode now.
+#[test]
+fn encode_refuses_what_emit_would_refuse() {
+    let refused = |fields: &[(&str, &[u8])], body: &[u8], what: &str| {
+        assert_eq!(
+            crate::transport::render_envelope(fields, body).err(),
+            Some(busbar_contract::transport::wire::Encode::Unrepresentable),
+            "{what}"
+        );
+    };
+    refused(
+        &[("content-length", b"5"), ("content-length", b"6")],
+        b"hello",
+        "two lengths that disagree",
+    );
+    refused(&[("content-length", b"+5")], b"hello", "a signed length");
+    refused(
+        &[("transfer-encoding", b"gzip")],
+        b"",
+        "a coding this framing does not read",
+    );
+    refused(
+        &[("transfer-encoding", b"chunked"), ("content-length", b"0")],
+        b"",
+        "a coding beside a length",
+    );
+    refused(&[("x-note", b"a\x01b")], b"", "a control byte in a value");
+    refused(&[("x-note", b"a\x7fb")], b"", "DEL in a value");
+    // What the framing reads, encode still renders.
+    for (fields, body) in [
+        (&[("content-length", &b"5"[..])][..], &b"hello"[..]),
+        (&[("content-length", b"5"), ("content-length", b"5")], b"hello"),
+        (&[("x-note", b"tab\there obs-\xe9")], b""),
+        (&[], b""),
+    ] {
+        crate::transport::render_envelope(fields, body).expect("still encodes");
+    }
+}
