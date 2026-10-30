@@ -712,12 +712,16 @@ fn advance(
 /// (`busbar_contract::abi::transport::fields`) carrying the status and any `Retry-After`, framed
 /// even when no field is left in it, so it always comes before the body. The head piece states the
 /// body length the head declared (`Content-Length`, `PIECE_HAS_DECLARED_LEN`), where it declared
-/// one: the host's pre-body download cap reads it before a body byte arrives.
+/// one: the host's pre-body download cap reads it before a body byte arrives. An answer that
+/// carries no body (to a HEAD, a `204`, a `304`: hyper knows its body is empty) may name the length
+/// a body WOULD have had (RFC 9110 8.6), which is no length of this answer's: it states none, save
+/// a stated `0`.
 fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> Piece {
+    let bodiless = r.body().is_end_stream();
     Piece {
         status: Some(r.status().as_u16()),
         retry_after_secs: retry_after_secs(r.headers(), now_unix_secs),
-        declared_len: declared_len(r.headers()),
+        declared_len: declared_len(r.headers()).filter(|n| *n == 0 || !bodiless),
         head: reason_phrase(r).map(HeadWords::reason),
         ..Piece::fields(stream, Bytes::from(field_block(r.headers(), &[])))
     }
