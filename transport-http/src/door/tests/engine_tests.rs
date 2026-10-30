@@ -1175,3 +1175,53 @@ fn a_request_head_over_its_allowance_is_refused() {
         );
     }
 }
+
+/// A framing with one `method` request sent on stream 1, the far end not yet heard from.
+fn asked_with(proto: Proto, method: &str) -> Framing {
+    let mut f = Framing::dial("http://127.0.0.1:9", proto, posture(300), 0).expect("dial");
+    f.drive(0, 0);
+    let message = format!("{method} /x HTTP/1.1\r\n\r\n");
+    f.emit(1, message.as_bytes(), true, 0, 0).expect("emit");
+    f.drive(0, 0);
+    assert!(!f.take_wire(usize::MAX).is_empty(), "the request went out");
+    f
+}
+
+/// RED (codeaudit correctness M engine.rs:720): an answer that carries no body (a HEAD answer, a
+/// `204`, a `304`) may state the length the body WOULD have had (RFC 9110 8.6, 15.4.5), and the
+/// head piece stated it as the body's, so the host's pre-body download cap read 5 GiB for an answer
+/// of zero bytes. Such an answer states no declared length; a body that is there still does.
+#[test]
+fn an_answer_with_no_body_states_no_declared_length() {
+    for (method, head) in [
+        (
+            "HEAD",
+            &b"HTTP/1.1 200 OK\r\ncontent-length: 5368709120\r\n\r\n"[..],
+        ),
+        ("GET", b"HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n"),
+        ("GET", b"HTTP/1.1 204 No Content\r\ncontent-length: 5\r\n\r\n"),
+    ] {
+        let mut f = asked_with(Proto::H1, method);
+        f.ingest(head, false);
+        f.drive(SEC, 0);
+        assert_eq!(
+            declared(&mut f),
+            Some(None),
+            "{method} {:?}: no body, so no declared length",
+            String::from_utf8_lossy(&head[..12])
+        );
+    }
+    let mut f = asked_with(Proto::H2, "HEAD");
+    let mut block = vec![0x88];
+    block.extend(literal("content-length", "5368709120"));
+    let mut far = h2(4, 0, 0, &[]);
+    far.extend(h2(1, 0x4 | 0x1, 1, &block));
+    f.ingest(&far, false);
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(None), "h2 HEAD: no declared length");
+
+    let mut f = asked_with(Proto::H1, "GET");
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", false);
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(Some(0)), "an empty body's length stands");
+}
