@@ -3,13 +3,12 @@
 
 //! THE FRAMINGS AN INSTANCE HOLDS, by token, with no lock shared between them.
 //!
-//! THE DESIGN Appendix A.8 sets "zero contended atomics per chunk" and request-path ops that
-//! "return READY or PENDING in bounded CPU"; A.4.2 says conn ops "never block". So the per-chunk
-//! ops (`ingest`, `emit`, `timer`) reach a framing through its token alone: the token names a
-//! slot, the slot's segment is found with one read of a set-once cell, and the slot's own lock is
-//! the only one taken. Each slot sits on its own cache lines, so two framings never share one. The
-//! host calls one op at a time on a connection's framing, so that lock is never contended; should
-//! it ever be held, the op is answered at once ([`Reach::Busy`]), never waited for.
+//! No contended atomic per chunk, and request-path ops answer in bounded CPU, never blocking. So
+//! the per-chunk ops (`ingest`, `emit`, `timer`) reach a framing through its token alone: the token
+//! names a slot, the slot's segment is found with one read of a set-once cell, and the slot's own
+//! lock is the only one taken. Each slot sits on its own cache lines, so two framings never share
+//! one. The host calls one op at a time on a connection's framing, so that lock is never contended;
+//! should it ever be held, the op is answered at once ([`Reach::Busy`]), never waited for.
 //!
 //! Only `begin` and `finish` (once per connection, never per chunk) take the free list's lock, to
 //! mint a slot and to give one back. Segments are allocated on first use and grow geometrically, so
