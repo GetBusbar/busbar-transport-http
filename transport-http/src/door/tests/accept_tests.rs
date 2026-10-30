@@ -785,3 +785,46 @@ fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
         "the stream's task went with the framing"
     );
 }
+
+/// RED (codeaudit correctness/error-handling L accept.rs:853): `detach` took the switched stream's
+/// upgrade handle out before it knew the switch had completed, and on "the switch has not
+/// completed" dropped it: every later detach found nothing switched and was REFUSED, though the
+/// `101` was owed. The handle stays until the switch completes, so a detach once it has hands the
+/// connection over.
+#[test]
+fn a_detach_before_the_switch_completes_can_be_made_again() {
+    let mut a = accepted();
+    let mut sent = GET.to_vec();
+    sent.extend_from_slice(
+        b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n\x81\x05hello",
+    );
+    a.ingest(&sent, false);
+    run(&mut a, SEC);
+    let first = up(&mut a).heads[0].0;
+    // An answer the host has not taken from the wire yet, past the pipe's high-water mark: hyper
+    // cannot write the `101` that follows until it is taken.
+    let body = vec![b'x'; 300_000];
+    a.emit(first, b"content-length: 300000\r\n", false, 200)
+        .expect("head");
+    a.emit(first, &body, true, 0).expect("body");
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(
+        stream,
+        b"connection: upgrade\r\nupgrade: x-test\r\n",
+        true,
+        101,
+    )
+    .expect("101");
+    run(&mut a, SEC);
+    let early = a.detach().map(|r| r.map(|r| r.len()));
+    assert!(early.is_err(), "the switch has not completed yet: {early:?}");
+    let _ = a.take_wire(usize::MAX);
+    run(&mut a, SEC);
+    let rest = a
+        .detach()
+        .expect("switched")
+        .expect("the connection is handed over once the switch completes");
+    let rest: Vec<u8> = rest.drain(..).collect();
+    assert_eq!(rest, b"\x81\x05hello", "the bytes after the request");
+}
