@@ -728,3 +728,24 @@ fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
         String::from_utf8_lossy(&wire)
     );
 }
+
+/// RED (codeaudit error-handling L accept.rs:659): the answer head's field block was read only up
+/// to its first line that is not `name: value` CRLF, so every line from there on (a security
+/// header, a cache rule) was dropped and the emit answered READY. A block that is not whole lines
+/// is refused, and the stream is still answerable.
+#[test]
+fn an_answer_head_with_a_malformed_field_line_is_refused() {
+    let (mut a, stream) = one_get();
+    for block in [
+        &b"content-type: text/plain\r\nx-frame-options: DENY"[..],
+        b"content-type: text/plain\r\nno separator\r\nx-frame-options: DENY\r\n",
+    ] {
+        let r = a.emit(stream, block, true, 200);
+        assert!(
+            r.is_err(),
+            "{:?}: refused, not cut short: {r:?}",
+            String::from_utf8_lossy(block)
+        );
+        assert!(a.answers_head(stream), "still answerable");
+    }
+}
