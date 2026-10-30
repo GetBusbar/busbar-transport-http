@@ -123,7 +123,7 @@ use busbar_contract::abi::transport::{
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
 use accept::{Accepted, AuthCalled, Kernel};
-use busbar_contract::abi::transport::check::check_emit_status;
+use busbar_contract::abi::mechanism::check::{fault, Fault, Rule};
 use engine::{Framing, Posture, Proto};
 use framings::{Framings, Held};
 #[cfg(test)]
@@ -1430,8 +1430,21 @@ impl Kernel for HostKernel<'_> {
     }
 }
 
-/// An emit whose status breaks `check_emit_status`, as the failure its op answers.
-fn refused_status(f: busbar_contract::abi::transport::check::Fault) -> engine::Failure {
+/// An `emit`'s status ([`EmitIn::status`]): stated on the emit that carries an accepted stream's
+/// answer head (`answers_head`), and on no other.
+fn check_emit_status(i: &EmitIn, answers_head: bool) -> Result<(), Fault> {
+    if i._status_reserved != 0 {
+        return Err(fault(Rule::UnknownCode, "emit._status_reserved"));
+    }
+    match (answers_head, i.status) {
+        (true, 0) => Err(fault(Rule::Missing, "emit.status")),
+        (false, s) if s != 0 => Err(fault(Rule::Contradiction, "emit.status")),
+        _ => Ok(()),
+    }
+}
+
+/// An emit whose status breaks [`check_emit_status`], as the failure its op answers.
+fn refused_status(f: Fault) -> engine::Failure {
     engine::Failure(format!(
         "emit: the status breaks {:?} at {}",
         f.rule, f.field
