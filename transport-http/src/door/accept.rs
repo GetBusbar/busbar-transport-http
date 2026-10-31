@@ -39,7 +39,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -225,7 +225,7 @@ impl Body for Reply {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        let mut q = self.0.lock().expect("reply");
+        let mut q = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if q.broken {
             // hyper ends the answer failed: HTTP/1.1 closes the connection with no terminating
             // chunk, HTTP/2 resets the stream.
@@ -246,7 +246,7 @@ impl Body for Reply {
     }
 
     fn is_end_stream(&self) -> bool {
-        let q = self.0.lock().expect("reply");
+        let q = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         q.ended && q.chunks.is_empty()
     }
 
@@ -567,7 +567,13 @@ impl Accepted {
         if self.closing.is_some() || !self.heard {
             return;
         }
-        if !self.shared.lock().expect("shared").streams.is_empty() {
+        if !self
+            .shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .streams
+            .is_empty()
+        {
             self.idle = None;
         } else if self.idle.is_none() {
             let at = after(now, IDLE_TIMEOUT);
@@ -648,7 +654,13 @@ impl Accepted {
     /// request and what follows it may hold before it is answered) it goes too: the connection is
     /// served on, as v1.5.5's server served it.
     fn bound_raw(&mut self) {
-        if std::mem::take(&mut self.shared.lock().expect("shared").no_hand_over) {
+        if std::mem::take(
+            &mut self
+                .shared
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .no_hand_over,
+        ) {
             self.let_raw_go();
         }
         if self.raw.as_ref().is_some_and(|r| r.len() > HEAD_MAX_BYTES) {
@@ -674,7 +686,13 @@ impl Accepted {
             self.peer_parked = None;
             any = true;
         }
-        for a in self.shared.lock().expect("shared").streams.values_mut() {
+        for a in self
+            .shared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .streams
+            .values_mut()
+        {
             if a.parked.is_some_and(|(t, _)| t == ticket) {
                 a.parked = None;
                 any = true;
@@ -732,7 +750,7 @@ impl Accepted {
         if self.refused_whole && bytes.is_empty() {
             return Ok(());
         }
-        let mut sh = self.shared.lock().expect("shared");
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
             return Err(Failure(format!("refuse: no request on stream {stream}")));
         };
@@ -740,7 +758,7 @@ impl Accepted {
             let Some(q) = a.reply.as_ref() else {
                 return Err(Failure(format!("refuse: stream {stream} sent no head")));
             };
-            let mut q = q.lock().expect("reply");
+            let mut q = q.lock().unwrap_or_else(PoisonError::into_inner);
             // The answer ends failed and nothing more is owed on it: its record goes once hyper
             // let it go (the same release as a stream the far side gave up).
             q.broken = true;
@@ -813,11 +831,11 @@ impl Accepted {
     pub fn stream_full(&self, stream: u64) -> bool {
         self.shared
             .lock()
-            .expect("shared")
+            .unwrap_or_else(PoisonError::into_inner)
             .streams
             .get(&stream)
             .and_then(|a| a.reply.as_ref())
-            .is_some_and(|q| q.lock().expect("reply").full)
+            .is_some_and(|q| q.lock().unwrap_or_else(PoisonError::into_inner).full)
     }
 
     /// Whether `stream`'s next emit carries its answer's head.
@@ -825,7 +843,7 @@ impl Accepted {
     pub fn answers_head(&self, stream: u64) -> bool {
         self.shared
             .lock()
-            .expect("shared")
+            .unwrap_or_else(PoisonError::into_inner)
             .streams
             .get(&stream)
             .is_some_and(|a| a.up && a.respond.is_some())
@@ -844,7 +862,7 @@ impl Accepted {
         end: bool,
         status: u32,
     ) -> Result<bool, Failure> {
-        let mut sh = self.shared.lock().expect("shared");
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         // A stream the host was never handed (refused, or not yet admitted) is no request of its.
         let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
             return Err(Failure(format!("emit: no request on stream {stream}")));
@@ -898,7 +916,7 @@ impl Accepted {
         let Some(q) = a.reply.as_ref() else {
             return Err(Failure(format!("emit: stream {stream} has no answer")));
         };
-        let mut q = q.lock().expect("reply");
+        let mut q = q.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes.is_empty() && !end {
             // A re-call after `YIELD_MORE` carries nothing new.
             return Ok(q.full);
@@ -958,10 +976,15 @@ impl Accepted {
                     *ended = true;
                 }
             }
-            carry_bodies(&mut shared.lock().expect("shared"), lines, &bounds, cx);
+            carry_bodies(
+                &mut shared.lock().unwrap_or_else(PoisonError::into_inner),
+                lines,
+                &bounds,
+                cx,
+            );
             Ok::<(), Failure>(())
         });
-        let mut sh = self.shared.lock().expect("shared");
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         if self.ended {
             // A request the far side abandoned before it was whole fails its stream.
             let open: Vec<u64> = sh
@@ -1004,7 +1027,7 @@ impl Accepted {
             a.body = None;
             a.asked = true;
             if let Some(q) = a.reply.as_ref() {
-                let mut q = q.lock().expect("reply");
+                let mut q = q.lock().unwrap_or_else(PoisonError::into_inner);
                 q.chunks.clear();
                 q.queued = 0;
                 q.ended = true;
@@ -1023,7 +1046,7 @@ impl Accepted {
         let mut writable = Vec::new();
         for (s, a) in &sh.streams {
             if let Some(q) = &a.reply {
-                let mut q = q.lock().expect("reply");
+                let mut q = q.lock().unwrap_or_else(PoisonError::into_inner);
                 if q.full && q.queued < REPLY_LOW_WATER {
                     q.full = false;
                     writable.push(*s);
@@ -1067,7 +1090,7 @@ impl Accepted {
         let switched = self
             .shared
             .lock()
-            .expect("shared")
+            .unwrap_or_else(PoisonError::into_inner)
             .streams
             .values()
             .any(|a| a.switched);
@@ -1088,7 +1111,7 @@ impl Accepted {
             let owed = self
                 .shared
                 .lock()
-                .expect("shared")
+                .unwrap_or_else(PoisonError::into_inner)
                 .streams
                 .values()
                 .any(|a| a.switched && a.upgrade.is_some());
@@ -1108,7 +1131,7 @@ impl Accepted {
                     }
                 }
                 if got.is_none() {
-                    let mut sh = shared.lock().expect("shared");
+                    let mut sh = shared.lock().unwrap_or_else(PoisonError::into_inner);
                     if let Some(a) = sh.streams.values_mut().find(|a| a.switched) {
                         if let Some(up) = a.upgrade.as_mut() {
                             if let Poll::Ready(r) = Pin::new(up).poll(cx) {
@@ -1178,7 +1201,7 @@ fn serve(
     let bodiless = body.is_end_stream();
     let (tx, rx) = futures_channel::oneshot::channel();
     let stream = {
-        let mut s = sh.lock().expect("shared");
+        let mut s = sh.lock().unwrap_or_else(PoisonError::into_inner);
         let id = s.next;
         s.next += 1;
         s.streams.insert(
@@ -1476,7 +1499,7 @@ impl Accepted {
             }
         }
         let shared = self.shared.clone();
-        let mut sh = shared.lock().expect("shared");
+        let mut sh = shared.lock().unwrap_or_else(PoisonError::into_inner);
         let waiting = std::mem::take(&mut sh.waiting);
         for id in waiting {
             let Some(mut a) = sh.streams.remove(&id) else {
@@ -1735,7 +1758,7 @@ fn finished(a: &Answer) -> bool {
     };
     let answer_done = a.respond.is_none()
         && a.reply.as_ref().is_none_or(|q| {
-            let q = q.lock().expect("reply");
+            let q = q.lock().unwrap_or_else(PoisonError::into_inner);
             q.ended && q.chunks.is_empty()
         });
     request_done && answer_done && !a.switched
@@ -1750,7 +1773,7 @@ fn given_up(a: &Answer) -> bool {
         .as_ref()
         .is_some_and(futures_channel::oneshot::Sender::is_canceled);
     let mid_answer = a.reply.as_ref().is_some_and(|q| {
-        let q = q.lock().expect("reply");
+        let q = q.lock().unwrap_or_else(PoisonError::into_inner);
         q.gone && !q.broken && !(q.ended && q.chunks.is_empty())
     });
     !a.switched && (before_head || mid_answer)
