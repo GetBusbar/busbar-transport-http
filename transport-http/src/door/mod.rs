@@ -94,7 +94,7 @@ use std::task::Poll;
 use busbar_contract::abi::host::service::{AuthRef, UnitRef};
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
-use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn, ReleaseIn};
+use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held as Opened, Life, Refreshed, Refusal};
@@ -477,7 +477,7 @@ macro_rules! slot {
     };
 }
 
-// ── the lifecycle: the SDK's slots over [`Instance`] but these three ─────────────────────────────
+// ── the lifecycle: the SDK's slots over [`Instance`] but these two ───────────────────────────────
 
 slot!(
     /// `refresh`: [`Instance::refresh`]; with no open instance, FAILED in words.
@@ -529,11 +529,6 @@ slot!(
         );
         Outcome::Ready
     }
-);
-
-slot!(
-    /// `release`: this door leases nothing, so every release is READY.
-    Release, ReleaseIn, OutHead, |_, _, _out| { Outcome::Ready }
 );
 
 busbar_contract::not_served! {
@@ -1457,7 +1452,7 @@ busbar_contract::plugin_door! {
         tick: Safe<life::Tick<Instance>>,
         drive: Safe<life::Drive<Instance>>,
         cancel: Safe<Cancel>,
-        release: Safe<Release>,
+        release: Safe<life::Release<Instance>>,
         close: Safe<life::Close<Instance>>,
     },
     kind_ops: {
