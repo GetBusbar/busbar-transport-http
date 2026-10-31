@@ -419,7 +419,7 @@ pub struct Accepted {
     /// strip removes are views into hyper's own read buffer, which is hyper's, as in v1.5.5.
     raw: Option<Vec<u8>>,
     /// The listener's guest list, in match order.
-    lines: Vec<Line>,
+    lines: Arc<[Line]>,
     /// The distinct auth handles the lines call at the peer point, in list order.
     peer_auths: Vec<AuthRef>,
     /// How many of them answered CONTINUE.
@@ -462,7 +462,8 @@ impl Drop for Accepted {
 impl Accepted {
     /// Serve an accepted connection at host time `now_ns`, under guest list `lines`.
     #[must_use]
-    pub fn accept(now_ns: u64, lines: Vec<Line>) -> Self {
+    pub fn accept(now_ns: u64, lines: impl Into<Arc<[Line]>>) -> Self {
+        let lines = lines.into();
         let io = HostIo::new(now_ns);
         let shared = Arc::new(Mutex::new(Shared {
             out: VecDeque::new(),
