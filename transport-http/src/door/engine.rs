@@ -239,7 +239,8 @@ impl Framing {
                     let (s, c) = b.handshake(shim).await?;
                     ex.execute(async move {
                         if let Err(e) = c.await {
-                            *err.lock().expect("err") = Some(e.to_string());
+                            *err.lock().unwrap_or_else(PoisonError::into_inner) =
+                                Some(e.to_string());
                         }
                         done.store(true, Ordering::Release);
                     });
@@ -250,7 +251,7 @@ impl Framing {
                 let (s, c) = http1::Builder::new().handshake(shim).await?;
                 ex.execute(async move {
                     if let Err(e) = c.await {
-                        *err.lock().expect("err") = Some(e.to_string());
+                        *err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
                     }
                     done.store(true, Ordering::Release);
                 });
@@ -461,7 +462,11 @@ impl Framing {
             self.fail_streams();
             return;
         }
-        let err = self.conn_err.lock().expect("err").clone();
+        let err = self
+            .conn_err
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(e) = err {
             if self
                 .exchanges
@@ -509,7 +514,11 @@ impl Framing {
         for (id, stage) in &mut self.exchanges {
             let r = advance(*id, stage, &mut self.sender, &mut self.out, &k, cx);
             if let Err(f) = r.map(|held| self.held |= held) {
-                let conn_dead = self.conn_err.lock().expect("err").is_some();
+                let conn_dead = self
+                    .conn_err
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some();
                 if self.proto == Proto::H1 || conn_dead || f.1 {
                     return Err(f.0);
                 }
