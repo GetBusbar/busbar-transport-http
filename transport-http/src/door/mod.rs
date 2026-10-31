@@ -825,6 +825,7 @@ impl SafeSlot for Begin {
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
             let mut h = Held::Accept(
                 Accepted::accept(i.sink.now_monotonic_ns, lines)
+                    .with_body_max(settings.posture.max_body_bytes)
                     .with_scheme(scheme)
                     .with_alpn(alpn),
             );

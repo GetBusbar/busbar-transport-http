@@ -58,10 +58,32 @@ use zeroize::Zeroize;
 
 use super::engine::{extend_wiped, Failure, Tasks, HEAD_MAX_BYTES};
 use super::guest::{self, Line, Matched};
-use super::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
+use super::hyper_io::{field_block, HeadWords, HostIo, HostTimer, Owed, Piece};
 
 /// v1.5.5's HTTP/1 header-read bound (`hardened_conn_builder`).
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// THE ACCEPTED SIDE'S TIME BOUNDS, on the host's clock: the bounds v1.5.5's data listener (busbar
+/// `root/listener.rs`) put on a connection, so that none is held for good by a peer that stops.
+///
+/// A connection with NO REQUEST IN FLIGHT is closed this long into its idle period: from its first
+/// bytes (a connection that sends none is the connector's to bound: `begin` answers no deadline),
+/// before hyper has read which HTTP they open (a partial HTTP/2 preface), on HTTP/2
+/// before its first request and between requests, and on HTTP/1.1 between requests (hyper's own
+/// header-read bound, the same 30 s, coincides). The period starts once and is pushed back while
+/// answer bytes are still owed to the far side.
+pub const IDLE_TIMEOUT: Duration = HEADER_READ_TIMEOUT;
+/// An idle connection is first asked to close gracefully (HTTP/2: GOAWAY); one that has not closed
+/// this long after is dropped.
+pub const CLOSE_GRACE: Duration = Duration::from_secs(10);
+/// A request body the framing reads (carried up, or held for a `HeadBody` auth) that delivers
+/// nothing for this long fails (v1.5.5's `body_read_timeout`).
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Past this grace, a request body below [`MIN_BODY_BYTES_PER_SEC`] fails (v1.5.5's throughput
+/// floor, which a body trickling one byte per inter-frame bound would never trip).
+pub const BODY_THROUGHPUT_GRACE: Duration = Duration::from_secs(10);
+/// The throughput floor a request body keeps past its grace.
+pub const MIN_BODY_BYTES_PER_SEC: u64 = 1024;
 
 /// An answer body holds at most this many queued bytes before its `emit` answers the stream full.
 pub const REPLY_HIGH_WATER: usize = 256 * 1024;
@@ -76,6 +98,93 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type ConnResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// hyper's served connection, which can be asked to close gracefully.
+trait Served: Future<Output = ConnResult> + Send + Unpin {
+    /// Start a graceful close (hyper-util's `graceful_shutdown`: before the protocol is read, it
+    /// stops reading; HTTP/1.1 closes once idle; HTTP/2 says GOAWAY).
+    fn shut(&mut self);
+}
+
+/// A served connection `C` and how to close it gracefully.
+struct Conn<C> {
+    c: Pin<Box<C>>,
+    shut: fn(Pin<&mut C>),
+}
+
+impl<C: Future<Output = ConnResult> + Send> Future for Conn<C> {
+    type Output = ConnResult;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ConnResult> {
+        self.get_mut().c.as_mut().poll(cx)
+    }
+}
+
+impl<C: Future<Output = ConnResult> + Send> Served for Conn<C> {
+    fn shut(&mut self) {
+        (self.shut)(self.c.as_mut());
+    }
+}
+
+/// A sleep on the host's clock, and the host time it ends at.
+type Deadline = (u64, Pin<Box<dyn hyper::rt::Sleep>>);
+
+/// The host time `d` after `now`.
+fn after(now: u64, d: Duration) -> u64 {
+    now.saturating_add(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The clock on one request body the framing reads, from its first poll.
+struct BodyClock {
+    started: u64,
+    last: u64,
+    bytes: u64,
+    /// The inter-frame bound's wake-up, re-armed on every data frame.
+    _wake: Pin<Box<dyn hyper::rt::Sleep>>,
+}
+
+/// What a request body's bounds are judged against in one round.
+struct Bounds<'a> {
+    now: u64,
+    timer: &'a HostTimer,
+    /// The total a body may take: the body cap read at the throughput floor.
+    total_ns: u64,
+}
+
+impl Bounds<'_> {
+    fn wake(&self) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        self.timer
+            .sleep_until_ns(after(self.now, BODY_READ_TIMEOUT))
+    }
+
+    /// `a`'s body was polled: `got` data bytes arrived (`None`: nothing yet). The bound it broke.
+    fn polled(&self, a: &mut Answer, got: Option<usize>) -> Option<&'static str> {
+        let c = a.clock.get_or_insert_with(|| BodyClock {
+            started: self.now,
+            last: self.now,
+            bytes: 0,
+            _wake: self.wake(),
+        });
+        if let Some(n) = got {
+            c.bytes = c.bytes.saturating_add(n as u64);
+            c.last = self.now;
+            c._wake = self.wake();
+        }
+        let elapsed = self.now.saturating_sub(c.started);
+        if elapsed > self.total_ns {
+            return Some("the request body passed its total read deadline");
+        }
+        let grace = after(0, BODY_THROUGHPUT_GRACE);
+        if elapsed > grace
+            && c.bytes < MIN_BODY_BYTES_PER_SEC.saturating_mul(elapsed / 1_000_000_000)
+        {
+            return Some("the request body fell below the minimum throughput floor");
+        }
+        if got.is_none() && self.now.saturating_sub(c.last) >= after(0, BODY_READ_TIMEOUT) {
+            return Some("the request body read timed out");
+        }
+        None
+    }
+}
 
 /// One answer body's queue: what the host emitted and hyper has not taken.
 #[derive(Default)]
@@ -171,6 +280,8 @@ struct Answer {
     held_whole: bool,
     /// The held body passed its line's `body_limit`.
     held_over: bool,
+    /// The clock on the body this framing reads ([`Bounds`]).
+    clock: Option<BodyClock>,
     /// The request's unit, as the kernel answered it.
     unit: UnitRef,
     /// A pending `auth.call`'s handle, `(ticket, seq)`: re-issued only on that ticket's resume.
@@ -282,7 +393,16 @@ pub struct Accepted {
     io: HostIo,
     /// hyper's executor (`engine::Tasks`): held weakly by the tasks hyper spawns on it.
     tasks: Tasks,
-    conn: Option<BoxFut<ConnResult>>,
+    conn: Option<Pin<Box<dyn Served>>>,
+    /// The idle period's end ([`IDLE_TIMEOUT`]), while no request is in flight, from the
+    /// connection's first bytes on (`begin` answers no deadline: the kind's conformance pins it).
+    idle: Option<Deadline>,
+    /// The far side has sent bytes.
+    heard: bool,
+    /// A graceful close's end ([`CLOSE_GRACE`]), once asked for.
+    closing: Option<Deadline>,
+    /// The total a request body may take ([`Bounds::total_ns`]); see [`Accepted::with_body_max`].
+    body_total_ns: u64,
     /// Why hyper ended the connection, when it ended in an error (its own text: a header-read
     /// timeout, a protocol violation, a malformed request; it repeats no request byte): the words
     /// every stream it ended is told after its own.
@@ -369,10 +489,18 @@ impl Accepted {
         let conn = builder
             .serve_connection_with_upgrades(io.stream(), service)
             .into_owned();
+        let conn: Pin<Box<dyn Served>> = Box::pin(Conn {
+            c: Box::pin(conn),
+            shut: |c| c.graceful_shutdown(),
+        });
         Self {
             io,
             tasks,
-            conn: Some(Box::pin(conn)),
+            conn: Some(conn),
+            idle: None,
+            heard: false,
+            closing: None,
+            body_total_ns: u64::MAX,
             ended_by: None,
             shared,
             out: VecDeque::new(),
@@ -391,6 +519,58 @@ impl Accepted {
             spoken: None,
             lead: Vec::new(),
             owed: VecDeque::new(),
+        }
+    }
+
+    /// The largest request body (`limits.request_body_max_bytes`): a body read at the throughput
+    /// floor takes at most `max / MIN_BODY_BYTES_PER_SEC` seconds, its total read deadline (as
+    /// v1.5.5's `total_body_deadline`).
+    #[must_use]
+    pub fn with_body_max(mut self, max: usize) -> Self {
+        let secs = (max as u64) / MIN_BODY_BYTES_PER_SEC;
+        self.body_total_ns = secs.saturating_mul(1_000_000_000);
+        self
+    }
+
+    /// The idle bound, at the start of a drive at host time `now`: a graceful close once the idle
+    /// period has ended with nothing owed to the far side (still owed: the period starts again),
+    /// and the connection dropped once that close's grace has ended.
+    fn close_when_idle(&mut self, now: u64) {
+        if self.closing.as_ref().is_some_and(|(at, _)| *at <= now) {
+            self.closing = None;
+            if self.conn.take().is_some() {
+                self.ended = true;
+            }
+        }
+        if self.idle.as_ref().is_some_and(|(at, _)| *at <= now) {
+            self.idle = None;
+            if self.wire_pending() {
+                return;
+            }
+            if let Some(c) = self.conn.as_mut() {
+                c.shut();
+                let at = after(now, CLOSE_GRACE);
+                self.closing = Some((at, self.io.timer().sleep_until_ns(at)));
+            }
+        }
+    }
+
+    /// The idle bound, at the end of a drive at host time `now`: its period starts (once) when no
+    /// request is in flight, and ends when one is.
+    fn arm_idle(&mut self, now: u64) {
+        if self.conn.is_none() {
+            self.idle = None;
+            self.closing = None;
+            return;
+        }
+        if self.closing.is_some() || !self.heard {
+            return;
+        }
+        if !self.shared.lock().expect("shared").streams.is_empty() {
+            self.idle = None;
+        } else if self.idle.is_none() {
+            let at = after(now, IDLE_TIMEOUT);
+            self.idle = Some((at, self.io.timer().sleep_until_ns(at)));
         }
     }
 
@@ -446,6 +626,7 @@ impl Accepted {
 
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
+        self.heard |= !bytes.is_empty();
         self.note_lead(bytes);
         let h2 = self.raw.as_mut().is_some_and(|raw| {
             extend_wiped(raw, bytes);
@@ -748,7 +929,14 @@ impl Accepted {
     /// Drive the connection at host time `now_ns` until nothing inside it has more to do.
     pub fn drive(&mut self, now_ns: u64) {
         self.io.set_time(now_ns);
+        self.close_when_idle(now_ns);
         let io = self.io.clone();
+        let timer = io.timer();
+        let bounds = Bounds {
+            now: now_ns,
+            timer: &timer,
+            total_ns: self.body_total_ns,
+        };
         let conn = &mut self.conn;
         let ended = &mut self.ended;
         let ended_by = &mut self.ended_by;
@@ -769,7 +957,7 @@ impl Accepted {
                     *ended = true;
                 }
             }
-            carry_bodies(&mut shared.lock().expect("shared"), lines, cx);
+            carry_bodies(&mut shared.lock().expect("shared"), lines, &bounds, cx);
             Ok::<(), Failure>(())
         });
         let mut sh = self.shared.lock().expect("shared");
@@ -859,6 +1047,7 @@ impl Accepted {
         drop(sh);
         self.out.extend(pieces);
         self.bound_raw();
+        self.arm_idle(now_ns);
     }
 
     /// DETACH the connection for the upgrade framer to adopt, two ways:
@@ -1005,6 +1194,7 @@ fn serve(
                 held: Vec::new(),
                 held_whole: false,
                 held_over: false,
+                clock: None,
                 unit: UnitRef::NONE,
                 parked: None,
                 up: false,
@@ -1034,84 +1224,100 @@ fn serve(
 /// piece that says the request is whole (or the failure piece of a body the far side broke off).
 /// A body a `HeadBody` auth needs is held instead, up to its line's limit
 /// ([`hold_body`]); any other waits, unread, for its request's admission.
-fn carry_bodies(sh: &mut Shared, lines: &[Line], cx: &mut Context<'_>) {
+fn carry_bodies(sh: &mut Shared, lines: &[Line], bounds: &Bounds<'_>, cx: &mut Context<'_>) {
     let Shared { out, streams, .. } = sh;
     for (id, a) in streams.iter_mut() {
         if let Gate::Hold(n) = a.gate {
-            hold_body(a, lines[n].body_limit, cx);
+            hold_body(a, lines[n].body_limit, bounds, cx);
             continue;
         }
         if a.gate != Gate::Admitted {
             continue;
         }
-        let Some(body) = a.body.as_mut() else {
-            continue;
-        };
-        loop {
-            match Pin::new(&mut *body).poll_frame(cx) {
-                Poll::Pending => break,
+        while let Some(body) = a.body.as_mut() {
+            let broke = match Pin::new(&mut *body).poll_frame(cx) {
+                Poll::Pending => match bounds.polled(a, None) {
+                    Some(why) => why.to_owned(),
+                    None => break,
+                },
                 // Data is carried as it arrives; a trailer section is not (v1.5.5's handlers
                 // read data only).
                 Poll::Ready(Some(Ok(f))) => {
+                    let mut got = 0;
                     if let Ok(d) = f.into_data() {
+                        got = d.len();
                         if !d.is_empty() {
                             out.push_back(Piece::data(*id, d));
                         }
                     }
+                    match bounds.polled(a, Some(got)) {
+                        Some(why) => why.to_owned(),
+                        None => continue,
+                    }
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    out.push_back(Piece::failure(*id, &e.to_string()));
-                    a.body = None;
-                    a.asked = true;
-                    a.told = true;
-                    break;
-                }
+                Poll::Ready(Some(Err(e))) => e.to_string(),
                 Poll::Ready(None) => {
                     out.push_back(Piece::end(*id));
                     a.body = None;
+                    a.clock = None;
                     a.asked = true;
                     break;
                 }
-            }
+            };
+            out.push_back(Piece::failure(*id, &broke));
+            a.body = None;
+            a.clock = None;
+            a.asked = true;
+            a.told = true;
         }
     }
 }
 
 /// Hold a `HeadBody` request's body as it arrives, up to `limit` bytes (the size gate's limit; over
 /// it is 413, answered before the verdict). Past the limit the body is let go (zeroised) and no
-/// more is read; whole, it waits for the auth.
-fn hold_body(a: &mut Answer, limit: u64, cx: &mut Context<'_>) {
-    let Some(body) = a.body.as_mut() else {
-        return;
-    };
-    loop {
+/// more is read; whole, it waits for the auth. One that breaks its time bounds ([`Bounds`]) is
+/// broken off.
+fn hold_body(a: &mut Answer, limit: u64, bounds: &Bounds<'_>, cx: &mut Context<'_>) {
+    while let Some(body) = a.body.as_mut() {
         match Pin::new(&mut *body).poll_frame(cx) {
-            Poll::Pending => return,
+            Poll::Pending => {
+                if bounds.polled(a, None).is_none() {
+                    return;
+                }
+            }
             Poll::Ready(Some(Ok(f))) => {
+                let mut got = 0;
                 if let Ok(d) = f.into_data() {
+                    got = d.len();
                     extend_wiped(&mut a.held, &d);
                 }
                 if a.held.len() as u64 > limit {
                     let_held_go(&mut a.held);
                     a.held_over = true;
                     a.body = None;
+                    a.clock = None;
                     return;
                 }
+                if bounds.polled(a, Some(got)).is_none() {
+                    continue;
+                }
             }
-            // A body the far side broke off is no request to judge: the stream is left to hyper.
-            Poll::Ready(Some(Err(_))) => {
-                let_held_go(&mut a.held);
-                a.body = None;
-                a.gate = Gate::Failed;
-                a.respond = None;
-                return;
-            }
+            Poll::Ready(Some(Err(_))) => {}
             Poll::Ready(None) => {
                 a.held_whole = true;
                 a.body = None;
+                a.clock = None;
                 return;
             }
         }
+        // A body the far side broke off, or one past its time bounds, is no request to judge: the
+        // stream is left to hyper.
+        let_held_go(&mut a.held);
+        a.body = None;
+        a.clock = None;
+        a.gate = Gate::Failed;
+        a.respond = None;
+        return;
     }
 }
 
