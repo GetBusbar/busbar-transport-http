@@ -94,7 +94,7 @@ use std::task::Poll;
 use busbar_contract::abi::host::service::{AuthRef, UnitRef};
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
-use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn, ReleaseIn};
+use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held as Opened, Life, Refreshed, Refusal};
@@ -338,6 +338,8 @@ pub const STATEMENT: Statement = Statement {
 pub struct Instance {
     settings: Mutex<Settings>,
     framings: Framings,
+    /// The listeners' guest lists, shared by the connections each accepts.
+    guests: guest::Lists,
 }
 
 /// Every slot's state: the SDK's held instance over [`Instance`], with the host tables `open` was
@@ -442,6 +444,7 @@ impl Life for Instance {
         Ok(Self {
             settings: Mutex::new(settings_of(settings)?),
             framings: Framings::default(),
+            guests: guest::Lists::default(),
         })
     }
 
@@ -474,38 +477,34 @@ macro_rules! slot {
     };
 }
 
-// ── the lifecycle: the SDK's slots over [`Instance`] but these three ─────────────────────────────
-
-slot!(
-    /// `refresh`: [`Instance::refresh`]; with no open instance, FAILED in words.
-    Refresh, RefreshIn, OutHead, |instance, i, o| {
-        let Some(h) = instance.get() else {
-            return o.fail(Refusal::failed("refresh: no open instance"));
-        };
-        match h.life().refresh(i.field(|x| &x.settings).bytes(), &[], i.generation) {
-            Ok(_) => Outcome::Ready,
-            Err(e) => o.fail(e),
-        }
-    }
-);
+// ── the lifecycle: the SDK's slots over [`Instance`] but this one ───────────────────────────────
 
 slot!(
     /// `cancel`: the one framer op in flight is one parked on a pending `auth.call` (`begin`,
     /// `ingest` or `emit` on the accepted side; the transport contract's "a framer pends only on a
     /// ticketed auth call"). Its bytes were taken, so its cancel is PARTIAL, and the parked call is
     /// let go ([`Accepted::cancel`]): a later op calls afresh, under a new handle. A ticket nothing
-    /// is parked on moved nothing.
+    /// is parked on moved nothing. A framing another op holds right now cannot be looked at (it is
+    /// never waited for): with nothing found elsewhere the cancel is FAILED, the framing busy, so
+    /// the host cancels again rather than read NOTHING_MOVED.
     Cancel, CancelIn, CancelOut, |instance, i, o| {
         let ticket = i.ticket;
         // The parked op answered PENDING and holds no framing, so every framing a parked call
         // sits on is visited ([`framings::Framings::each`]); none is waited for.
         let mut partial = false;
+        let mut skipped = false;
         if let Some(h) = instance.get() {
-            h.life().framings.each(|h| {
+            skipped = h.life().framings.each(|h| {
                 if let Held::Accept(a) = h {
                     partial |= a.cancel(ticket);
                 }
             });
+        }
+        if skipped && !partial {
+            return o.fail(Refusal::failed(format!(
+                "cancel: {}",
+                framings::Reach::Busy.why()
+            )));
         }
         o.set(
             |x| &x.disposition,
@@ -517,11 +516,6 @@ slot!(
         );
         Outcome::Ready
     }
-);
-
-slot!(
-    /// `release`: this door leases nothing, so every release is READY.
-    Release, ReleaseIn, OutHead, |_, _, _out| { Outcome::Ready }
 );
 
 busbar_contract::not_served! {
@@ -550,7 +544,8 @@ busbar_contract::not_served! {
 /// stream the host was handed or the whole connection
 /// ([`Accepted::refuse`]). The kernel's refusal of a request before its hand-in stays
 /// `unit.refuse`'s, framed inside the accepted side; this op is the host's, after it. It never
-/// pends and calls no host service. A dialled connection is refused by its far end, never here.
+/// pends: a request its drive decodes goes through the guest list's steps that never pend
+/// ([`with`]). A dialled connection is refused by its far end, never here.
 pub(crate) struct Refuse;
 impl SafeSlot for Refuse {
     type In = RefuseIn;
@@ -580,9 +575,10 @@ impl SafeSlot for Refuse {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| match h {
-                Held::Accept(a) => a.refuse(stream, bytes, status, head_sent),
-                Held::Dial(_) => Ok(()),
+            |h, resumed| match h {
+                // `refuse` never pends, so it is never resumed.
+                Held::Accept(a) if !resumed => a.refuse(stream, bytes, status, head_sent),
+                _ => Ok(()),
             },
         )
     }
@@ -599,8 +595,9 @@ impl SafeSlot for Refuse {
 /// its preface.
 pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
-/// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding.
-const OFFER_H2_H1: &[u8] = b"\x02h2\x08http/1.1";
+/// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding: the
+/// accepting offer's own list, spelled once.
+const OFFER_H2_H1: &[u8] = ACCEPT_OFFER;
 /// The same under the http1-only key.
 const OFFER_H1: &[u8] = b"\x08http/1.1";
 /// The same under the prior-knowledge key: h2 alone.
@@ -793,7 +790,14 @@ impl SafeSlot for Begin {
             // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
             // listener did (`accept`): no agreed protocol is read here. It is framed under the
             // listener's guest list, in the kernel's match order (`BeginIn::lines`).
-            let lines: Option<Vec<guest::Line>> = i.lines().iter().map(guest::Line::of).collect();
+            // The listener's list, copied once and shared by every connection it accepts.
+            let lent = i.lines();
+            let lines = inst.guests.shared(
+                |kept| {
+                    kept.len() == lent.len() && kept.iter().zip(lent.iter()).all(|(k, l)| k.same(l))
+                },
+                || lent.iter().map(guest::Line::of).collect(),
+            );
             let Some(lines) = lines else {
                 o.error("begin: a guest-list line's route is not text");
                 return Outcome::Failed;
@@ -813,6 +817,7 @@ impl SafeSlot for Begin {
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
             let mut h = Held::Accept(
                 Accepted::accept(i.sink.now_monotonic_ns, lines)
+                    .with_body_max(settings.posture.max_body_bytes)
                     .with_scheme(scheme)
                     .with_alpn(alpn),
             );
@@ -895,8 +900,10 @@ impl SafeSlot for Ingest {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| {
+            |h, resumed| {
+                // A resumed op took its bytes whole the first time.
                 match h {
+                    _ if resumed => {}
                     Held::Dial(f) => f.ingest(bytes, i.end != 0),
                     Held::Accept(a) => a.ingest(bytes, i.end != 0),
                 }
@@ -927,11 +934,19 @@ impl SafeSlot for Emit {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| match h {
+            |h, resumed| match h {
+                // A resumed op took its bytes whole the first time.
+                Held::Dial(_) if resumed => Ok(()),
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_status(&i, false).map_err(refused_status)?;
                     f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+                }
+                Held::Accept(a) if resumed => {
+                    // Its answer states the stream's queue as it stands: the first run's
+                    // fullness was answered PENDING, never to the host.
+                    full = a.stream_full(i.stream);
+                    Ok(())
                 }
                 Held::Accept(a) => {
                     // The first emit on an accepted stream is its answer's head, with its status;
@@ -967,7 +982,7 @@ impl SafeSlot for Timer {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h| {
+            |h, _| {
                 // A connection the host refused whole is over: no deadline of it is owed.
                 match h {
                     Held::Accept(a) if a.refused_whole() => {
@@ -996,7 +1011,7 @@ impl SafeSlot for Detach {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let Some(inst) = p.get().map(Opened::life) else {
-            o.error("detach: no such framing");
+            o.error("detach: no open instance");
             return Outcome::Failed;
         };
         let mut slot = match inst.framings.reach(i.framing) {
@@ -1010,17 +1025,24 @@ impl SafeSlot for Detach {
         let sink = i.field(|x| &x.sink);
         a.drive(sink.now_monotonic_ns);
         let agreed = a.agreed();
-        let mut wire_buf = sink.wire();
-        let wire = a.take_wire(wire_buf.cap());
-        wire_buf.extend(&wire);
-        let wire_pending = a.wire_pending();
-        let rest = match a.detach() {
-            Ok(Some(rest)) => rest,
+        // Whether the connection goes, decided BEFORE a wire byte is taken: a detach that is not
+        // READY hands the host nothing, so the bytes still owed to the far side stay owed (the
+        // next op hands them over), never taken into a buffer the host does not read.
+        match a.detach() {
+            Ok(Some(_)) => {}
             Ok(None) => {
                 o.error("detach: nothing on this connection switched protocols");
                 return Outcome::Refused;
             }
             Err(e) => return failed(&mut o, e.0),
+        }
+        let mut wire_buf = sink.wire();
+        let wire = a.take_wire(wire_buf.cap());
+        wire_buf.extend(&wire);
+        let wire_pending = a.wire_pending();
+        // The connection went above: this answers what it handed over, and moves nothing.
+        let Ok(Some(rest)) = a.detach() else {
+            return failed(&mut o, "detach: the switch has not completed".into());
         };
         let mut frame = sink.frame();
         let n = rest.len().min(frame.cap());
@@ -1129,40 +1151,48 @@ impl SafeSlot for Encode {
     }
 }
 
-/// A framer op [`with`] runs: its name, which every failure text leads with, and whether it runs
-/// guest-list admission.
+/// A framer op [`with`] runs: its name, which every failure text leads with, and its static
+/// no-instance text (with no instance there is nowhere to keep an owned one).
 #[derive(Clone, Copy)]
 struct FramerOp {
     /// The op's name.
     name: &'static str,
-    /// Whether the op runs guest-list admission: only the ticketed input ops do.
-    admits: bool,
+    /// `<op>: no open instance`.
+    no_instance: &'static str,
 }
 
-/// `ingest`: a ticketed input op, so it admits.
-const INGEST: FramerOp = FramerOp {
-    name: "ingest",
-    admits: true,
-};
-/// `emit`: a ticketed input op, so it admits.
-const EMIT: FramerOp = FramerOp {
-    name: "emit",
-    admits: true,
-};
-/// `refuse`: drives only what is already admitted.
-const REFUSE: FramerOp = FramerOp {
-    name: "refuse",
-    admits: false,
-};
-/// `timer`: drives only what is already admitted.
-const TIMER: FramerOp = FramerOp {
-    name: "timer",
-    admits: false,
-};
+/// One [`FramerOp`], its texts spelled from its name once.
+macro_rules! framer_op {
+    ($(#[$doc:meta])* $const:ident, $name:literal) => {
+        $(#[$doc])*
+        const $const: FramerOp = FramerOp {
+            name: $name,
+            no_instance: concat!($name, ": no open instance"),
+        };
+    };
+}
+
+framer_op!(
+    /// `ingest`.
+    INGEST, "ingest"
+);
+framer_op!(
+    /// `emit`.
+    EMIT, "emit"
+);
+framer_op!(
+    /// `refuse`.
+    REFUSE, "refuse"
+);
+framer_op!(
+    /// `timer`.
+    TIMER, "timer"
+);
 
 /// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
-/// name. An op re-entered with `FLAG_RESUME` (it answered PENDING on a parked `auth.call`) took its
-/// input whole the first time: `f` is not run again.
+/// name. `f` is told whether the op was re-entered with `FLAG_RESUME` (it answered PENDING on a
+/// parked `auth.call`): such an op took its input whole the first time and takes none again, but
+/// what it answers is read afresh.
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,
@@ -1170,11 +1200,10 @@ fn with(
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
+    f: impl FnOnce(&mut Held, bool) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(held) = p.get() else {
-        // A static text: with no instance there is nowhere to keep an owned one.
-        o.error(no_open_instance(op.name));
+        o.error(op.no_instance);
         return Outcome::Failed;
     };
     let inst = held.life();
@@ -1184,29 +1213,20 @@ fn with(
         ticket: head.ticket,
         conn: token,
     };
-    // GUEST-LIST ADMISSION RUNS ONLY ON THE TICKETED INPUT OPS (`ingest`, `emit`): it calls the
-    // host auth handle, a may-pend service callable only inside a ticketed op. `timer` and `refuse`
-    // never pend and only drive what is already admitted.
-    let kernel = (op.admits && !head.ticket.is_none()).then_some(&mut kernel);
+    // GUEST-LIST ADMISSION RUNS ON EVERY OP THAT DRIVES: a drive may decode a request (a
+    // pipelined HTTP/1.1 request is read as soon as the answer before it is written, in whichever
+    // op wrote it), and no later op is owed to it. On an op with no ticket (`timer`, `refuse`, a
+    // re-call) the may-pend `auth.call` is never made ([`Accepted::admit`]): a request whose line's
+    // auth must be called waits for the next ticketed op; every other step (the match, the
+    // kernel's refusals, the size gate, the hand-in) runs.
+    let kernel = Some(&mut kernel);
     // Reached by its token alone; a framing another op holds is answered at once.
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
         Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
     };
-    if head.flags & FLAG_RESUME != 0 {
-        return step(slot.held(), sink, o, kernel, |_| Ok(()));
-    }
-    step(slot.held(), sink, o, kernel, f)
-}
-
-/// `<op>: no open instance`, for each op [`with`] runs.
-fn no_open_instance(op: &str) -> &'static str {
-    match op {
-        "ingest" => "ingest: no open instance",
-        "emit" => "emit: no open instance",
-        "refuse" => "refuse: no open instance",
-        _ => "timer: no open instance",
-    }
+    let resumed = head.flags & FLAG_RESUME != 0;
+    step(slot.held(), sink, o, kernel, |h| f(h, resumed))
 }
 
 /// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
@@ -1414,12 +1434,12 @@ busbar_contract::plugin_door! {
     lifecycle: {
         validate: Safe<life::Validate<Instance>>,
         open: Safe<life::Open<Instance>>,
-        refresh: Safe<Refresh>,
+        refresh: Safe<life::Refresh<Instance>>,
         retire: Safe<life::Retire<Instance>>,
         tick: Safe<life::Tick<Instance>>,
         drive: Safe<life::Drive<Instance>>,
         cancel: Safe<Cancel>,
-        release: Safe<Release>,
+        release: Safe<life::Release<Instance>>,
         close: Safe<life::Close<Instance>>,
     },
     kind_ops: {

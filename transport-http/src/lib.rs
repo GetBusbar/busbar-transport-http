@@ -41,6 +41,8 @@ pub mod linked {
     /// The layers this framer declares it is built over: none. The connector chooses the carrier
     /// from the target's scheme: no transport names another.
     pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
+    /// Whether this transport carries sessions: no, as every claim row states.
+    pub const SESSION: bool = crate::meta::SESSION;
 
     /// The `http` framer's memory-ABI door: the one entry, linked here and exported by the
     /// dropped-in build alike.

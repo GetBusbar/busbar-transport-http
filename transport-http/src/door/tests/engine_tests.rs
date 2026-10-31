@@ -40,7 +40,8 @@ fn body(f: &mut Framing) -> (Vec<u8>, bool) {
         if p.stream != 1 || p.status.is_some() || p.failed {
             continue;
         }
-        if p.bytes.is_empty() {
+        // The end the host reads is the piece's flag (`PIECE_END`), never an empty piece.
+        if p.end {
             whole = true;
         }
         out.extend_from_slice(&p.bytes);
@@ -1174,4 +1175,114 @@ fn a_request_head_over_its_allowance_is_refused() {
             "{what}: the refusal fails the framing"
         );
     }
+}
+
+/// A framing with one `method` request sent on stream 1, the far end not yet heard from.
+fn asked_with(proto: Proto, method: &str) -> Framing {
+    let mut f = Framing::dial("http://127.0.0.1:9", proto, posture(300), 0).expect("dial");
+    f.drive(0, 0);
+    let message = format!("{method} /x HTTP/1.1\r\n\r\n");
+    f.emit(1, message.as_bytes(), true, 0, 0).expect("emit");
+    f.drive(0, 0);
+    assert!(!f.take_wire(usize::MAX).is_empty(), "the request went out");
+    f
+}
+
+/// RED (codeaudit correctness M engine.rs:720): an answer that carries no body (a HEAD answer, a
+/// `204`, a `304`) may state the length the body WOULD have had (RFC 9110 8.6, 15.4.5), and the
+/// head piece stated it as the body's, so the host's pre-body download cap read 5 GiB for an answer
+/// of zero bytes. Such an answer states no declared length; a body that is there still does.
+#[test]
+fn an_answer_with_no_body_states_no_declared_length() {
+    for (method, head) in [
+        (
+            "HEAD",
+            &b"HTTP/1.1 200 OK\r\ncontent-length: 5368709120\r\n\r\n"[..],
+        ),
+        (
+            "GET",
+            b"HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n",
+        ),
+        (
+            "GET",
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 5\r\n\r\n",
+        ),
+    ] {
+        let mut f = asked_with(Proto::H1, method);
+        f.ingest(head, false);
+        f.drive(SEC, 0);
+        assert_eq!(
+            declared(&mut f),
+            Some(None),
+            "{method} {:?}: no body, so no declared length",
+            String::from_utf8_lossy(&head[..12])
+        );
+    }
+    let mut f = asked_with(Proto::H2, "HEAD");
+    let mut block = vec![0x88];
+    block.extend(literal("content-length", "5368709120"));
+    let mut far = h2(4, 0, 0, &[]);
+    far.extend(h2(1, 0x4 | 0x1, 1, &block));
+    f.ingest(&far, false);
+    f.drive(SEC, 0);
+    assert_eq!(declared(&mut f), Some(None), "h2 HEAD: no declared length");
+
+    let mut f = asked_with(Proto::H1, "GET");
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", false);
+    f.drive(SEC, 0);
+    assert_eq!(
+        declared(&mut f),
+        Some(Some(0)),
+        "an empty body's length stands"
+    );
+}
+
+/// RED (codeaudit resource M engine.rs:186): hyper's HTTP/2 client task holds a clone of its
+/// executor, and the executor's task list held that task: a cycle, so a dialled HTTP/2 framing
+/// the host finished before its connection task ended never freed it (hyper's connection state,
+/// the pipe, any request not yet sent). Dropping the framing frees all of it.
+#[test]
+fn a_dropped_h2_framing_frees_its_connection() {
+    let f = asked(Proto::H2, 300);
+    let task = Arc::downgrade(&f.conn_err);
+    drop(f);
+    assert!(
+        task.upgrade().is_none(),
+        "the connection task went with the framing"
+    );
+}
+
+/// RED (codeaudit correctness/error-handling L engine.rs:434): a stream refused partway (its
+/// failure piece out, the rest of its message still arriving) was failed AGAIN when the connection
+/// failed with output owed: two terminal pieces for one stream. A connection's failure is stated
+/// once on each stream the host was not already told failed.
+#[test]
+fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
+    f.drive(0, 0);
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
+        .expect("emit");
+    f.drive(0, 0);
+    // Refused partway: bytes past the stated length, the host's end of it not yet come.
+    f.emit(
+        3,
+        b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
+        false,
+        0,
+        0,
+    )
+    .expect("an h2 stream's refusal is a failure piece");
+    // The far end breaks the connection (DATA on stream 0: a connection error), output owed.
+    f.ingest(&h2(0, 0, 0, b"x"), false);
+    f.drive(SEC, 0);
+    let failed_on = |s: u64, f: &mut Framing| {
+        f.pieces()
+            .iter()
+            .filter(|p| p.stream == s && p.failed)
+            .count()
+    };
+    assert_eq!(failed_on(1, &mut f), 1, "the live stream is told once");
+    assert_eq!(failed_on(3, &mut f), 1, "the refused stream is told once");
 }

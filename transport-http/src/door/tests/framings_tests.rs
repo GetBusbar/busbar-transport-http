@@ -72,3 +72,52 @@ fn a_token_that_outlived_its_framing_reaches_nothing() {
     assert_eq!(table.reach(0).err(), Some(Reach::Gone));
     assert_eq!(table.reach(u64::MAX).err(), Some(Reach::Gone));
 }
+
+/// RED (codeaudit concurrency M framings.rs:202): `finish` met a slot another op held (`cancel`'s
+/// visit, say) and answered `Busy`, and nothing ever freed the slot. A removal waits for the op
+/// holding it (ops answer in bounded CPU), then frees the framing and gives the slot back.
+#[test]
+fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
+    let table = Framings::default();
+    let a = table.insert(framing()).expect("a");
+    let held = table.reach(a).expect("reach a");
+    std::thread::scope(|s| {
+        let removing = s.spawn(|| table.remove(a));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(held);
+        assert_eq!(
+            removing.join().expect("join"),
+            Ok(()),
+            "the removal frees it"
+        );
+    });
+    assert_eq!(table.reach(a).err(), Some(Reach::Gone));
+    let b = table.insert(framing()).expect("b");
+    assert_eq!(
+        untoken(a).map(|t| t.0),
+        untoken(b).map(|t| t.0),
+        "the slot was given back"
+    );
+}
+
+/// RED (codeaudit concurrency/error-handling L framings.rs:173): an op that panicked holding a
+/// slot poisoned it, and `finish` answered `no such framing` with the framing and the slot kept
+/// for the instance's life. The framing is still not reached by any other op, but its removal frees
+/// it, and the slot serves the next framing.
+#[test]
+fn a_poisoned_slot_is_still_freed_by_its_removal() {
+    let table = Framings::default();
+    let a = table.insert(framing()).expect("a");
+    let _ = std::thread::scope(|s| {
+        s.spawn(|| {
+            let _held = table.reach(a).expect("reach a");
+            panic!("an op panics holding its framing");
+        })
+        .join()
+    });
+    assert_eq!(table.reach(a).err(), Some(Reach::Gone), "not reached again");
+    assert_eq!(table.remove(a), Ok(()), "its removal frees it");
+    let b = table.insert(framing()).expect("b");
+    assert_eq!(untoken(a).map(|t| t.0), untoken(b).map(|t| t.0));
+    assert!(table.reach(b).is_ok(), "the slot serves the next framing");
+}

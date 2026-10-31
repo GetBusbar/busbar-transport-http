@@ -23,6 +23,9 @@ pub(crate) const SECURE_KEY: &str = "https";
 /// target's scheme; no transport names another.
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
+/// Whether this transport carries sessions: no (each claim row states `session` 0).
+pub(crate) const SESSION: bool = false;
+
 pub(crate) const TAIL: TransportTail = TransportTail {
     role: ROLE_FRAMER,
     framing: FRAMING_STREAM,

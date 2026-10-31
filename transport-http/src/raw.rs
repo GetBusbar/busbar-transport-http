@@ -124,10 +124,12 @@ impl<'a> Head<'a> {
 
     /// How the body is framed.
     ///
-    /// `chunked` must be the FINAL transfer coding (RFC 9112 6.1: a list where it is not last
-    /// leaves the body length undeterminable) and applied only ONCE (`chunked, chunked` is a body
-    /// wrapped twice); any other declared coding is one this transport cannot frame, and falling
-    /// through to `Content-Length` would answer a question the sender did not ask. A chunked
+    /// `chunked` ALONE is the coding this transport reads: it must be the final transfer coding
+    /// (RFC 9112 6.1: a list where it is not last leaves the body length undeterminable), applied
+    /// only ONCE (`chunked, chunked` is a body wrapped twice), and any other coding in the list
+    /// (`gzip, chunked`) is one this transport does not implement, so it is refused (RFC 9112 6.1),
+    /// never dropped while its bytes go on unnamed; falling through to `Content-Length` would
+    /// answer a question the sender did not ask. A chunked
     /// message naming a `Content-Length` beside it — two framings of the same bytes, the smuggling
     /// shape itself — is refused rather than silently disambiguated. A `Content-Length` is exactly
     /// `1*DIGIT` fitting a `usize`, every member and line naming the same value (RFC 9110 8.6);
@@ -137,14 +139,13 @@ impl<'a> Head<'a> {
     ///
     /// The refusals above.
     pub(crate) fn framing(&self) -> Result<BodyFraming, &'static str> {
-        let (mut coded, mut applied, mut last) = (false, 0_usize, false);
+        let (mut codings, mut chunked) = (0_usize, 0_usize);
         for coding in self.members("transfer-encoding") {
-            coded = true;
-            last = coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked"));
-            applied += usize::from(last);
+            codings += 1;
+            chunked += usize::from(coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked")));
         }
-        if coded {
-            if applied != 1 || !last {
+        if codings != 0 {
+            if codings != 1 || chunked != 1 {
                 return Err("unsupported transfer coding");
             }
             if self.members("content-length").next().is_some() {
@@ -193,6 +194,8 @@ enum ChunkState {
     Data,
     /// Reading the CRLF that closes a chunk's data.
     AfterData,
+    /// Read the CR that closes a chunk's data: its LF is next.
+    AfterDataCr,
     /// Reading trailer lines, terminated by an empty one.
     Trailers,
     /// The terminal chunk and its trailers have both arrived.
@@ -241,18 +244,26 @@ impl ChunkedDecoder {
                     }
                     n
                 }
+                // One CRLF (or a bare LF, RFC 9112 2.2) closes a chunk's data; nothing else.
                 ChunkState::AfterData => {
                     match rest[0] {
                         b'\n' => self.state = ChunkState::Size,
-                        b'\r' => {}
+                        b'\r' => self.state = ChunkState::AfterDataCr,
                         _ => return Err(ChunkedMalformed),
                     }
+                    1
+                }
+                ChunkState::AfterDataCr => {
+                    if rest[0] != b'\n' {
+                        return Err(ChunkedMalformed);
+                    }
+                    self.state = ChunkState::Size;
                     1
                 }
                 ChunkState::Size | ChunkState::Trailers => {
                     let end = memchr::memchr(b'\n', rest);
                     let part = &rest[..end.unwrap_or(rest.len())];
-                    self.line.extend(part.iter().filter(|b| **b != b'\r'));
+                    self.line.extend_from_slice(part);
                     let Some(end) = end else {
                         return Ok(bytes.len());
                     };
@@ -264,8 +275,15 @@ impl ChunkedDecoder {
         Ok(bytes.len())
     }
 
-    /// A size or trailer line has ended.
+    /// A size or trailer line has ended: its one CR before the LF is the line end's; a CR anywhere
+    /// else makes it malformed (RFC 9112 7.1), never a byte spliced out.
     fn end_line(&mut self) -> Result<(), ChunkedMalformed> {
+        if self.line.last() == Some(&b'\r') {
+            self.line.pop();
+        }
+        if self.line.contains(&b'\r') {
+            return Err(ChunkedMalformed);
+        }
         let line = std::str::from_utf8(&self.line).map_err(|_| ChunkedMalformed)?;
         self.state = match self.state {
             ChunkState::Size => match chunk_size(line)? {

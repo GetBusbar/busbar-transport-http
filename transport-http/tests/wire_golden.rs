@@ -688,9 +688,20 @@ fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
         // Where the recording masked part of the BODY (a signed assertion, a PKCE verifier, a
         // run-varying id), the door is handed the masked body, so its `content-length` counts the
         // mask; the recording's own (numeric, or `<LEN>`) stands. Only that header's value is
-        // taken over: its name, case and position are still the door's to get right.
+        // taken over: its name, case and position are still the door's to get right, and its
+        // value must be the length of the body the door was handed.
         if let (Some(w), Some(g)) = (content_length(want), content_length(&got)) {
             if w != g && (w == "<LEN>" || has_mask(&r.body)) {
+                if g != r.body.len().to_string() {
+                    failures.push(format!(
+                        "{} {} {}: the door's content-length {g} is not the {}-byte body it was handed",
+                        r.cell,
+                        r.method,
+                        r.path,
+                        r.body.len()
+                    ));
+                    continue;
+                }
                 got = got.replacen(
                     &format!("content-length: {g}\r\n"),
                     &format!("content-length: {w}\r\n"),
