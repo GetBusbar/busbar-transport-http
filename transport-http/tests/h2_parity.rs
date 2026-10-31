@@ -28,7 +28,7 @@ use busbar_contract::abi::transport::{
 };
 use tokio::io::AsyncReadExt;
 
-use common::{frame_name, h2_frames};
+use common::{frame_name, h2_frames, request_whole};
 
 const BODY: &str =
     r#"{"model":"claude-x","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
@@ -72,13 +72,17 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .await
             .expect("bind");
         let port = l.local_addr().expect("addr").port();
+        // Recorded until the request is WHOLE by its own framing (its END_STREAM, or the body its
+        // length states), however late the client is scheduled, under a bound that fails in words.
         let rec = tokio::spawn(async move {
             let (mut sock, _) = l.accept().await.expect("accept");
             let mut got = Vec::new();
             let mut buf = [0_u8; 4096];
-            while let Ok(Ok(n)) =
-                tokio::time::timeout(Duration::from_millis(400), sock.read(&mut buf)).await
-            {
+            while !request_whole(&got, h2) {
+                let n = tokio::time::timeout(Duration::from_secs(30), sock.read(&mut buf))
+                    .await
+                    .expect("1.5.5's client sent its whole request")
+                    .expect("read");
                 if n == 0 {
                     break;
                 }
@@ -97,7 +101,10 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .http2_adaptive_window(true)
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(4))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            // Hermetic: never the environment's proxy (`HTTP_PROXY`, `ALL_PROXY`), whose capture
+            // would be the proxy's, not the recording listener's.
+            .no_proxy();
         // The two keys, as 1.5.5 applied them: prior knowledge, or HTTP/1.1 only.
         let client = if h2 {
             client.http2_prior_knowledge()
@@ -111,8 +118,12 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .header("authorization", BEARER)
             .header("content-type", "application/json")
             .body(body);
-        let _ = tokio::time::timeout(Duration::from_millis(600), req.send()).await;
-        (rec.await.expect("record"), port)
+        // The send is never cut mid-write: it runs until the recording is whole, then goes (the
+        // listener answers nothing).
+        let send = tokio::spawn(req.send());
+        let got = rec.await.expect("record");
+        send.abort();
+        (got, port)
     })
 }
 
