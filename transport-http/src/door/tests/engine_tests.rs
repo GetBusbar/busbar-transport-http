@@ -40,7 +40,8 @@ fn body(f: &mut Framing) -> (Vec<u8>, bool) {
         if p.stream != 1 || p.status.is_some() || p.failed {
             continue;
         }
-        if p.bytes.is_empty() {
+        // The end the host reads is the piece's flag (`PIECE_END`), never an empty piece.
+        if p.end {
             whole = true;
         }
         out.extend_from_slice(&p.bytes);
