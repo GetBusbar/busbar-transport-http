@@ -165,6 +165,35 @@ fn locate_lending(
     )
 }
 
+// ── the lifecycle the SDK answers (KIND-transport sibling alignment D2, D3, D16) ────────────────
+
+/// RED (sibling review D2, D16): the door answered READY to a release of a lease it never handed
+/// out, from a slot of its own. The lifecycle SDK's answer, as every sibling's: REFUSED, in
+/// `release: no such lease`'s words (the door leases nothing, so every release is a host bug).
+#[test]
+fn a_release_of_a_lease_never_handed_out_is_refused() {
+    use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
+    use busbar_contract::abi::sdk::life::NO_SUCH_LEASE;
+    let inst = open("");
+    let mut i: ReleaseIn = z();
+    i.lease = 7;
+    let mut o: OutHead = z();
+    let r = call(ops().head.release, inst, &mut i, &mut o, life::RELEASE);
+    assert_eq!(
+        (r, text(o.error)),
+        (Outcome::Refused, NO_SUCH_LEASE.to_owned())
+    );
+}
+
+/// RED (sibling review D3): the door's own `refresh` wrapper answered FAILED `refresh: no open
+/// instance`. The lifecycle SDK's slot is the kind's (four of six siblings): with no instance it
+/// answers FAULT (the words, if wanted, belong in the SDK, core T9).
+#[test]
+fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
+    let (r, _) = refresh(std::ptr::null_mut(), "{}");
+    assert_eq!(r, Outcome::Fault);
+}
+
 // ── refresh ──────────────────────────────────────────────────────────────────────────────────────
 
 /// RED: `refresh` answered READY and kept the settings `open` read, whatever the new blob said.
