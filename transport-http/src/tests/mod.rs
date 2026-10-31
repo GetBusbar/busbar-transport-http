@@ -546,3 +546,13 @@ fn encode_refuses_what_emit_would_refuse() {
         crate::transport::render_envelope(fields, body).expect("still encodes");
     }
 }
+
+/// The `linked` entry's `SESSION` is what every claim row the door states says (sibling alignment
+/// D14): the root folds one, the host reads the other.
+#[test]
+fn linked_session_is_every_claim_rows_session() {
+    assert!(!crate::linked::SESSION);
+    assert!(crate::door::CLAIMS
+        .iter()
+        .all(|c| (c.session != 0) == crate::linked::SESSION));
+}
