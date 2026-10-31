@@ -2214,6 +2214,8 @@ fn never_reached_the_plane(label: &str, h: &AcceptHost) {
         "{label}: no bytes of the transport's own: {:?}",
         String::from_utf8_lossy(&h.out)
     );
+    // An unanswered HTTP/1.1 request ends its connection (hyper closes it with no bytes).
+    assert!(h.ended, "{label}: the connection is closed");
 }
 
 /// The hand-in answers FAILED: the request is not handed up.
@@ -2916,6 +2918,8 @@ fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     );
     assert_eq!(h.heads_up(), 0, "{label}: nothing went up");
     assert!(h.out.is_empty(), "{label}: no bytes of the transport's own");
+    // The refusal closes the connection, never leaves it open and silent.
+    assert!(h.ended, "{label}: the connection is closed");
     h.close();
 }
 
