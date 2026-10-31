@@ -120,6 +120,27 @@ fn undated(mut wire: Vec<u8>) -> Vec<u8> {
     wire
 }
 
+/// Whether `wire` holds one whole HTTP/1.1 answer: its head, then the body its `content-length`
+/// states, or its chunked body through the last chunk (a head stating neither has no body here).
+fn answer_whole(wire: &[u8]) -> bool {
+    let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&wire[..end]).to_ascii_lowercase();
+    let body = &wire[end + 4..];
+    if let Some(len) = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return body.len() >= len;
+    }
+    if head.contains("transfer-encoding: chunked") {
+        return body.ends_with(b"0\r\n\r\n");
+    }
+    true
+}
+
 /// v1.5.5's data listener answering `request` with `status`, `headers` and `body` (known size when
 /// `sized`, else streamed): its wire bytes, over an in-memory socket.
 fn v155(
@@ -172,14 +193,17 @@ fn v155(
         });
         // The request, and NO half-close: v1.5.5's builder leaves `half_close` off, so a read end
         // before the answer is written closes the connection with nothing written (both sides of
-        // this comparison then read as empty and agree vacuously). The answer is read until the
-        // connection goes quiet.
+        // this comparison then read as empty and agree vacuously). The answer is read until it is
+        // WHOLE by its own framing (its `content-length`, or its last chunk), however late the
+        // server is scheduled, under a generous bound that fails in words.
         cli.write_all(request).await.expect("request");
         let mut wire = Vec::new();
         let mut buf = [0_u8; 4096];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), cli.read(&mut buf)).await
-        {
+        while !answer_whole(&wire) {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(30), cli.read(&mut buf))
+                .await
+                .expect("v1.5.5's answer arrives whole")
+                .expect("read");
             if n == 0 {
                 break;
             }
