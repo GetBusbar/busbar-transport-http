@@ -1157,21 +1157,43 @@ impl SafeSlot for Encode {
     }
 }
 
-/// A framer op [`with`] runs: its name, which every failure text leads with.
+/// A framer op [`with`] runs: its name, which every failure text leads with, and its static
+/// no-instance text (with no instance there is nowhere to keep an owned one).
 #[derive(Clone, Copy)]
 struct FramerOp {
     /// The op's name.
     name: &'static str,
+    /// `<op>: no open instance`.
+    no_instance: &'static str,
 }
 
-/// `ingest`.
-const INGEST: FramerOp = FramerOp { name: "ingest" };
-/// `emit`.
-const EMIT: FramerOp = FramerOp { name: "emit" };
-/// `refuse`.
-const REFUSE: FramerOp = FramerOp { name: "refuse" };
-/// `timer`.
-const TIMER: FramerOp = FramerOp { name: "timer" };
+/// One [`FramerOp`], its texts spelled from its name once.
+macro_rules! framer_op {
+    ($(#[$doc:meta])* $const:ident, $name:literal) => {
+        $(#[$doc])*
+        const $const: FramerOp = FramerOp {
+            name: $name,
+            no_instance: concat!($name, ": no open instance"),
+        };
+    };
+}
+
+framer_op!(
+    /// `ingest`.
+    INGEST, "ingest"
+);
+framer_op!(
+    /// `emit`.
+    EMIT, "emit"
+);
+framer_op!(
+    /// `refuse`.
+    REFUSE, "refuse"
+);
+framer_op!(
+    /// `timer`.
+    TIMER, "timer"
+);
 
 /// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
 /// name. `f` is told whether the op was re-entered with `FLAG_RESUME` (it answered PENDING on a
@@ -1187,8 +1209,7 @@ fn with(
     f: impl FnOnce(&mut Held, bool) -> Result<(), engine::Failure>,
 ) -> Outcome {
     let Some(held) = p.get() else {
-        // A static text: with no instance there is nowhere to keep an owned one.
-        o.error(no_open_instance(op.name));
+        o.error(op.no_instance);
         return Outcome::Failed;
     };
     let inst = held.life();
@@ -1212,16 +1233,6 @@ fn with(
     };
     let resumed = head.flags & FLAG_RESUME != 0;
     step(slot.held(), sink, o, kernel, |h| f(h, resumed))
-}
-
-/// `<op>: no open instance`, for each op [`with`] runs.
-fn no_open_instance(op: &str) -> &'static str {
-    match op {
-        "ingest" => "ingest: no open instance",
-        "emit" => "emit: no open instance",
-        "refuse" => "refuse: no open instance",
-        _ => "timer: no open instance",
-    }
 }
 
 /// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
