@@ -204,6 +204,8 @@ struct Host {
     framing: u64,
     sock: Arc<Socket>,
     wire_log: Vec<u8>,
+    /// Every byte the far end sent, as ingested.
+    heard_log: Vec<u8>,
     frame_log: Vec<u8>,
     deadline: Option<u64>,
     more: bool,
@@ -260,6 +262,7 @@ impl Host {
             framing: 0,
             sock,
             wire_log: Vec::new(),
+            heard_log: Vec::new(),
             frame_log: Vec::new(),
             deadline: None,
             more: false,
@@ -471,8 +474,27 @@ impl Host {
         call(self.ops.encode, self.inst, &mut i, &mut o, slot::ENCODE)
     }
 
-    /// Ingest whatever the far end has sent until it stays quiet for `quiet`; the first op that
-    /// fails ends the pump with its outcome.
+    /// Ingest whatever the far end sends until `done` holds of what was handed up (the explicit
+    /// end of what the cell waits for, never a quiet spell on a loaded runner), the far end ends, or
+    /// an op fails (its outcome). A far end that has not got there in [`PUMP_DEADLINE`] fails the
+    /// cell in words.
+    fn pump_until(&mut self, done: impl Fn(&[Got]) -> bool, got: &mut Vec<Got>) -> Outcome {
+        let deadline = std::time::Instant::now() + PUMP_DEADLINE;
+        while !done(got) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the far end did not get there in {PUMP_DEADLINE:?}"
+            );
+            if self.pump_once(got) == Some(Outcome::Ready) {
+                break;
+            }
+        }
+        Outcome::Ready
+    }
+
+    /// Ingest whatever the far end has sent until it stays quiet for `quiet` (for a cell that
+    /// asserts nothing the far end sends after it); the first op that fails ends the pump with its
+    /// outcome.
     fn pump(&mut self, quiet: Duration, got: &mut Vec<Got>) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(10);
@@ -509,6 +531,36 @@ impl Host {
         Outcome::Ready
     }
 
+    /// One pass of [`Host::pump`]: `None` when the far end sent nothing yet (after a short wait),
+    /// `Some(Ready)` once it ended, `Some(other)` when an op failed; the bytes it sent ingested.
+    fn pump_once(&mut self, got: &mut Vec<Got>) -> Option<Outcome> {
+        let (bytes, end) = {
+            let mut g = self.sock.rx.lock().expect("rx");
+            (g.0.drain(..).collect::<Vec<u8>>(), g.1)
+        };
+        if bytes.is_empty() && !end {
+            std::thread::sleep(Duration::from_millis(10));
+            return None;
+        }
+        self.heard_log.extend_from_slice(&bytes);
+        let mut i: IngestIn = z();
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end = u32::from(end);
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        if self.take(r, &o, got) != Outcome::Ready {
+            return Some(r);
+        }
+        let r = self.drain(slot::INGEST, 0, got);
+        if r != Outcome::Ready {
+            return Some(r);
+        }
+        end.then_some(Outcome::Ready)
+    }
+
     /// Move the clock to `at` and call `timer` if the framer asked for a deadline by then.
     fn advance(&mut self, at: u64, got: &mut Vec<Got>) -> Outcome {
         self.now = at;
@@ -524,6 +576,35 @@ impl Host {
             return self.drain(slot::TIMER, 0, got);
         }
         Outcome::Ready
+    }
+
+    /// PING ACK frames the far end has sent (HTTP/2).
+    fn acks(&self) -> usize {
+        let log = &self.heard_log;
+        let (mut i, mut k) = (0, 0);
+        while i + 9 <= log.len() {
+            let len =
+                usize::from(log[i]) << 16 | usize::from(log[i + 1]) << 8 | usize::from(log[i + 2]);
+            if log[i + 3] == 6 && log[i + 4] & 1 != 0 {
+                k += 1;
+            }
+            i += 9 + len;
+        }
+        k
+    }
+
+    /// Ingest until the far end has answered every PING the framer wrote (HTTP/2).
+    fn pump_acks(&mut self, got: &mut Vec<Got>) {
+        let deadline = std::time::Instant::now() + PUMP_DEADLINE;
+        while self.acks() < self.pings() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the far end did not answer its pings in {PUMP_DEADLINE:?}"
+            );
+            if self.pump_once(got).is_some_and(|r| r != Outcome::Ready) {
+                break;
+            }
+        }
     }
 
     /// Non-ACK PING frames the framer has written (HTTP/2, after the 24-byte preface).
@@ -546,6 +627,14 @@ impl Host {
         let mut o: OutHead = z();
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
     }
+}
+
+/// How long [`Host::pump_until`] waits for the far end, however loaded the runner.
+const PUMP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A head frame was handed up.
+fn has_head(got: &[Got]) -> bool {
+    got.iter().any(|g| g.flags & PIECE_HAS_CODE != 0)
 }
 
 fn text(got: &[Got], stream: u64) -> String {
@@ -598,7 +687,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     let t0 = host.now;
     let mut got = host.ask(1, "/v1/messages", "hello");
     assert_eq!(
-        host.pump(Duration::from_millis(300), &mut got),
+        host.pump_until(|g| text(g, 1) == "got=5;a", &mut got),
         Outcome::Ready
     );
     let head = got
@@ -640,6 +729,9 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     assert!(!ended(&got, 1), "the stalled response is not whole");
 
     if h2 {
+        // The adaptive window's ping is answered before the clock moves (a ping still in flight
+        // holds the keep-alive's back).
+        host.pump_acks(&mut got);
         let p0 = host.pings();
         if case == Case::KeepAliveTimeout {
             sock.silent.store(true, Ordering::SeqCst);
@@ -674,7 +766,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
         }
     }
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 1), &mut got);
     println!(
         "PROOF {label}: body {:?}, whole={}",
         text(&got, 1),
@@ -757,7 +849,7 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
     let mut got = host.ask(1, "/hang", "");
     got.extend(host.ask(3, "/v1/messages", "hello"));
     assert_eq!(
-        host.pump(Duration::from_millis(300), &mut got),
+        host.pump_until(|g| text(g, 3) == "got=5;a", &mut got),
         Outcome::Ready
     );
     assert_eq!(text(&got, 3), "got=5;a", "the sibling answered");
@@ -767,7 +859,7 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
         "not before 5s"
     );
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 3), &mut got);
     println!(
         "PROOF {label}: stream 3 {:?}, whole={}",
         text(&got, 3),
@@ -810,9 +902,9 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
     );
     host.begin("");
     let mut got = host.ask(1, "/v1/messages", "hello");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| text(g, 1) == "got=5;a", &mut got);
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 1), &mut got);
     assert!(ended(&got, 1), "the exchange completed");
     // A field block a small sink split mid-line says so on the piece that continues the line
     // (PIECE_CONTINUED); every other fields piece starts a line.
@@ -896,10 +988,7 @@ fn a_429_head_states_its_class_fault_and_retry_after() {
         );
         host.begin("");
         let mut got = host.ask(1, "/limited", "hello");
-        assert_eq!(
-            host.pump(Duration::from_millis(300), &mut got),
-            Outcome::Ready
-        );
+        assert_eq!(host.pump_until(has_head, &mut got), Outcome::Ready);
         let head = got
             .iter()
             .find(|g| g.flags & PIECE_HAS_CODE != 0)
