@@ -610,8 +610,9 @@ impl SafeSlot for Refuse {
 /// its preface.
 pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
-/// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding.
-const OFFER_H2_H1: &[u8] = b"\x02h2\x08http/1.1";
+/// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding: the
+/// accepting offer's own list, spelled once.
+const OFFER_H2_H1: &[u8] = ACCEPT_OFFER;
 /// The same under the http1-only key.
 const OFFER_H1: &[u8] = b"\x08http/1.1";
 /// The same under the prior-knowledge key: h2 alone.
