@@ -338,6 +338,8 @@ pub const STATEMENT: Statement = Statement {
 pub struct Instance {
     settings: Mutex<Settings>,
     framings: Framings,
+    /// The listeners' guest lists, shared by the connections each accepts.
+    guests: guest::Lists,
 }
 
 /// Every slot's state: the SDK's held instance over [`Instance`], with the host tables `open` was
@@ -442,6 +444,7 @@ impl Life for Instance {
         Ok(Self {
             settings: Mutex::new(settings_of(settings)?),
             framings: Framings::default(),
+            guests: guest::Lists::default(),
         })
     }
 
@@ -805,7 +808,14 @@ impl SafeSlot for Begin {
             // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
             // listener did (`accept`): no agreed protocol is read here. It is framed under the
             // listener's guest list, in the kernel's match order (`BeginIn::lines`).
-            let lines: Option<Vec<guest::Line>> = i.lines().iter().map(guest::Line::of).collect();
+            // The listener's list, copied once and shared by every connection it accepts.
+            let lent = i.lines();
+            let lines = inst.guests.shared(
+                |kept| {
+                    kept.len() == lent.len() && kept.iter().zip(lent.iter()).all(|(k, l)| k.same(l))
+                },
+                || lent.iter().map(guest::Line::of).collect(),
+            );
             let Some(lines) = lines else {
                 o.error("begin: a guest-list line's route is not text");
                 return Outcome::Failed;

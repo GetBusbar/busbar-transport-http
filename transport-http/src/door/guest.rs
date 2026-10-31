@@ -7,6 +7,8 @@
 //! (`abi::transport::route::RouteView`: `path_and_fields_match`, then `admits`); and the strip of
 //! what a line's auth named, so the plane never sees a credential.
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use busbar_contract::abi::host::service::AuthRef;
 use busbar_contract::abi::sdk::services::Place;
 use busbar_contract::abi::sdk::Lent;
@@ -85,7 +87,31 @@ impl Line {
         }
     }
 
-    /// The line's route in the contract's vocabulary.
+    /// Whether the line the host lent is this one, read in place (nothing copied but the route
+    /// view's predicate list).
+    #[must_use]
+    pub fn same(&self, l: Lent<'_, LineEntry>) -> bool {
+        let e = *l.get();
+        let Some(v) = l.route_view() else {
+            return false;
+        };
+        e.line == self.line
+            && e.points == self.points
+            && e.auth == self.auth
+            && e.body_limit == self.body_limit
+            && v.methods == self.methods
+            && v.path_form == self.path_form
+            && v.path == self.path
+            && v.rung == self.rung
+            && v.fields.len() == self.fields.len()
+            && v.fields
+                .iter()
+                .zip(&self.fields)
+                .all(|((op, n, val), (o, name, value))| op == o && n == name && *val == &value[..])
+    }
+
+    /// The line's route in the contract's vocabulary; its predicate list built only where it has
+    /// one (an empty list allocates nothing).
     fn view(&self) -> RouteView<'_> {
         RouteView {
             methods: self.methods,
@@ -98,6 +124,49 @@ impl Line {
                 .collect(),
             rung: self.rung,
         }
+    }
+
+    /// The line's route without its predicates: whether its path holds, at no allocation.
+    fn path_view(&self) -> RouteView<'_> {
+        RouteView {
+            methods: self.methods,
+            path_form: self.path_form,
+            path: &self.path,
+            fields: Vec::new(),
+            rung: self.rung,
+        }
+    }
+}
+
+/// How many listeners' guest lists an instance keeps copied.
+const LISTS_KEPT: usize = 16;
+
+/// THE GUEST LISTS AN INSTANCE HAS COPIED, one per listener, shared by every connection it
+/// accepts: `begin` compares the lent list with these in place and copies it only when it is new
+/// (a listener's list is the same for every connection; a changed one is copied afresh).
+#[derive(Default)]
+pub struct Lists(Mutex<Vec<Arc<[Line]>>>);
+
+impl Lists {
+    /// The list `same` recognises, else the one `copy` makes (kept for the next `begin`); `None`
+    /// when `copy` answers none.
+    pub fn shared(
+        &self,
+        same: impl Fn(&[Line]) -> bool,
+        copy: impl FnOnce() -> Option<Vec<Line>>,
+    ) -> Option<Arc<[Line]>> {
+        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = kept.iter().position(|l| same(l)) {
+            let l = kept.remove(at);
+            kept.push(l.clone());
+            return Some(l);
+        }
+        let l: Arc<[Line]> = copy()?.into();
+        if kept.len() == LISTS_KEPT {
+            kept.remove(0);
+        }
+        kept.push(l.clone());
+        Some(l)
     }
 }
 
@@ -119,7 +188,15 @@ pub enum Matched {
 pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])]) -> Matched {
     let mut miss = None;
     for (n, l) in lines.iter().enumerate() {
-        let v = l.view();
+        // The path first, with no predicate list built; the list only for a line whose path holds.
+        if !l.path_view().path_and_fields_match(path, &[]) {
+            continue;
+        }
+        let v = if l.fields.is_empty() {
+            l.path_view()
+        } else {
+            l.view()
+        };
         if !v.path_and_fields_match(path, fields) {
             continue;
         }
