@@ -1017,7 +1017,7 @@ impl SafeSlot for Detach {
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
         let Some(inst) = p.get().map(Opened::life) else {
-            o.error("detach: no such framing");
+            o.error("detach: no open instance");
             return Outcome::Failed;
         };
         let mut slot = match inst.framings.reach(i.framing) {
