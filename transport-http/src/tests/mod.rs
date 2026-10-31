@@ -536,7 +536,10 @@ fn encode_refuses_what_emit_would_refuse() {
     // What the framing reads, encode still renders.
     for (fields, body) in [
         (&[("content-length", &b"5"[..])][..], &b"hello"[..]),
-        (&[("content-length", b"5"), ("content-length", b"5")], b"hello"),
+        (
+            &[("content-length", b"5"), ("content-length", b"5")],
+            b"hello",
+        ),
         (&[("x-note", b"tab\there obs-\xe9")], b""),
         (&[], b""),
     ] {

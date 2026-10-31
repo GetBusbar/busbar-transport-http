@@ -85,7 +85,11 @@ fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
         let removing = s.spawn(|| table.remove(a));
         std::thread::sleep(std::time::Duration::from_millis(20));
         drop(held);
-        assert_eq!(removing.join().expect("join"), Ok(()), "the removal frees it");
+        assert_eq!(
+            removing.join().expect("join"),
+            Ok(()),
+            "the removal frees it"
+        );
     });
     assert_eq!(table.reach(a).err(), Some(Reach::Gone));
     let b = table.insert(framing()).expect("b");
