@@ -347,6 +347,16 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
         op::<FinishIn, FramerOut>(o.finish, none, slot::FINISH),
         failed("finish")
     );
+    // RED (codeaudit craft L mod.rs:999): `detach` named a framing it never looked at (`detach:
+    // no such framing`); `refuse` is the other op with no instance.
+    assert_eq!(
+        op::<FramingIn, FramerOut>(o.detach, none, slot::DETACH),
+        failed("detach")
+    );
+    assert_eq!(
+        op::<RefuseIn, FramerOut>(o.refuse, none, slot::REFUSE),
+        failed("refuse")
+    );
 }
 
 /// RED: an op on a framing the instance does not hold answered `no such framing`, naming no op.
