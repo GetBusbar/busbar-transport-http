@@ -449,9 +449,13 @@ impl Framing {
             return;
         }
         let io = self.io.clone();
+        // What the host has taken of the queue is read ONCE per drive: the host takes nothing
+        // between its rounds (the sink is filled after it), and a push moves `pushed` and the
+        // queued bytes alike, so it stands for every round.
+        let taken = (self.proto == Proto::H2).then(|| self.out.taken());
         if let Err(f) = io.rounds(|cx| {
             self.tasks.run(cx);
-            self.step(cx)
+            self.step(cx, taken)
         }) {
             self.failed = Some(f);
             self.fail_streams();
@@ -491,7 +495,7 @@ impl Framing {
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
     /// HTTP/2 ends THAT stream (dropping its exchange resets it on the wire) with a failure piece;
     /// on HTTP/1.1, or once the connection itself has failed, it fails the framing.
-    fn step(&mut self, cx: &mut Context<'_>) -> Result<(), Failure> {
+    fn step(&mut self, cx: &mut Context<'_>, taken: Option<u64>) -> Result<(), Failure> {
         if let Some(h) = self.handshake.as_mut() {
             if let Poll::Ready(r) = h.as_mut().poll(cx) {
                 self.handshake = None;
@@ -500,7 +504,7 @@ impl Framing {
         }
         let k = Knobs {
             now_unix_secs: self.now_unix_ns / 1_000_000_000,
-            hold: (self.proto == Proto::H2).then(|| self.out.taken()),
+            hold: taken,
         };
         for (id, stage) in &mut self.exchanges {
             let r = advance(*id, stage, &mut self.sender, &mut self.out, &k, cx);
