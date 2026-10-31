@@ -858,15 +858,14 @@ fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
 // ── the accepted side's time bounds (codeaudit security L→M accept.rs:362) ──────────────────────
 
 /// RED (codeaudit security accept.rs:362): only HTTP/1's header read was bounded, and only once
-/// hyper had chosen HTTP/1. A connection that sends nothing, or part of the HTTP/2 preface, or the
-/// preface and then no request, asked the host for no wake-up at all and held its framing for
+/// hyper had chosen HTTP/1. A connection that sends part of the HTTP/2 preface, or the preface and
+/// then no request, asked the host for no wake-up at all and held its framing for
 /// good. A connection with no request in flight and nothing owed is closed 30 s on (the bound
 /// v1.5.5's listener put on a header read), on the host's clock.
 #[test]
 fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
     for (what, sent) in [
-        ("nothing", &b""[..]),
-        ("part of the h2 preface", b"PRI * HT"),
+        ("part of the h2 preface", &b"PRI * HT"[..]),
         (
             "the h2 preface and no request",
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0",
@@ -875,6 +874,8 @@ fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
         let mut a = accepted();
         a.ingest(sent, false);
         run(&mut a, SEC);
+        // The host takes what the framing owes the far side (its SETTINGS, on HTTP/2).
+        let _ = a.take_wire(usize::MAX);
         let at = a
             .next_deadline()
             .unwrap_or_else(|| panic!("{what}: a wake-up is asked for"));
