@@ -818,7 +818,10 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
     .expect("101");
     run(&mut a, SEC);
     let early = a.detach().map(|r| r.map(|r| r.len()));
-    assert!(early.is_err(), "the switch has not completed yet: {early:?}");
+    assert!(
+        early.is_err(),
+        "the switch has not completed yet: {early:?}"
+    );
     let _ = a.take_wire(usize::MAX);
     run(&mut a, SEC);
     let rest = a
@@ -849,5 +852,101 @@ fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
     assert!(
         told[0].starts_with("the far side gave the stream up: ") && told[0].len() > 33,
         "the cause rides the words: {told:?}"
+    );
+}
+
+// ── the accepted side's time bounds (codeaudit security L→M accept.rs:362) ──────────────────────
+
+/// RED (codeaudit security accept.rs:362): only HTTP/1's header read was bounded, and only once
+/// hyper had chosen HTTP/1. A connection that sends nothing, or part of the HTTP/2 preface, or the
+/// preface and then no request, asked the host for no wake-up at all and held its framing for
+/// good. A connection with no request in flight and nothing owed is closed 30 s on (the bound
+/// v1.5.5's listener put on a header read), on the host's clock.
+#[test]
+fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
+    for (what, sent) in [
+        ("nothing", &b""[..]),
+        ("part of the h2 preface", b"PRI * HT"),
+        (
+            "the h2 preface and no request",
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0",
+        ),
+    ] {
+        let mut a = accepted();
+        a.ingest(sent, false);
+        run(&mut a, SEC);
+        let at = a
+            .next_deadline()
+            .unwrap_or_else(|| panic!("{what}: a wake-up is asked for"));
+        assert!(at <= SEC + 30 * SEC, "{what}: within the bound: {at}");
+        run(&mut a, 31 * SEC);
+        run(&mut a, 45 * SEC);
+        assert!(a.ended(), "{what}: the connection is closed");
+    }
+}
+
+/// The HTTP/2 frame types in `wire`, in order.
+fn h2_types(wire: &[u8]) -> Vec<u8> {
+    let (mut at, mut out) = (0, Vec::new());
+    while at + 9 <= wire.len() {
+        let len = usize::from(wire[at]) << 16
+            | usize::from(wire[at + 1]) << 8
+            | usize::from(wire[at + 2]);
+        out.push(wire[at + 3]);
+        at += 9 + len;
+    }
+    out
+}
+
+/// RED: an HTTP/2 connection idle between requests is closed the same way, saying GOAWAY first;
+/// one answering a request is not.
+#[test]
+fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
+    let (mut a, stream) = h2_request();
+    run(&mut a, 40 * SEC);
+    assert!(!a.ended(), "a request in flight keeps the connection");
+    a.emit(stream, b"", true, 204).expect("answered");
+    run(&mut a, 41 * SEC);
+    let _ = a.take_wire(usize::MAX);
+    run(&mut a, 60 * SEC);
+    assert!(!a.ended(), "not yet idle for 30 s");
+    run(&mut a, 72 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        h2_types(&wire).contains(&7),
+        "GOAWAY: {:?}",
+        h2_types(&wire)
+    );
+    run(&mut a, 90 * SEC);
+    assert!(a.ended(), "the idle connection is closed");
+}
+
+/// An admitted request whose body has stalled (nothing for 30 s), or trickles below 1 KiB/s once
+/// 10 s have passed, fails its stream, as v1.5.5's listener failed such a body (`TimeoutBody`).
+#[test]
+fn a_stalled_or_trickled_request_body_fails_its_stream() {
+    let post =
+        b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 100\r\n\r\nhello";
+    let failed = |a: &mut Accepted| a.pieces().drain(..).any(|p| p.failed);
+    let mut a = accepted();
+    a.ingest(post, false);
+    run(&mut a, SEC);
+    assert!(!failed(&mut a));
+    assert!(
+        a.next_deadline().is_some_and(|d| d <= 31 * SEC),
+        "a wake-up is asked for the stalled body"
+    );
+    run(&mut a, 32 * SEC);
+    assert!(failed(&mut a), "a body silent for 30 s fails its stream");
+
+    let mut a = accepted();
+    a.ingest(post, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    a.ingest(b"x", false);
+    run(&mut a, 13 * SEC);
+    assert!(
+        failed(&mut a),
+        "a body under 1 KiB/s past 10 s fails its stream"
     );
 }
