@@ -168,8 +168,7 @@ impl Tasks {
 
     /// Poll every task once; one that ends is dropped, one spawned meanwhile runs next round.
     pub(crate) fn run(&self, cx: &mut Context<'_>) {
-        let mut tasks =
-            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
         tasks.retain_mut(|t| t.as_mut().poll(cx).is_pending());
         let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         tasks.append(&mut list);

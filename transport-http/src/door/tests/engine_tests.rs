@@ -1198,8 +1198,14 @@ fn an_answer_with_no_body_states_no_declared_length() {
             "HEAD",
             &b"HTTP/1.1 200 OK\r\ncontent-length: 5368709120\r\n\r\n"[..],
         ),
-        ("GET", b"HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n"),
-        ("GET", b"HTTP/1.1 204 No Content\r\ncontent-length: 5\r\n\r\n"),
+        (
+            "GET",
+            b"HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\n\r\n",
+        ),
+        (
+            "GET",
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 5\r\n\r\n",
+        ),
     ] {
         let mut f = asked_with(Proto::H1, method);
         f.ingest(head, false);
@@ -1223,7 +1229,11 @@ fn an_answer_with_no_body_states_no_declared_length() {
     let mut f = asked_with(Proto::H1, "GET");
     f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n", false);
     f.drive(SEC, 0);
-    assert_eq!(declared(&mut f), Some(Some(0)), "an empty body's length stands");
+    assert_eq!(
+        declared(&mut f),
+        Some(Some(0)),
+        "an empty body's length stands"
+    );
 }
 
 /// RED (codeaudit resource M engine.rs:186): hyper's HTTP/2 client task holds a clone of its
