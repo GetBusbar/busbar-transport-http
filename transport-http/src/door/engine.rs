@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -76,7 +76,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
     /// The raw buffer is zeroed when it is dropped (the message refused, or the framing gone), and
-    /// when it grows (`append_zeroizing`); a whole message's head span is zeroed and its body
+    /// when it grows (`extend_wiped`); a whole message's head span is zeroed and its body
     /// handed on in place (`Framing::message`). The head is read in place from it
     /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
     /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
@@ -134,6 +134,48 @@ impl Queue {
     }
 }
 
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A FRAMING'S OWN TASK LIST, hyper's executor, run once per round of the framing's drive. hyper
+/// keeps a clone of its executor inside the tasks it spawns (HTTP/2's connection task, each
+/// stream's task), so the executor holds the list only WEAKLY ([`Spawner`]): the framing alone owns
+/// it, and the framing's drop drops every task in it. An executor holding its list strongly (the
+/// SDK drive's own) would be held by its own tasks, and a framing dropped before they ended would
+/// keep them, hyper's connection state and the pipe, for good.
+#[derive(Default)]
+pub(crate) struct Tasks(Arc<Mutex<Vec<Task>>>);
+
+/// hyper's executor over a framing's [`Tasks`], holding it weakly: a task spawned once the framing
+/// is gone is dropped unrun.
+#[derive(Clone)]
+pub(crate) struct Spawner(Weak<Mutex<Vec<Task>>>);
+
+impl<F: Future<Output = ()> + Send + 'static> Executor<F> for Spawner {
+    fn execute(&self, fut: F) {
+        if let Some(list) = self.0.upgrade() {
+            list.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Box::pin(fut));
+        }
+    }
+}
+
+impl Tasks {
+    /// The executor hyper is handed.
+    pub(crate) fn spawner(&self) -> Spawner {
+        Spawner(Arc::downgrade(&self.0))
+    }
+
+    /// Poll every task once; one that ends is dropped, one spawned meanwhile runs next round.
+    pub(crate) fn run(&self, cx: &mut Context<'_>) {
+        let mut tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        tasks.retain_mut(|t| t.as_mut().poll(cx).is_pending());
+        let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        tasks.append(&mut list);
+        *list = tasks;
+    }
+}
+
 /// Why a framing failed; the op that finds it answers FAILED with this text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure(pub String);
@@ -141,6 +183,8 @@ pub struct Failure(pub String);
 /// One connection's HTTP machine.
 pub struct Framing {
     io: HostIo,
+    /// hyper's executor ([`Tasks`]).
+    tasks: Tasks,
     handshake: Option<BoxFut<hyper::Result<Sender>>>,
     sender: Option<Sender>,
     conn_err: Arc<Mutex<Option<String>>>,
@@ -176,7 +220,8 @@ impl Framing {
         );
         // The one real-clock read: this framing's epoch (module docs).
         let io = HostIo::new(now_ns);
-        let (exec, timer) = (io.exec(), io.timer());
+        let tasks = Tasks::default();
+        let (exec, timer) = (tasks.spawner(), io.timer());
         let conn_err = Arc::new(Mutex::new(None));
         let conn_done = Arc::new(AtomicBool::new(false));
         let (ex, err, done) = (exec.clone(), conn_err.clone(), conn_done.clone());
@@ -194,7 +239,8 @@ impl Framing {
                     let (s, c) = b.handshake(shim).await?;
                     ex.execute(async move {
                         if let Err(e) = c.await {
-                            *err.lock().expect("err") = Some(e.to_string());
+                            *err.lock().unwrap_or_else(PoisonError::into_inner) =
+                                Some(e.to_string());
                         }
                         done.store(true, Ordering::Release);
                     });
@@ -205,7 +251,7 @@ impl Framing {
                 let (s, c) = http1::Builder::new().handshake(shim).await?;
                 ex.execute(async move {
                     if let Err(e) = c.await {
-                        *err.lock().expect("err") = Some(e.to_string());
+                        *err.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
                     }
                     done.store(true, Ordering::Release);
                 });
@@ -214,6 +260,7 @@ impl Framing {
         };
         Ok(Self {
             io,
+            tasks,
             handshake: Some(handshake),
             sender: None,
             conn_err,
@@ -339,7 +386,7 @@ impl Framing {
                 "stream {stream} already carries a request"
             )));
         };
-        append_zeroizing(buf, bytes);
+        extend_wiped(buf, bytes);
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
@@ -403,12 +450,23 @@ impl Framing {
             return;
         }
         let io = self.io.clone();
-        if let Err(f) = io.rounds(|cx| self.step(cx)) {
+        // What the host has taken of the queue is read ONCE per drive: the host takes nothing
+        // between its rounds (the sink is filled after it), and a push moves `pushed` and the
+        // queued bytes alike, so it stands for every round.
+        let taken = (self.proto == Proto::H2).then(|| self.out.taken());
+        if let Err(f) = io.rounds(|cx| {
+            self.tasks.run(cx);
+            self.step(cx, taken)
+        }) {
             self.failed = Some(f);
             self.fail_streams();
             return;
         }
-        let err = self.conn_err.lock().expect("err").clone();
+        let err = self
+            .conn_err
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if let Some(e) = err {
             if self
                 .exchanges
@@ -421,8 +479,9 @@ impl Framing {
         }
     }
 
-    /// With output pending, state the recorded failure on every stream not already finished, then
-    /// drop the exchanges (so a later call pushes nothing).
+    /// With output pending, state the recorded failure on every stream not already finished nor
+    /// already told it failed (a `Refused` one's failure piece is out), then drop the exchanges (so
+    /// a later call pushes nothing).
     fn fail_streams(&mut self) {
         if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
             return;
@@ -431,7 +490,7 @@ impl Framing {
             return;
         };
         for (id, stage) in &self.exchanges {
-            if !matches!(stage, Stage::Done) {
+            if !matches!(stage, Stage::Done | Stage::Refused) {
                 self.out.push(Piece::failure(*id, why));
             }
         }
@@ -441,7 +500,7 @@ impl Framing {
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
     /// HTTP/2 ends THAT stream (dropping its exchange resets it on the wire) with a failure piece;
     /// on HTTP/1.1, or once the connection itself has failed, it fails the framing.
-    fn step(&mut self, cx: &mut Context<'_>) -> Result<(), Failure> {
+    fn step(&mut self, cx: &mut Context<'_>, taken: Option<u64>) -> Result<(), Failure> {
         if let Some(h) = self.handshake.as_mut() {
             if let Poll::Ready(r) = h.as_mut().poll(cx) {
                 self.handshake = None;
@@ -450,12 +509,16 @@ impl Framing {
         }
         let k = Knobs {
             now_unix_secs: self.now_unix_ns / 1_000_000_000,
-            hold: (self.proto == Proto::H2).then(|| self.out.taken()),
+            hold: taken,
         };
         for (id, stage) in &mut self.exchanges {
             let r = advance(*id, stage, &mut self.sender, &mut self.out, &k, cx);
             if let Err(f) = r.map(|held| self.held |= held) {
-                let conn_dead = self.conn_err.lock().expect("err").is_some();
+                let conn_dead = self
+                    .conn_err
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some();
                 if self.proto == Proto::H1 || conn_dead || f.1 {
                     return Err(f.0);
                 }
@@ -499,14 +562,17 @@ impl Owed for Framing {
     }
 }
 
-/// Append `bytes` to `buf`, never leaving a copy of what it held behind: where it must grow, the
-/// bytes move to a new allocation and the old one is zeroed as it drops (a `Vec`'s own growth
-/// frees the old allocation as it was).
-fn append_zeroizing(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+/// THE ONE WIPE-ON-GROW RULE for a buffer of this door's own that may hold credential bytes (the
+/// request message `emit` collects, the accepted side's hand-over copy, a held body): append
+/// `bytes` to `buf`, never leaving a copy of what it held behind. Where it must grow, the bytes
+/// move to a new allocation (at least double the old) and the one outgrown is zeroed before it is
+/// freed (a `Vec`'s own growth frees the old allocation as it was).
+pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     let need = buf.len().saturating_add(bytes.len());
     if need > buf.capacity() {
-        let mut grown = Zeroizing::new(Vec::with_capacity(need.max(buf.capacity() * 2)));
+        let mut grown = Vec::with_capacity(need.max(buf.capacity().saturating_mul(2)));
         grown.extend_from_slice(buf);
+        zeroize::Zeroize::zeroize(buf);
         *buf = grown;
     }
     buf.extend_from_slice(bytes);
@@ -712,12 +778,16 @@ fn advance(
 /// (`busbar_contract::abi::transport::fields`) carrying the status and any `Retry-After`, framed
 /// even when no field is left in it, so it always comes before the body. The head piece states the
 /// body length the head declared (`Content-Length`, `PIECE_HAS_DECLARED_LEN`), where it declared
-/// one: the host's pre-body download cap reads it before a body byte arrives.
+/// one: the host's pre-body download cap reads it before a body byte arrives. An answer that
+/// carries no body (to a HEAD, a `204`, a `304`: hyper knows its body is empty) may name the length
+/// a body WOULD have had (RFC 9110 8.6), which is no length of this answer's: it states none, save
+/// a stated `0`.
 fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> Piece {
+    let bodiless = r.body().is_end_stream();
     Piece {
         status: Some(r.status().as_u16()),
         retry_after_secs: retry_after_secs(r.headers(), now_unix_secs),
-        declared_len: declared_len(r.headers()),
+        declared_len: declared_len(r.headers()).filter(|n| *n == 0 || !bodiless),
         head: reason_phrase(r).map(HeadWords::reason),
         ..Piece::fields(stream, Bytes::from(field_block(r.headers(), &[])))
     }

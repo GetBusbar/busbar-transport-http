@@ -49,7 +49,7 @@ use busbar_contract::abi::transport::{
     HeadSlots, IngestIn, LocateIn, LocateOut, Ops, RefuseIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL,
     PIECE_CONTINUED, PIECE_END, PIECE_END_OF_FRAME, PIECE_FIELDS, PIECE_HAS_CODE,
     PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
-    YIELD_HAS_DEADLINE, YIELD_MORE,
+    YIELD_HAS_DEADLINE, YIELD_MORE, YIELD_STREAM_FULL,
 };
 use busbar_contract::abi::transport::{
     FAULT_NONE, FAULT_TRANSIENT, STATUS_CALLER_FAULT, STATUS_SUCCESS,
@@ -204,6 +204,8 @@ struct Host {
     framing: u64,
     sock: Arc<Socket>,
     wire_log: Vec<u8>,
+    /// Every byte the far end sent, as ingested.
+    heard_log: Vec<u8>,
     frame_log: Vec<u8>,
     deadline: Option<u64>,
     more: bool,
@@ -260,6 +262,7 @@ impl Host {
             framing: 0,
             sock,
             wire_log: Vec::new(),
+            heard_log: Vec::new(),
             frame_log: Vec::new(),
             deadline: None,
             more: false,
@@ -471,8 +474,27 @@ impl Host {
         call(self.ops.encode, self.inst, &mut i, &mut o, slot::ENCODE)
     }
 
-    /// Ingest whatever the far end has sent until it stays quiet for `quiet`; the first op that
-    /// fails ends the pump with its outcome.
+    /// Ingest whatever the far end sends until `done` holds of what was handed up (the explicit
+    /// end of what the cell waits for, never a quiet spell on a loaded runner), the far end ends, or
+    /// an op fails (its outcome). A far end that has not got there in [`PUMP_DEADLINE`] fails the
+    /// cell in words.
+    fn pump_until(&mut self, done: impl Fn(&[Got]) -> bool, got: &mut Vec<Got>) -> Outcome {
+        let deadline = std::time::Instant::now() + PUMP_DEADLINE;
+        while !done(got) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the far end did not get there in {PUMP_DEADLINE:?}"
+            );
+            if self.pump_once(got) == Some(Outcome::Ready) {
+                break;
+            }
+        }
+        Outcome::Ready
+    }
+
+    /// Ingest whatever the far end has sent until it stays quiet for `quiet` (for a cell that
+    /// asserts nothing the far end sends after it); the first op that fails ends the pump with its
+    /// outcome.
     fn pump(&mut self, quiet: Duration, got: &mut Vec<Got>) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(10);
@@ -509,6 +531,36 @@ impl Host {
         Outcome::Ready
     }
 
+    /// One pass of [`Host::pump`]: `None` when the far end sent nothing yet (after a short wait),
+    /// `Some(Ready)` once it ended, `Some(other)` when an op failed; the bytes it sent ingested.
+    fn pump_once(&mut self, got: &mut Vec<Got>) -> Option<Outcome> {
+        let (bytes, end) = {
+            let mut g = self.sock.rx.lock().expect("rx");
+            (g.0.drain(..).collect::<Vec<u8>>(), g.1)
+        };
+        if bytes.is_empty() && !end {
+            std::thread::sleep(Duration::from_millis(10));
+            return None;
+        }
+        self.heard_log.extend_from_slice(&bytes);
+        let mut i: IngestIn = z();
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.end = u32::from(end);
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let r = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        if self.take(r, &o, got) != Outcome::Ready {
+            return Some(r);
+        }
+        let r = self.drain(slot::INGEST, 0, got);
+        if r != Outcome::Ready {
+            return Some(r);
+        }
+        end.then_some(Outcome::Ready)
+    }
+
     /// Move the clock to `at` and call `timer` if the framer asked for a deadline by then.
     fn advance(&mut self, at: u64, got: &mut Vec<Got>) -> Outcome {
         self.now = at;
@@ -524,6 +576,35 @@ impl Host {
             return self.drain(slot::TIMER, 0, got);
         }
         Outcome::Ready
+    }
+
+    /// PING ACK frames the far end has sent (HTTP/2).
+    fn acks(&self) -> usize {
+        let log = &self.heard_log;
+        let (mut i, mut k) = (0, 0);
+        while i + 9 <= log.len() {
+            let len =
+                usize::from(log[i]) << 16 | usize::from(log[i + 1]) << 8 | usize::from(log[i + 2]);
+            if log[i + 3] == 6 && log[i + 4] & 1 != 0 {
+                k += 1;
+            }
+            i += 9 + len;
+        }
+        k
+    }
+
+    /// Ingest until the far end has answered every PING the framer wrote (HTTP/2).
+    fn pump_acks(&mut self, got: &mut Vec<Got>) {
+        let deadline = std::time::Instant::now() + PUMP_DEADLINE;
+        while self.acks() < self.pings() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the far end did not answer its pings in {PUMP_DEADLINE:?}"
+            );
+            if self.pump_once(got).is_some_and(|r| r != Outcome::Ready) {
+                break;
+            }
+        }
     }
 
     /// Non-ACK PING frames the framer has written (HTTP/2, after the 24-byte preface).
@@ -546,6 +627,14 @@ impl Host {
         let mut o: OutHead = z();
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
     }
+}
+
+/// How long [`Host::pump_until`] waits for the far end, however loaded the runner.
+const PUMP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A head frame was handed up.
+fn has_head(got: &[Got]) -> bool {
+    got.iter().any(|g| g.flags & PIECE_HAS_CODE != 0)
 }
 
 fn text(got: &[Got], stream: u64) -> String {
@@ -598,7 +687,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     let t0 = host.now;
     let mut got = host.ask(1, "/v1/messages", "hello");
     assert_eq!(
-        host.pump(Duration::from_millis(300), &mut got),
+        host.pump_until(|g| text(g, 1) == "got=5;a", &mut got),
         Outcome::Ready
     );
     let head = got
@@ -640,6 +729,9 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     assert!(!ended(&got, 1), "the stalled response is not whole");
 
     if h2 {
+        // The adaptive window's ping is answered before the clock moves (a ping still in flight
+        // holds the keep-alive's back).
+        host.pump_acks(&mut got);
         let p0 = host.pings();
         if case == Case::KeepAliveTimeout {
             sock.silent.store(true, Ordering::SeqCst);
@@ -674,7 +766,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
         }
     }
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 1), &mut got);
     println!(
         "PROOF {label}: body {:?}, whole={}",
         text(&got, 1),
@@ -757,7 +849,7 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
     let mut got = host.ask(1, "/hang", "");
     got.extend(host.ask(3, "/v1/messages", "hello"));
     assert_eq!(
-        host.pump(Duration::from_millis(300), &mut got),
+        host.pump_until(|g| text(g, 3) == "got=5;a", &mut got),
         Outcome::Ready
     );
     assert_eq!(text(&got, 3), "got=5;a", "the sibling answered");
@@ -767,7 +859,7 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
         "not before 5s"
     );
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 3), &mut got);
     println!(
         "PROOF {label}: stream 3 {:?}, whole={}",
         text(&got, 3),
@@ -810,9 +902,9 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
     );
     host.begin("");
     let mut got = host.ask(1, "/v1/messages", "hello");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| text(g, 1) == "got=5;a", &mut got);
     rt.block_on(sock.release.send(())).expect("release");
-    host.pump(Duration::from_millis(300), &mut got);
+    host.pump_until(|g| ended(g, 1), &mut got);
     assert!(ended(&got, 1), "the exchange completed");
     // A field block a small sink split mid-line says so on the piece that continues the line
     // (PIECE_CONTINUED); every other fields piece starts a line.
@@ -896,10 +988,7 @@ fn a_429_head_states_its_class_fault_and_retry_after() {
         );
         host.begin("");
         let mut got = host.ask(1, "/limited", "hello");
-        assert_eq!(
-            host.pump(Duration::from_millis(300), &mut got),
-            Outcome::Ready
-        );
+        assert_eq!(host.pump_until(has_head, &mut got), Outcome::Ready);
         let head = got
             .iter()
             .find(|g| g.flags & PIECE_HAS_CODE != 0)
@@ -1173,8 +1262,22 @@ impl AcceptHost {
     }
 
     fn emit(&mut self, stream: u64, bytes: &[u8], end: bool, status: u32) -> Outcome {
+        self.emit_with(stream, bytes, end, status, 0).0
+    }
+
+    /// `emit` with head flags `flags` (`FLAG_RESUME`: the host re-issuing the op that answered
+    /// PENDING): its outcome and its yield's flags.
+    fn emit_with(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        status: u32,
+        flags: u32,
+    ) -> (Outcome, u32) {
         let mut i: EmitIn = z();
         i.head.ticket = self.ticket;
+        i.head.flags = flags;
         i.framing = self.framing;
         i.stream = stream;
         i.bytes = bytes.as_ptr();
@@ -1184,7 +1287,7 @@ impl AcceptHost {
         i.sink = self.sink();
         let mut o: FramerOut = z();
         let r = call(self.ops.emit, self.inst, &mut i, &mut o, slot::EMIT);
-        self.take(r, &o)
+        (self.take(r, &o), o.yielded.flags)
     }
 
     /// `refuse`: `bytes` for `stream` (`None`: the whole connection), with the neutral `status`
@@ -1493,6 +1596,11 @@ struct Script {
     asked: Vec<Asked>,
     /// The fields `unit.refuse` answers, in order; empty: `content-type: application/json` alone.
     refusal_fields: Vec<(&'static str, &'static str)>,
+    /// The next `auth.call` first crosses a `cancel` into the door (`table`, instance), while the
+    /// op that made the call holds its framing.
+    reenter: Option<(&'static Ops, usize)>,
+    /// What that `cancel` answered: its outcome and disposition.
+    reentered: Option<(Outcome, u32)>,
 }
 
 /// Which of the auth handle's services answer FAILED.
@@ -1592,6 +1700,29 @@ fn outcome(out: *mut ServiceOut, o: Outcome) -> RawOutcome {
 }
 
 extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut) -> RawOutcome {
+    let reenter = SCRIPTS
+        .lock()
+        .expect("scripts")
+        .get_mut(&ctx.handle)
+        .and_then(|s| s.reenter.take());
+    if let Some((ops, inst)) = reenter {
+        let mut i: CancelIn = z();
+        i.ticket = Ticket {
+            slot: 77,
+            generation: 1,
+        };
+        let mut o: CancelOut = z();
+        let r = call(
+            ops.head.cancel,
+            inst as *mut c_void,
+            &mut i,
+            &mut o,
+            life::CANCEL,
+        );
+        if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&ctx.handle) {
+            s.reentered = Some((r, o.disposition));
+        }
+    }
     // SAFETY: the SDK wrapper hands a live `AuthCallIn`, its buffers and a live `out`.
     unsafe {
         let i = input.cast::<AuthCallIn>().read_unaligned();
@@ -2083,6 +2214,8 @@ fn never_reached_the_plane(label: &str, h: &AcceptHost) {
         "{label}: no bytes of the transport's own: {:?}",
         String::from_utf8_lossy(&h.out)
     );
+    // An unanswered HTTP/1.1 request ends its connection (hyper closes it with no bytes).
+    assert!(h.ended, "{label}: the connection is closed");
 }
 
 /// The hand-in answers FAILED: the request is not handed up.
@@ -2348,6 +2481,158 @@ fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
         "{label}: the cancelled call is not re-issued: {seqs:?}"
     );
     assert_eq!(h.heads_up(), 1, "{label}");
+    h.close();
+}
+
+/// RED (codeaudit concurrency L mod.rs:504): a `cancel` that meets a framing another op holds
+/// right now cannot look at it, and answered NOTHING_MOVED as if no parked call could sit there. It
+/// says it could not look (FAILED, the framing busy), never that nothing moved.
+fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+    );
+    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+        s.reenter = Some((ops, h.inst as usize));
+    }
+    assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
+    let reentered = SCRIPTS.lock().expect("scripts")[&h.ctx].reentered;
+    let (r, disposition) = reentered.expect("the cancel crossed while the framing was held");
+    assert_eq!(
+        r,
+        Outcome::Failed,
+        "{label}: a cancel that could not look at a held framing says so, not NOTHING_MOVED \
+         (disposition {disposition})"
+    );
+    h.close();
+}
+
+/// RED (codeaudit correctness M mod.rs:1153): a request hyper decodes during the host's `refuse`
+/// (a pipelined HTTP/1.1 request, read as soon as the refused answer is written) was never put
+/// through the guest list: `refuse` admitted nothing and no later op was owed to the connection,
+/// so the client waited for an answer that never came. Every admission step that calls no
+/// may-pend service runs on it: here the request's `none` line hands it in and it goes up.
+fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
+    let one = b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello";
+    let two: Vec<u8> = one.iter().chain(one.iter()).copied().collect();
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        &two,
+    );
+    assert_eq!(
+        h.heads_up(),
+        1,
+        "{label}: one request at a time on HTTP/1.1"
+    );
+    assert_eq!(
+        h.refuse(Some(1), b"no", 403, false),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        h.heads_up(),
+        2,
+        "{label}: the request decoded during the refuse went up in it"
+    );
+    h.close();
+}
+
+/// RED (codeaudit error-handling M mod.rs:1014, correctness L mod.rs:1014): `detach` took the
+/// answer bytes still owed to the far side into the host's wire buffer before it knew it would
+/// answer READY; answering REFUSED (nothing switched protocols) it handed the host none of them,
+/// and they were gone: the far side read an answer with a hole in it. A detach that is not READY
+/// takes nothing, and the bytes go out with the next op.
+fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
+    let mut h = admitted(
+        ops,
+        vec![line(5, 0, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    // A host wire buffer of 16 bytes: the answer is owed over several ops.
+    h.wire = vec![0; 16];
+    assert_eq!(
+        h.emit(1, b"content-length: 5\r\n", false, 200),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(h.emit(1, b"hello", true, 0), Outcome::Ready, "{label}");
+    assert_eq!(h.detach().0, Outcome::Refused, "{label}: nothing switched");
+    h.wire = vec![0; 64 * 1024];
+    assert_eq!(h.timer(), Outcome::Ready, "{label}");
+    assert_eq!(
+        String::from_utf8_lossy(&undated(h.out.clone())),
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello",
+        "{label}: every answer byte reached the far side"
+    );
+    h.close();
+}
+
+/// RED (codeaudit error-handling L mod.rs:940): an `emit` that left its stream's queue at the
+/// high-water mark AND parked on a pending `auth.call` (another request's, decoded and waiting)
+/// answered PENDING; its resume ran nothing and answered READY without `YIELD_STREAM_FULL`, so the
+/// host kept writing a stream that was full. The resume states the stream's fullness as it stands.
+fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![
+            line(3, POINT_HEAD, METHOD_ANY, "/a", 0),
+            line(5, 0, METHOD_ANY, "/b", 0),
+        ],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    // A's auth pends on this op's ticket; B is admitted and goes up.
+    assert_eq!(
+        h.ingest(&h2_requests(&[(1, "/a"), (3, "/b")])),
+        Outcome::Pending,
+        "{label}"
+    );
+    let parked = h.ticket;
+    h.ticket = Ticket {
+        slot: 2,
+        generation: 1,
+    };
+    assert_eq!(h.ingest(b""), Outcome::Ready, "{label}");
+    let b = h
+        .words
+        .iter()
+        .find(|(_, _, t)| t == b"/b")
+        .map(|(s, _, _)| *s)
+        .expect("B went up");
+    // B's answer, streamed: the far side's window takes the first chunks, the rest queue; the
+    // sixth fills the queue to its high-water mark.
+    assert_eq!(h.emit(b, b"", false, 200), Outcome::Ready, "{label}");
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..5 {
+        assert_eq!(h.emit(b, &chunk, false, 0), Outcome::Ready, "{label}");
+    }
+    // A's parked call is let go, and its next call pends: on the emit that fills B's queue.
+    assert_eq!(h.cancel(parked), CANCEL_PARTIAL, "{label}");
+    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+        s.pend = 1;
+    }
+    h.ticket = Ticket {
+        slot: 3,
+        generation: 1,
+    };
+    assert_eq!(
+        h.emit_with(b, &chunk, false, 0, 0).0,
+        Outcome::Pending,
+        "{label}: the emit parks on A's auth"
+    );
+    let (r, flags) = h.emit_with(b, &chunk, false, 0, FLAG_RESUME);
+    assert_eq!(r, Outcome::Ready, "{label}: resumed");
+    assert_ne!(
+        flags & YIELD_STREAM_FULL,
+        0,
+        "{label}: the resume states B's queue full"
+    );
     h.close();
 }
 
@@ -2633,6 +2918,8 @@ fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     );
     assert_eq!(h.heads_up(), 0, "{label}: nothing went up");
     assert!(h.out.is_empty(), "{label}: no bytes of the transport's own");
+    // The refusal closes the connection, never leaves it open and silent.
+    assert!(h.ended, "{label}: the connection is closed");
     h.close();
 }
 
@@ -3328,6 +3615,26 @@ fn a_resumed_op_reissues_the_same_handle_and_takes_no_byte_twice() {
 #[test]
 fn a_cancel_of_a_parked_op_is_partial_and_lets_the_call_go() {
     both(cancel_of_a_parked_op);
+}
+
+#[test]
+fn a_request_decoded_during_a_refuse_is_admitted_in_it() {
+    both(a_request_decoded_during_refuse_is_admitted);
+}
+
+#[test]
+fn a_refused_detach_hands_over_no_owed_byte_and_loses_none() {
+    both(a_refused_detach_keeps_the_owed_bytes);
+}
+
+#[test]
+fn a_resumed_emit_states_its_stream_full_linked_and_dropped_in() {
+    both(a_resumed_emit_states_its_stream_full);
+}
+
+#[test]
+fn a_cancel_meeting_a_held_framing_is_not_nothing_moved() {
+    both(cancel_meeting_a_held_framing);
 }
 
 #[test]

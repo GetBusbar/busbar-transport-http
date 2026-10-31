@@ -15,7 +15,16 @@ const SEC: u64 = 1_000_000_000;
 /// refused.
 struct Open;
 
+/// The ticket a test kernel's op runs on: a ticketed one, where `auth.call` may be made.
+const OP_TICKET: Ticket = Ticket {
+    slot: 1,
+    generation: 1,
+};
+
 impl Kernel for Open {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
         &mut self,
@@ -111,6 +120,27 @@ fn undated(mut wire: Vec<u8>) -> Vec<u8> {
     wire
 }
 
+/// Whether `wire` holds one whole HTTP/1.1 answer: its head, then the body its `content-length`
+/// states, or its chunked body through the last chunk (a head stating neither has no body here).
+fn answer_whole(wire: &[u8]) -> bool {
+    let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&wire[..end]).to_ascii_lowercase();
+    let body = &wire[end + 4..];
+    if let Some(len) = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return body.len() >= len;
+    }
+    if head.contains("transfer-encoding: chunked") {
+        return body.ends_with(b"0\r\n\r\n");
+    }
+    true
+}
+
 /// v1.5.5's data listener answering `request` with `status`, `headers` and `body` (known size when
 /// `sized`, else streamed): its wire bytes, over an in-memory socket.
 fn v155(
@@ -163,14 +193,17 @@ fn v155(
         });
         // The request, and NO half-close: v1.5.5's builder leaves `half_close` off, so a read end
         // before the answer is written closes the connection with nothing written (both sides of
-        // this comparison then read as empty and agree vacuously). The answer is read until the
-        // connection goes quiet.
+        // this comparison then read as empty and agree vacuously). The answer is read until it is
+        // WHOLE by its own framing (its `content-length`, or its last chunk), however late the
+        // server is scheduled, under a generous bound that fails in words.
         cli.write_all(request).await.expect("request");
         let mut wire = Vec::new();
         let mut buf = [0_u8; 4096];
-        while let Ok(Ok(n)) =
-            tokio::time::timeout(std::time::Duration::from_millis(300), cli.read(&mut buf)).await
-        {
+        while !answer_whole(&wire) {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(30), cli.read(&mut buf))
+                .await
+                .expect("v1.5.5's answer arrives whole")
+                .expect("read");
             if n == 0 {
                 break;
             }
@@ -435,6 +468,9 @@ fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
 struct Refusing;
 
 impl Kernel for Refusing {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
     #[allow(clippy::too_many_arguments)]
     fn auth_call(
         &mut self,
@@ -683,5 +719,259 @@ fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
             .streams
             .contains_key(&stream),
         "its record and queued bytes are let go"
+    );
+}
+
+/// One GET admitted on a fresh connection: the connection and its stream.
+fn one_get() -> (Accepted, u64) {
+    let mut a = accepted();
+    a.ingest(GET, false);
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert_eq!(u.heads.len(), 1, "one request");
+    (a, u.heads[0].0)
+}
+
+/// RED (codeaudit correctness M accept.rs:649, error-handling L accept.rs:649, conformance L
+/// accept.rs:656): an answer head was judged only after its stream's answer sender was taken, so a
+/// head no answer can carry lost the stream (hyper ended it unanswered, and a corrected head found
+/// no answer to give); and a status of 600 to 999 was written as an answer (`http` takes any three
+/// digits, RFC 9110 15 names 100 to 599). A head that cannot be an answer is refused and the stream
+/// is still answerable.
+#[test]
+fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
+    let (mut a, stream) = one_get();
+    for (status, block) in [
+        (700, &b"content-type: text/plain\r\n"[..]),
+        (999, b""),
+        (99, b""),
+        (200, b"x-bad: a\x01b\r\n"),
+    ] {
+        let r = a.emit(stream, block, true, status);
+        assert!(r.is_err(), "status {status}: refused: {r:?}");
+        assert!(a.answers_head(stream), "status {status}: still answerable");
+    }
+    assert!(
+        a.emit(stream, b"content-type: text/plain\r\n", true, 599)
+            .is_ok(),
+        "the corrected head is the answer"
+    );
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 599 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
+/// RED (codeaudit error-handling L accept.rs:659): the answer head's field block was read only up
+/// to its first line that is not `name: value` CRLF, so every line from there on (a security
+/// header, a cache rule) was dropped and the emit answered READY. A block that is not whole lines
+/// is refused, and the stream is still answerable.
+#[test]
+fn an_answer_head_with_a_malformed_field_line_is_refused() {
+    let (mut a, stream) = one_get();
+    for block in [
+        &b"content-type: text/plain\r\nx-frame-options: DENY"[..],
+        b"content-type: text/plain\r\nno separator\r\nx-frame-options: DENY\r\n",
+    ] {
+        let r = a.emit(stream, block, true, 200);
+        assert!(
+            r.is_err(),
+            "{:?}: refused, not cut short: {r:?}",
+            String::from_utf8_lossy(block)
+        );
+        assert!(a.answers_head(stream), "still answerable");
+    }
+}
+
+/// RED (codeaudit resource M engine.rs:186, its accepted half): hyper's HTTP/2 server spawns each
+/// stream's task with a clone of its executor, and the executor's task list held that task: a
+/// cycle, so an accepted connection dropped with a stream in flight never freed the stream's task
+/// (its service future, hyper's and h2's stream state). Dropping the framing frees it: the
+/// stream's answer channel then has no one waiting on it.
+#[test]
+fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
+    let (a, stream) = h2_request();
+    let respond = a
+        .shared
+        .lock()
+        .expect("shared")
+        .streams
+        .get_mut(&stream)
+        .and_then(|s| s.respond.take())
+        .expect("the stream's answer is owed");
+    assert!(!respond.is_canceled(), "the stream's task waits on it");
+    drop(a);
+    assert!(
+        respond.is_canceled(),
+        "the stream's task went with the framing"
+    );
+}
+
+/// RED (codeaudit correctness/error-handling L accept.rs:853): `detach` took the switched stream's
+/// upgrade handle out before it knew the switch had completed, and on "the switch has not
+/// completed" dropped it: every later detach found nothing switched and was REFUSED, though the
+/// `101` was owed. The handle stays until the switch completes, so a detach once it has hands the
+/// connection over.
+#[test]
+fn a_detach_before_the_switch_completes_can_be_made_again() {
+    let mut a = accepted();
+    let mut sent = GET.to_vec();
+    sent.extend_from_slice(
+        b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n\x81\x05hello",
+    );
+    a.ingest(&sent, false);
+    run(&mut a, SEC);
+    let first = up(&mut a).heads[0].0;
+    // An answer the host has not taken from the wire yet, past the pipe's high-water mark: hyper
+    // cannot write the `101` that follows until it is taken.
+    let body = vec![b'x'; 300_000];
+    a.emit(first, b"content-length: 300000\r\n", false, 200)
+        .expect("head");
+    a.emit(first, &body, true, 0).expect("body");
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(
+        stream,
+        b"connection: upgrade\r\nupgrade: x-test\r\n",
+        true,
+        101,
+    )
+    .expect("101");
+    run(&mut a, SEC);
+    let early = a.detach().map(|r| r.map(|r| r.len()));
+    assert!(
+        early.is_err(),
+        "the switch has not completed yet: {early:?}"
+    );
+    let _ = a.take_wire(usize::MAX);
+    run(&mut a, SEC);
+    let rest = a
+        .detach()
+        .expect("switched")
+        .expect("the connection is handed over once the switch completes");
+    let rest: Vec<u8> = rest.drain(..).collect();
+    assert_eq!(rest, b"\x81\x05hello", "the bytes after the request");
+}
+
+/// RED (codeaudit error-handling L accept.rs:720): the accepted connection's own end (hyper's
+/// error: a header-read timeout, an HTTP/2 protocol violation, a malformed request) was dropped, so
+/// every stream it ended was told the same words as a far side that merely went away. The cause
+/// rides the stream's failure words (hyper's text, which repeats no request byte).
+#[test]
+fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
+    let (mut a, stream) = h2_request();
+    // DATA on stream 0: a connection error (RFC 9113 6.1).
+    a.ingest(&frame(0, 0, 0, b"x"), false);
+    run(&mut a, SEC);
+    let told: Vec<String> = a
+        .pieces()
+        .drain(..)
+        .filter(|p| p.failed && p.stream == stream)
+        .map(|p| String::from_utf8_lossy(&p.bytes).into_owned())
+        .collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].starts_with("the far side gave the stream up: ") && told[0].len() > 33,
+        "the cause rides the words: {told:?}"
+    );
+}
+
+// ── the accepted side's time bounds (codeaudit security L→M accept.rs:362) ──────────────────────
+
+/// RED (codeaudit security accept.rs:362): only HTTP/1's header read was bounded, and only once
+/// hyper had chosen HTTP/1. A connection that sends part of the HTTP/2 preface, or the preface and
+/// then no request, asked the host for no wake-up at all and held its framing for
+/// good. A connection with no request in flight and nothing owed is closed 30 s on (the bound
+/// v1.5.5's listener put on a header read), on the host's clock.
+#[test]
+fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
+    for (what, sent) in [
+        ("part of the h2 preface", &b"PRI * HT"[..]),
+        (
+            "the h2 preface and no request",
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0",
+        ),
+    ] {
+        let mut a = accepted();
+        a.ingest(sent, false);
+        run(&mut a, SEC);
+        // The host takes what the framing owes the far side (its SETTINGS, on HTTP/2).
+        let _ = a.take_wire(usize::MAX);
+        let at = a
+            .next_deadline()
+            .unwrap_or_else(|| panic!("{what}: a wake-up is asked for"));
+        assert!(at <= SEC + 30 * SEC, "{what}: within the bound: {at}");
+        run(&mut a, 31 * SEC);
+        run(&mut a, 45 * SEC);
+        assert!(a.ended(), "{what}: the connection is closed");
+    }
+}
+
+/// The HTTP/2 frame types in `wire`, in order.
+fn h2_types(wire: &[u8]) -> Vec<u8> {
+    let (mut at, mut out) = (0, Vec::new());
+    while at + 9 <= wire.len() {
+        let len = usize::from(wire[at]) << 16
+            | usize::from(wire[at + 1]) << 8
+            | usize::from(wire[at + 2]);
+        out.push(wire[at + 3]);
+        at += 9 + len;
+    }
+    out
+}
+
+/// RED: an HTTP/2 connection idle between requests is closed the same way, saying GOAWAY first;
+/// one answering a request is not.
+#[test]
+fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
+    let (mut a, stream) = h2_request();
+    run(&mut a, 40 * SEC);
+    assert!(!a.ended(), "a request in flight keeps the connection");
+    a.emit(stream, b"", true, 204).expect("answered");
+    run(&mut a, 41 * SEC);
+    let _ = a.take_wire(usize::MAX);
+    run(&mut a, 60 * SEC);
+    assert!(!a.ended(), "not yet idle for 30 s");
+    run(&mut a, 72 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        h2_types(&wire).contains(&7),
+        "GOAWAY: {:?}",
+        h2_types(&wire)
+    );
+    run(&mut a, 90 * SEC);
+    assert!(a.ended(), "the idle connection is closed");
+}
+
+/// An admitted request whose body has stalled (nothing for 30 s), or trickles below 1 KiB/s once
+/// 10 s have passed, fails its stream, as v1.5.5's listener failed such a body (`TimeoutBody`).
+#[test]
+fn a_stalled_or_trickled_request_body_fails_its_stream() {
+    let post =
+        b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 100\r\n\r\nhello";
+    let failed = |a: &mut Accepted| a.pieces().drain(..).any(|p| p.failed);
+    let mut a = accepted();
+    a.ingest(post, false);
+    run(&mut a, SEC);
+    assert!(!failed(&mut a));
+    assert!(
+        a.next_deadline().is_some_and(|d| d <= 31 * SEC),
+        "a wake-up is asked for the stalled body"
+    );
+    run(&mut a, 32 * SEC);
+    assert!(failed(&mut a), "a body silent for 30 s fails its stream");
+
+    let mut a = accepted();
+    a.ingest(post, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    a.ingest(b"x", false);
+    run(&mut a, 13 * SEC);
+    assert!(
+        failed(&mut a),
+        "a body under 1 KiB/s past 10 s fails its stream"
     );
 }

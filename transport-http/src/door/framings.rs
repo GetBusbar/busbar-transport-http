@@ -8,7 +8,8 @@
 //! names a slot, the slot's segment is found with one read of a set-once cell, and the slot's own
 //! lock is the only one taken. Each slot sits on its own cache lines, so two framings never share
 //! one. The host calls one op at a time on a connection's framing, so that lock is never contended;
-//! should it ever be held, the op is answered at once ([`Reach::Busy`]), never waited for.
+//! should it ever be held, the op is answered at once ([`Reach::Busy`]), never waited for. The one
+//! exception is the framing's removal (`finish`), which must always free it ([`Framings::remove`]).
 //!
 //! Only `begin` and `finish` (once per connection, never per chunk) take the free list's lock, to
 //! mint a slot and to give one back. Segments are allocated on first use and grow geometrically, so
@@ -178,37 +179,65 @@ impl Framings {
         Ok(state)
     }
 
-    /// Visit every framing no op holds right now, `f` on each. Never waits: a framing another op
-    /// holds is skipped, as that op is running, not parked. Once per call over every minted slot,
-    /// for the rare op that names no framing (`cancel` names only a ticket).
-    pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) {
+    /// Visit every framing no op holds right now, `f` on each. Never waits (the op holding a
+    /// framing may be the very one whose host call crossed here): a framing another op holds is
+    /// skipped, and the answer says one was (`true`), so the caller never reads a skipped framing
+    /// as one with nothing on it. Once per call over every minted slot, for the rare op that names
+    /// no framing (`cancel` names only a ticket).
+    pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) -> bool {
+        let mut skipped = false;
         for segment in self.segments.iter().filter_map(OnceLock::get) {
             for slot in segment.iter() {
-                if let Ok(mut state) = slot.0.try_lock() {
-                    if let Some(held) = state.held.as_mut() {
-                        f(held);
+                match slot.0.try_lock() {
+                    Ok(mut state) => {
+                        if let Some(held) = state.held.as_mut() {
+                            f(held);
+                        }
                     }
+                    Err(TryLockError::WouldBlock) => skipped = true,
+                    // A poisoned framing is reached by no op: nothing parks on it.
+                    Err(TryLockError::Poisoned(_)) => {}
                 }
             }
         }
+        skipped
     }
 
-    /// Drop the framing `token` names and give its slot back.
+    /// Drop the framing `token` names and give its slot back. The one op that WAITS for its slot:
+    /// a framing's last op must always free it, so a removal that meets an op holding the slot
+    /// (`cancel`'s visit, or an op another thread runs) waits for it to let go (every op answers in
+    /// bounded CPU), and one that meets a slot a panicking op poisoned frees it too, and clears the
+    /// poison, so the slot serves the next framing.
     ///
     /// # Errors
     ///
-    /// As [`Self::reach`].
+    /// [`Reach::Gone`]: no framing holds the token.
     pub(super) fn remove(&self, token: u64) -> Result<(), Reach> {
-        let mut state = self.reach(token)?;
-        state.held = None;
-        drop(state);
-        if let Some((index, _)) = untoken(token) {
-            self.free
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .idle
-                .push(index);
+        let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
+        let (k, at) = place(index as usize);
+        let slot = self
+            .segments
+            .get(k)
+            .and_then(OnceLock::get)
+            .and_then(|s| s.get(at))
+            .ok_or(Reach::Gone)?;
+        let mut state = slot
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation || state.held.is_none() {
+            return Err(Reach::Gone);
         }
+        let held = state.held.take();
+        drop(state);
+        slot.0.clear_poison();
+        // Dropped outside the slot's lock: a framing's drop runs hyper's and the pipe's.
+        drop(held);
+        self.free
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle
+            .push(index);
         Ok(())
     }
 }
