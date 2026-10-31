@@ -94,7 +94,7 @@ use std::task::Poll;
 use busbar_contract::abi::host::service::{AuthRef, UnitRef};
 use busbar_contract::abi::mechanism::call::{AbiStr, InHead, OutHead, Outcome, FLAG_RESUME};
 use busbar_contract::abi::mechanism::door::{KindTailHead, Statement};
-use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut, RefreshIn};
+use busbar_contract::abi::mechanism::lifecycle::{CancelIn, CancelOut};
 use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held as Opened, Life, Refreshed, Refusal};
@@ -477,20 +477,7 @@ macro_rules! slot {
     };
 }
 
-// ── the lifecycle: the SDK's slots over [`Instance`] but these two ───────────────────────────────
-
-slot!(
-    /// `refresh`: [`Instance::refresh`]; with no open instance, FAILED in words.
-    Refresh, RefreshIn, OutHead, |instance, i, o| {
-        let Some(h) = instance.get() else {
-            return o.fail(Refusal::failed("refresh: no open instance"));
-        };
-        match h.life().refresh(i.field(|x| &x.settings).bytes(), &[], i.generation) {
-            Ok(_) => Outcome::Ready,
-            Err(e) => o.fail(e),
-        }
-    }
-);
+// ── the lifecycle: the SDK's slots over [`Instance`] but this one ───────────────────────────────
 
 slot!(
     /// `cancel`: the one framer op in flight is one parked on a pending `auth.call` (`begin`,
@@ -1447,7 +1434,7 @@ busbar_contract::plugin_door! {
     lifecycle: {
         validate: Safe<life::Validate<Instance>>,
         open: Safe<life::Open<Instance>>,
-        refresh: Safe<Refresh>,
+        refresh: Safe<life::Refresh<Instance>>,
         retire: Safe<life::Retire<Instance>>,
         tick: Safe<life::Tick<Instance>>,
         drive: Safe<life::Drive<Instance>>,
