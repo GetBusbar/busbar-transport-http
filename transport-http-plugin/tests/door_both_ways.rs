@@ -2431,7 +2431,11 @@ fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
         Script::default(),
         &two,
     );
-    assert_eq!(h.heads_up(), 1, "{label}: one request at a time on HTTP/1.1");
+    assert_eq!(
+        h.heads_up(),
+        1,
+        "{label}: one request at a time on HTTP/1.1"
+    );
     assert_eq!(
         h.refuse(Some(1), b"no", 403, false),
         Outcome::Ready,
