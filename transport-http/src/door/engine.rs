@@ -76,7 +76,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
     /// The raw buffer is zeroed when it is dropped (the message refused, or the framing gone), and
-    /// when it grows (`append_zeroizing`); a whole message's head span is zeroed and its body
+    /// when it grows (`extend_wiped`); a whole message's head span is zeroed and its body
     /// handed on in place (`Framing::message`). The head is read in place from it
     /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
     /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
@@ -386,7 +386,7 @@ impl Framing {
                 "stream {stream} already carries a request"
             )));
         };
-        append_zeroizing(buf, bytes);
+        extend_wiped(buf, bytes);
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
         if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
@@ -550,14 +550,17 @@ impl Owed for Framing {
     }
 }
 
-/// Append `bytes` to `buf`, never leaving a copy of what it held behind: where it must grow, the
-/// bytes move to a new allocation and the old one is zeroed as it drops (a `Vec`'s own growth
-/// frees the old allocation as it was).
-fn append_zeroizing(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+/// THE ONE WIPE-ON-GROW RULE for a buffer of this door's own that may hold credential bytes (the
+/// request message `emit` collects, the accepted side's hand-over copy, a held body): append
+/// `bytes` to `buf`, never leaving a copy of what it held behind. Where it must grow, the bytes
+/// move to a new allocation (at least double the old) and the one outgrown is zeroed before it is
+/// freed (a `Vec`'s own growth frees the old allocation as it was).
+pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     let need = buf.len().saturating_add(bytes.len());
     if need > buf.capacity() {
-        let mut grown = Zeroizing::new(Vec::with_capacity(need.max(buf.capacity() * 2)));
+        let mut grown = Vec::with_capacity(need.max(buf.capacity().saturating_mul(2)));
         grown.extend_from_slice(buf);
+        zeroize::Zeroize::zeroize(buf);
         *buf = grown;
     }
     buf.extend_from_slice(bytes);

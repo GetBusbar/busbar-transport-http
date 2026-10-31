@@ -56,7 +56,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::server::conn::auto;
 use zeroize::Zeroize;
 
-use super::engine::{Failure, Tasks, HEAD_MAX_BYTES};
+use super::engine::{extend_wiped, Failure, Tasks, HEAD_MAX_BYTES};
 use super::guest::{self, Line, Matched};
 use super::hyper_io::{field_block, HeadWords, HostIo, Owed, Piece};
 
@@ -1465,20 +1465,6 @@ impl Accepted {
         a.body = None;
         did.moved = true;
     }
-}
-
-/// Append `bytes` to `buf`, a buffer of the transport's own that may hold credential bytes: when
-/// they do not fit, the bytes move to a new allocation and the one outgrown is zeroised before it
-/// is freed, so no copy is freed unzeroised.
-fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
-    if buf.capacity() - buf.len() < bytes.len() {
-        let want = (buf.len() + bytes.len()).max(buf.capacity().saturating_mul(2));
-        let mut grown = Vec::with_capacity(want);
-        grown.extend_from_slice(buf);
-        buf.zeroize();
-        *buf = grown;
-    }
-    buf.extend_from_slice(bytes);
 }
 
 /// THE REQUEST BODY AN ANSWER ENDED BEFORE: once the host's answer on `a`'s stream is
