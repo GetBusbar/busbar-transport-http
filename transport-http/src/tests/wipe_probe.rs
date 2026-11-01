@@ -309,3 +309,76 @@ fn a_live_payload_has_no_deallocation_receipt() {
     );
     drop(payload);
 }
+
+/// The actual Encode slot must release its normalized target on both success and every later
+/// refusal path. Caller-owned input/output are deliberately outside the registered payloads.
+#[test]
+fn encode_keeps_target_wiping_custody_on_success_short_sink_and_invalid_fields() {
+    use busbar_contract::abi::mechanism::call::{AbiStr, Field, Outcome};
+    use busbar_contract::abi::transport::{slot, EncodeIn, FramerOut, Ops};
+    let target = format!(
+        "/credential-{}/../target?key={}",
+        " ".repeat(1024),
+        "target-secret".repeat(100)
+    );
+    for (capacity, invalid_field) in [(16_384, false), (0, false), (16_384, true)] {
+        let mut wire = vec![0_u8; capacity];
+        let field = Field {
+            name: AbiStr {
+                ptr: b"bad:name".as_ptr(),
+                len: 8,
+            },
+            value: AbiStr {
+                ptr: b"value".as_ptr(),
+                len: 5,
+            },
+        };
+        // SAFETY: these are plain C ABI records; all zero fields are valid absent values. The
+        // target, optional field and initialized output storage stay live across the slot call.
+        let (mut input, mut output): (EncodeIn, FramerOut) = unsafe { std::mem::zeroed() };
+        input.head.size = std::mem::size_of::<EncodeIn>() as u32;
+        input.head.op = slot::ENCODE;
+        output.head.size = std::mem::size_of::<FramerOut>() as u32;
+        input.method = AbiStr {
+            ptr: b"GET".as_ptr(),
+            len: 3,
+        };
+        input.target = AbiStr {
+            ptr: target.as_ptr(),
+            len: target.len(),
+        };
+        if invalid_field {
+            input.fields = std::ptr::from_ref(&field);
+            input.fields_len = 1;
+        }
+        input.sink.wire = wire.as_mut_ptr();
+        input.sink.wire_cap = wire.len();
+        // SAFETY: the linked door and its ops are static ABI records owned by this crate.
+        let ops = unsafe { &*(*crate::door::door()).ops().cast::<Ops>() };
+        let probe = Probe::start();
+        let result = ops.encode.expect("Encode is served")(
+            std::ptr::null_mut(),
+            std::ptr::from_ref(&input).cast(),
+            std::ptr::from_mut(&mut output).cast(),
+        )
+        .outcome();
+        assert_eq!(
+            result,
+            if capacity != 0 && !invalid_field {
+                Outcome::Ready
+            } else {
+                Outcome::Failed
+            }
+        );
+        if result == Outcome::Ready {
+            assert!(wire[..output.yielded.wire_len as usize]
+                .windows(13)
+                .any(|bytes| bytes == b"target-secret"));
+        } else {
+            assert_eq!(output.yielded.wire_len, 0);
+        }
+        probe
+            .finish()
+            .assert_wiped_on_linux(&["target filtered", "target path", "target encoded"]);
+    }
+}

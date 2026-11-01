@@ -876,12 +876,12 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
         .iter()
         .filter(|g| g.flags & PIECE_STREAM_FAILED != 0)
         .collect();
+    assert_eq!(failed.len(), 1, "one stream failed");
     println!(
         "PROOF {label}: stream {} failed alone: {:?}",
         failed[0].stream,
         String::from_utf8_lossy(&failed[0].bytes)
     );
-    assert_eq!(failed.len(), 1, "one stream failed");
     assert_eq!(failed[0].stream, 1);
     assert_eq!(
         failed[0].bytes,
@@ -930,13 +930,48 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
             + 2;
         frames.drain(at..end);
     }
-    let out = (host.wire_log.clone(), frames);
+    let out = (stable_h2_wire(&host.wire_log), frames);
     host.close();
     out
 }
 
+/// Compare every request and connection-setup byte while allowing PING and WINDOW_UPDATE
+/// scheduling to vary with the server's read/ACK timing. No application frame is removed.
+fn stable_h2_wire(wire: &[u8]) -> Vec<u8> {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    assert!(
+        wire.starts_with(PREFACE),
+        "an h2 exchange starts with its preface"
+    );
+    let mut stable = PREFACE.to_vec();
+    let mut at = PREFACE.len();
+    while at < wire.len() {
+        assert!(wire.len() - at >= 9, "a complete frame header is retained");
+        let len = (usize::from(wire[at]) << 16)
+            | (usize::from(wire[at + 1]) << 8)
+            | usize::from(wire[at + 2]);
+        let end = at + 9 + len;
+        assert!(end <= wire.len(), "a complete frame payload is retained");
+        match wire[at + 3] {
+            6 => {
+                assert_eq!(len, 8, "a PING is eight bytes");
+                assert_eq!(
+                    &wire[at + 5..at + 9],
+                    &[0; 4],
+                    "a PING is connection-scoped"
+                );
+            }
+            8 => assert_eq!(len, 4, "a WINDOW_UPDATE is four bytes"),
+            _ => stable.extend_from_slice(&wire[at..end]),
+        }
+        at = end;
+    }
+    stable
+}
+
 /// The re-call rule's check: an exchange collected through a sink so small that every op is
-/// re-called must be the SAME bytes as one collected through a roomy sink. A framer that answered
+/// re-called must preserve the SAME request/response bytes as a roomy sink. Timing-dependent
+/// HTTP/2 PING/WINDOW_UPDATE frames are checked separately from that byte comparison. A framer that answered
 /// anything twice on a re-call, or dropped anything, differs.
 fn recall_continues(tight: &(Vec<u8>, Vec<u8>), roomy: &(Vec<u8>, Vec<u8>)) -> Result<(), String> {
     if tight.0 != roomy.0 {
@@ -1104,6 +1139,92 @@ struct AcceptHost {
 }
 
 impl AcceptHost {
+    fn begin_policy_again(&mut self, policy: &[u8], flags: u32) -> Outcome {
+        let mut i: BeginIn = z();
+        i.head.ticket = self.ticket;
+        i.head.flags = flags;
+        i.head.extensions = Blob {
+            ptr: policy.as_ptr(),
+            len: policy.len(),
+            fmt: BLOB_OCTETS,
+            flags: 0,
+        };
+        i.side = SIDE_ACCEPT;
+        i.scheme = SCHEME_PLAIN;
+        i.lines = self.lines.as_ptr();
+        i.lines_len = self.lines.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let result = call(self.ops.begin, self.inst, &mut i, &mut o, slot::BEGIN);
+        if result == Outcome::Ready {
+            self.framing = o.framing;
+        }
+        self.take(result, &o)
+    }
+
+    fn ingest_policy(
+        &mut self,
+        bytes: &[u8],
+        policy: &[u8],
+        flags: u32,
+    ) -> (
+        Outcome,
+        Option<busbar_contract::abi::transport::guest_policy::Open>,
+    ) {
+        use busbar_contract::abi::{
+            mechanism::{extensions, lifecycle::ReleaseIn},
+            transport::guest_policy,
+        };
+        let mut i: IngestIn = z();
+        i.head.ticket = self.ticket;
+        i.head.flags = flags;
+        i.head.extensions = Blob {
+            ptr: policy.as_ptr(),
+            len: policy.len(),
+            fmt: BLOB_OCTETS,
+            flags: 0,
+        };
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let result = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        // SAFETY: the answer lease is still live; copy before releasing its bytes below.
+        let extension = unsafe { bytes_of(o.head.extensions.ptr, o.head.extensions.len) };
+        let request = extensions::get(&extension, guest_policy::EXT_GUEST_OPEN)
+            .map(|v| guest_policy::Open::decode(v).unwrap());
+        if request.is_some() {
+            assert_eq!(result, Outcome::Ready);
+            assert_ne!(o.yielded.flags & YIELD_MORE, 0);
+            assert_eq!(
+                (
+                    o.yielded.wire_len,
+                    o.yielded.frame_len,
+                    o.yielded.pieces_len
+                ),
+                (0, 0, 0)
+            );
+        }
+        let result = self.take(result, &o);
+        if o.head.lease != 0 {
+            let mut release: ReleaseIn = z();
+            release.lease = o.head.lease;
+            let mut out: OutHead = z();
+            assert_eq!(
+                call(
+                    self.ops.head.release,
+                    self.inst,
+                    &mut release,
+                    &mut out,
+                    life::RELEASE
+                ),
+                Outcome::Ready
+            );
+        }
+        (result, request)
+    }
+
     /// An accepted connection on a listener whose one line takes every `POST /v1/messages` with
     /// auth `none`, its hand-in answered CONTINUE: the request goes up as before.
     fn open(ops: &'static Ops) -> Self {
@@ -1129,9 +1250,22 @@ impl AcceptHost {
         facts: fn(&mut ConnFacts),
         scheme: u8,
     ) -> Self {
+        let (host, result) = Self::open_on_policy(ops, lines, script, facts, scheme, &[]);
+        assert_eq!(result, Outcome::Ready, "begin on the accepted side");
+        host
+    }
+
+    fn open_on_policy(
+        ops: &'static Ops,
+        lines: Vec<LineEntry>,
+        script: Script,
+        facts: fn(&mut ConnFacts),
+        scheme: u8,
+        policy: &[u8],
+    ) -> (Self, Outcome) {
         let state = facts;
         let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
-        SCRIPTS.lock().expect("scripts").insert(ctx, script);
+        scripts().insert(ctx, script);
         let tables = HostTables {
             size: size_of::<HostTables>() as u32,
             _reserved: 0,
@@ -1176,6 +1310,13 @@ impl AcceptHost {
         facts.size = size_of::<ConnFacts>() as u32;
         state(&mut facts);
         let mut i: BeginIn = z();
+        i.head.ticket = h.ticket;
+        i.head.extensions = Blob {
+            ptr: policy.as_ptr(),
+            len: policy.len(),
+            fmt: BLOB_OCTETS,
+            flags: 0,
+        };
         i.side = SIDE_ACCEPT;
         // The listener's scheme, as the host states it (busbar step 2, `BeginIn::scheme`).
         i.scheme = scheme;
@@ -1186,8 +1327,8 @@ impl AcceptHost {
         let mut o: FramerOut = z();
         let r = call(ops.begin, h.inst, &mut i, &mut o, slot::BEGIN);
         h.framing = o.framing;
-        assert_eq!(h.take(r, &o), Outcome::Ready, "begin on the accepted side");
-        h
+        let r = h.take(r, &o);
+        (h, r)
     }
 
     fn sink(&mut self) -> FramerSink {
@@ -1372,17 +1513,17 @@ impl AcceptHost {
 
     /// The tickets the door's `auth.call`s were issued under, in order.
     fn tickets(&self) -> Vec<Ticket> {
-        SCRIPTS.lock().expect("scripts")[&self.ctx].tickets.clone()
+        scripts()[&self.ctx].tickets.clone()
     }
 
     /// The completion sequence numbers the door's `auth.call`s were issued under, in order.
     fn seqs(&self) -> Vec<u32> {
-        SCRIPTS.lock().expect("scripts")[&self.ctx].seqs.clone()
+        scripts()[&self.ctx].seqs.clone()
     }
 
     /// Every call the door made on the auth handle, in order.
     fn asked(&self) -> Vec<Asked> {
-        SCRIPTS.lock().expect("scripts")[&self.ctx].asked.clone()
+        scripts()[&self.ctx].asked.clone()
     }
 
     /// The request head pieces that went up.
@@ -1394,7 +1535,7 @@ impl AcceptHost {
         let mut i: InHead = z();
         let mut o: OutHead = z();
         call(self.ops.head.close, self.inst, &mut i, &mut o, life::CLOSE);
-        SCRIPTS.lock().expect("scripts").remove(&self.ctx);
+        scripts().remove(&self.ctx);
     }
 }
 
@@ -1587,6 +1728,8 @@ struct Script {
     fails: Fails,
     /// How many `auth.call`s answer NOT-READY (PENDING) before the script answers.
     pend: usize,
+    /// One selected stream's next auth call pends, after its siblings may have handed in.
+    pend_stream: Option<u64>,
     /// Each `auth.call`'s completion sequence number.
     seqs: Vec<u32>,
     /// Each `auth.call`'s ticket.
@@ -1617,6 +1760,14 @@ const MINTED: UnitRef = UnitRef { id: 41, mac: 42 };
 /// Each connection's script, by its host context.
 static SCRIPTS: Mutex<BTreeMap<u64, Script>> = Mutex::new(BTreeMap::new());
 static NEXT_CTX: AtomicU64 = AtomicU64::new(1);
+
+// A failing test may poison the shared registry while holding its own context. Other contexts
+// retain their independent scripts and must still report their original results.
+fn scripts() -> std::sync::MutexGuard<'static, BTreeMap<u64, Script>> {
+    SCRIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The host services table: the auth handle's three slots, scripted; every other unserved.
 static SLOTS: LazyLock<HostSlots> = LazyLock::new(|| {
@@ -1719,14 +1870,14 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
             &mut o,
             life::CANCEL,
         );
-        if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&ctx.handle) {
+        if let Some(s) = scripts().get_mut(&ctx.handle) {
             s.reentered = Some((r, o.disposition));
         }
     }
     // SAFETY: the SDK wrapper hands a live `AuthCallIn`, its buffers and a live `out`.
     unsafe {
         let i = input.cast::<AuthCallIn>().read_unaligned();
-        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let mut scripts = scripts();
         let script = scripts.get_mut(&ctx.handle).expect("a script");
         script.asked.push(Asked::Auth {
             point: i.point,
@@ -1747,6 +1898,10 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
         }
         if script.pend > 0 {
             script.pend -= 1;
+            return outcome(out, Outcome::Pending);
+        }
+        if script.pend_stream == Some(i.stream) {
+            script.pend_stream = None;
             return outcome(out, Outcome::Pending);
         }
         let (flow, names) = script
@@ -1792,7 +1947,7 @@ extern "C" fn unit_hand_in(ctx: HostCtx, input: *const c_void, out: *mut Service
     // SAFETY: the SDK wrapper hands a live `UnitHandInIn` and a live `out`.
     unsafe {
         let i = input.cast::<UnitHandInIn>().read_unaligned();
-        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let mut scripts = scripts();
         let script = scripts.get_mut(&ctx.handle).expect("a script");
         script.asked.push(Asked::HandIn {
             auth: i.auth.id,
@@ -1849,7 +2004,7 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
     // SAFETY: the SDK wrapper hands a live `UnitRefuseIn` and a live `out`.
     unsafe {
         let i = input.cast::<UnitRefuseIn>().read_unaligned();
-        let mut scripts = SCRIPTS.lock().expect("scripts");
+        let mut scripts = scripts();
         let script = scripts.get_mut(&ctx.handle).expect("a script");
         script.asked.push(Asked::Refuse {
             unit: i.unit.id,
@@ -2493,11 +2648,11 @@ fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
         vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
         Script::default(),
     );
-    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+    if let Some(s) = scripts().get_mut(&h.ctx) {
         s.reenter = Some((ops, h.inst as usize));
     }
     assert_eq!(h.ingest(POST_HELLO), Outcome::Ready, "{label}");
-    let reentered = SCRIPTS.lock().expect("scripts")[&h.ctx].reentered;
+    let reentered = scripts()[&h.ctx].reentered;
     let (r, disposition) = reentered.expect("the cancel crossed while the framing was held");
     assert_eq!(
         r,
@@ -2614,7 +2769,7 @@ fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
     }
     // A's parked call is let go, and its next call pends: on the emit that fills B's queue.
     assert_eq!(h.cancel(parked), CANCEL_PARTIAL, "{label}");
-    if let Some(s) = SCRIPTS.lock().expect("scripts").get_mut(&h.ctx) {
+    if let Some(s) = scripts().get_mut(&h.ctx) {
         s.pend = 1;
     }
     h.ticket = Ticket {
@@ -3057,7 +3212,7 @@ fn refusal_carries_the_request(label: &str, ops: &'static Ops) {
             Script::default(),
             req,
         );
-        let refused = SCRIPTS.lock().expect("scripts")[&h.ctx].refused.clone();
+        let refused = scripts()[&h.ctx].refused.clone();
         let [view] = &refused[..] else {
             panic!("{label}: one refusal: {refused:?}");
         };
@@ -3175,13 +3330,26 @@ fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
     );
     // The body the host emits for it is never written; whether the op takes it or answers the
     // stream over is hyper's, not the wire's.
-    let _ = h.emit(1, b"hello", true, 0);
+    let outcome = h.emit(1, b"hello", true, 0);
+    assert!(
+        matches!(outcome, Outcome::Ready | Outcome::Failed),
+        "{label}: a HEAD body completes or its already-ended stream is refused: {outcome:?}"
+    );
     let wire = String::from_utf8_lossy(&undated(h.out.clone())).into_owned();
     println!("PROOF {label}: head answer {wire:?}");
     assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"), "{label}: {wire:?}");
     assert!(
         wire.contains("content-type: text/plain\r\n"),
         "{label}: {wire:?}"
+    );
+    assert_eq!(
+        wire.matches("content-length: 5\r\n").count(),
+        1,
+        "{label}: HEAD keeps the representation length: {wire:?}"
+    );
+    assert!(
+        !wire.to_ascii_lowercase().contains("transfer-encoding:"),
+        "{label}: HEAD has no body transfer coding: {wire:?}"
     );
     assert!(
         wire.ends_with("\r\n\r\n"),
@@ -3537,6 +3705,440 @@ fn both(cell: fn(&str, &'static Ops)) {
     }
 }
 
+fn policy_blob(generation: u64, id: u32, points: u32, limit: u64) -> Vec<u8> {
+    use busbar_contract::abi::{mechanism::extensions, transport::guest_policy};
+    let value = guest_policy::encode(
+        7,
+        generation,
+        &[guest_policy::GuestLine {
+            line: id,
+            points,
+            auth: AuthRef {
+                id: 100 + u64::from(id),
+                mac: 7,
+            },
+            body_limit: limit,
+            methods: METHOD_ANY,
+            path_form: PATH_EXACT,
+            path: "/v1/messages".into(),
+            fields: Vec::new(),
+            rung: 0,
+        }],
+    )
+    .unwrap();
+    extensions::encode(&[(guest_policy::EXT_GUEST_POLICY, &value)])
+}
+
+fn policy_before_auth(label: &str, ops: &'static Ops) {
+    policy_before_auth_points(label, ops, POINT_HEAD);
+}
+
+fn policy_before_auth_points(label: &str, ops: &'static Ops, points: u32) {
+    let initial = policy_blob(1, 1, 0, 0);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(1, 0, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+        |_| {},
+        SCHEME_PLAIN,
+        &initial,
+    );
+    assert_eq!(began, Outcome::Ready, "{label}");
+    let (result, request) = h.ingest_policy(POST_HELLO, &[], 0);
+    if request.is_none() {
+        h.close();
+        panic!("{label}: a new stream was processed without asking for its policy");
+    }
+    assert_eq!(result, Outcome::Ready, "{label}");
+    let request = request.unwrap();
+    assert_eq!((request.stream, request.known_generation), (1, 1));
+    assert!(
+        h.asked().is_empty(),
+        "{label}: no match/auth before the loan"
+    );
+    assert_eq!(h.heads_up(), 0);
+    let reply = policy_blob(2, 9, points, 0);
+    assert_eq!(
+        h.ingest_policy(POST_HELLO, &reply, 0).0,
+        Outcome::Pending,
+        "{label}"
+    );
+    assert_eq!(h.heads_up(), 0);
+    assert_eq!(
+        h.ingest_policy(POST_HELLO, &reply, FLAG_RESUME).0,
+        Outcome::Ready,
+        "{label}"
+    );
+    let asked = h.asked();
+    let auth_points: Vec<_> = asked
+        .iter()
+        .filter_map(|asked| match asked {
+            Asked::Auth {
+                auth: 109, point, ..
+            } => Some(*point),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        auth_points,
+        if points & POINT_PEER != 0 {
+            vec![POINT_PEER, POINT_PEER, POINT_HEAD]
+        } else {
+            vec![POINT_HEAD, POINT_HEAD]
+        },
+        "{label}: {asked:?}"
+    );
+    assert!(
+        matches!(
+            asked.last(),
+            Some(Asked::HandIn {
+                auth: 109,
+                line: 9,
+                ..
+            })
+        ),
+        "{label}: {asked:?}"
+    );
+    assert_eq!(
+        h.seqs()[0],
+        h.seqs()[1],
+        "{label}: resume retains completion identity"
+    );
+    assert_eq!(h.heads_up(), 1);
+    assert_eq!(
+        h.cancel(h.ticket),
+        CANCEL_NOTHING_MOVED,
+        "{label}: a later cancellation does not revoke a published request"
+    );
+    h.close();
+}
+
+fn opening_peer_pending(label: &str, ops: &'static Ops) {
+    let policy = policy_blob(1, 6, POINT_PEER | POINT_HEAD, 0);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(
+            6,
+            POINT_PEER | POINT_HEAD,
+            METHOD_POST,
+            "/v1/messages",
+            0,
+        )],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+        |_| {},
+        SCHEME_PLAIN,
+        &policy,
+    );
+    if began != Outcome::Pending {
+        h.close();
+        assert_eq!(
+            began,
+            Outcome::Pending,
+            "{label}: Peer must run before Begin READY"
+        );
+        return;
+    }
+    assert_eq!(
+        h.framing, 0,
+        "{label}: no token published before peer completion"
+    );
+    assert!(matches!(
+        &h.asked()[..],
+        [Asked::Auth {
+            point: POINT_PEER,
+            ..
+        }]
+    ));
+    assert_eq!(
+        h.begin_policy_again(&policy, FLAG_RESUME),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_ne!(h.framing, 0);
+    assert_eq!(
+        h.seqs(),
+        [1, 1],
+        "{label}: resume reuses the provisional framing and peer call"
+    );
+    h.close();
+}
+
+fn opening_peer_cancel(label: &str, ops: &'static Ops) {
+    let policy = policy_blob(1, 6, POINT_PEER, 0);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(6, POINT_PEER, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 2,
+            ..Script::default()
+        },
+        |_| {},
+        SCHEME_PLAIN,
+        &policy,
+    );
+    if began != Outcome::Pending {
+        h.close();
+        assert_eq!(
+            began,
+            Outcome::Pending,
+            "{label}: Peer must run during Begin"
+        );
+        return;
+    }
+    assert_eq!(h.cancel(h.ticket), CANCEL_PARTIAL, "{label}");
+    assert_eq!(
+        h.begin_policy_again(&policy, 0),
+        Outcome::Pending,
+        "{label}: cancellation removed the provisional opening"
+    );
+    assert_eq!(
+        h.begin_policy_again(&policy, FLAG_RESUME),
+        Outcome::Ready,
+        "{label}"
+    );
+    assert_eq!(
+        h.seqs(),
+        [1, 1, 1],
+        "{label}: a fresh framing after cancel then its resume"
+    );
+    h.close();
+}
+
+fn multiplexed_pending_policies(label: &str, ops: &'static Ops) {
+    let initial = policy_blob(1, 1, 0, 0);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(1, 0, METHOD_ANY, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+        |_| {},
+        SCHEME_PLAIN,
+        &initial,
+    );
+    assert_eq!(began, Outcome::Ready);
+    let bytes = h2_requests(&[(1, "/v1/messages"), (3, "/v1/messages")]);
+    let mut request = h.ingest_policy(&bytes, &[], 0).1;
+    if request.is_none() {
+        request = h.ingest_policy(&[], &[], 0).1;
+    }
+    if request.is_none() {
+        h.close();
+        panic!("{label}: multiplexed streams did not request host policy");
+    }
+    assert_eq!(request.unwrap().stream, 1);
+    let old = policy_blob(2, 9, POINT_HEAD, 0);
+    assert_eq!(h.ingest_policy(&[], &old, 0).0, Outcome::Pending);
+    let first_ticket = h.ticket;
+    h.ticket.slot += 1;
+    let (result, second) = h.ingest_policy(&[], &[], 0);
+    assert_eq!(result, Outcome::Ready);
+    assert_eq!(second.unwrap().stream, 2);
+    let new = policy_blob(3, 10, POINT_HEAD, 0);
+    assert_eq!(h.ingest_policy(&[], &new, 0).0, Outcome::Ready);
+    assert_eq!(
+        h.heads_up(),
+        1,
+        "{label}: the sibling progresses while the first auth is pending"
+    );
+    h.ticket = first_ticket;
+    assert_eq!(h.ingest_policy(&[], &old, FLAG_RESUME).0, Outcome::Ready);
+    assert!(
+        matches!(
+            &h.asked()[..],
+            [
+                Asked::Auth { auth: 109, .. },
+                Asked::Auth { auth: 110, .. },
+                Asked::HandIn {
+                    auth: 110,
+                    line: 10,
+                    ..
+                },
+                Asked::Auth { auth: 109, .. },
+                Asked::HandIn {
+                    auth: 109,
+                    line: 9,
+                    ..
+                },
+            ]
+        ),
+        "{label}: {:?}",
+        h.asked()
+    );
+    assert_eq!(h.heads_up(), 2);
+    h.close();
+}
+
+fn cancel_unpublished_heads(label: &str, ops: &'static Ops) {
+    let policy = policy_blob(2, 9, POINT_HEAD_BODY, 8);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(9, POINT_HEAD_BODY, METHOD_ANY, "/v1/messages", 8)],
+        Script {
+            pend_stream: Some(2),
+            ..Script::default()
+        },
+        |_| {},
+        SCHEME_PLAIN,
+        &policy,
+    );
+    assert_eq!(began, Outcome::Ready);
+    let mut bytes = h2_requests(&[(1, "/v1/messages"), (3, "/v1/messages")]);
+    // These two decoded heads have bodies still to come: leave END_STREAM unset.
+    let mut at = 24;
+    while at + 9 <= bytes.len() {
+        let len = (usize::from(bytes[at]) << 16)
+            | (usize::from(bytes[at + 1]) << 8)
+            | usize::from(bytes[at + 2]);
+        if bytes[at + 3] == 1 {
+            bytes[at + 4] &= !1;
+        }
+        at += 9 + len;
+    }
+    let mut request = h.ingest_policy(&bytes, &[], 0).1;
+    if request.is_none() {
+        request = h.ingest_policy(&[], &[], 0).1;
+    }
+    if request.is_none() {
+        h.close();
+        panic!("{label}: a gated body was processed without its host policy");
+    }
+    assert_eq!(request.unwrap().stream, 1);
+    assert_eq!(h.ingest_policy(&[], &policy, 0).1.unwrap().stream, 2);
+    assert_eq!(h.ingest_policy(&[], &policy, 0).0, Outcome::Ready);
+    assert!(h.asked().is_empty());
+    h.ticket.slot += 1;
+    let mut body = h2_frame(0, 1, 1, b"aa");
+    body.extend(h2_frame(0, 1, 3, b"bb"));
+    assert_eq!(h.ingest_policy(&body, &[], 0).0, Outcome::Pending);
+    assert_eq!(
+        h.heads_up(),
+        0,
+        "{label}: PENDING did not publish the earlier sibling's queued head"
+    );
+    assert!(matches!(
+        &h.asked()[..],
+        [Asked::Auth { .. }, Asked::HandIn { .. }, Asked::Auth { .. }]
+    ));
+    assert_eq!(h.cancel(h.ticket), CANCEL_PARTIAL);
+    assert_eq!(h.ingest_policy(&[], &[], 0).0, Outcome::Ready);
+    assert_eq!(
+        h.heads_up(),
+        0,
+        "{label}: a cancelled operation cannot later publish its queued admission"
+    );
+    h.close();
+}
+
+fn multiplex_policy_progress(label: &str, ops: &'static Ops) {
+    use busbar_contract::abi::{mechanism::extensions, transport::guest_policy};
+    let initial = policy_blob(1, 1, 0, 0);
+    let (mut h, began) = AcceptHost::open_on_policy(
+        ops,
+        vec![line(1, 0, METHOD_ANY, "/v1/messages", 0)],
+        Script::default(),
+        |_| {},
+        SCHEME_PLAIN,
+        &initial,
+    );
+    assert_eq!(began, Outcome::Ready);
+    let requests: Vec<_> = (0..65).map(|n| (2 * n + 1, "/v1/messages")).collect();
+    let bytes = h2_requests(&requests);
+    let mut input = bytes.as_slice();
+    let mut reply = Vec::new();
+    let mut opened = std::collections::BTreeSet::new();
+    let mut previous_heads = 0;
+    let mut previous_wire = 0;
+    for _ in 0..(requests.len() * 4) {
+        let (result, request) = h.ingest_policy(input, &reply, 0);
+        assert_eq!(result, Outcome::Ready, "{label}");
+        input = &[];
+        reply.clear();
+        if let Some(request) = request {
+            assert!(
+                opened.insert(request.stream),
+                "{label}: each stream opens once"
+            );
+            if opened.len() > 1 {
+                assert!(
+                    h.heads_up() > previous_heads || h.out.len() > previous_wire,
+                    "{label}: flush progress between fresh policy requests"
+                );
+            }
+            previous_heads = h.heads_up();
+            previous_wire = h.out.len();
+            reply = if request.known_generation == 2 {
+                let ack = guest_policy::Identity {
+                    listener: 7,
+                    generation: 2,
+                }
+                .encode()
+                .unwrap();
+                extensions::encode(&[(guest_policy::EXT_GUEST_CURRENT, &ack)])
+            } else {
+                policy_blob(2, 9, 0, 0)
+            };
+        }
+        if h.heads_up() == requests.len() {
+            break;
+        }
+    }
+    let heads = h.heads_up();
+    h.close();
+    assert_eq!(
+        opened.len(),
+        requests.len(),
+        "{label}: every stream obtains a loan"
+    );
+    assert_eq!(
+        heads,
+        requests.len(),
+        "{label}: all multiplexed requests progress"
+    );
+}
+
+#[test]
+fn a_stream_gets_its_policy_before_auth_linked_and_dropped_in() {
+    both(policy_before_auth);
+}
+
+#[test]
+fn a_reloaded_policy_completes_its_peer_verdict_before_head_auth_linked_and_dropped_in() {
+    both(|label, ops| policy_before_auth_points(label, ops, POINT_PEER | POINT_HEAD));
+}
+
+#[test]
+fn multiplexed_pending_streams_keep_distinct_policy_generations_linked_and_dropped_in() {
+    both(multiplexed_pending_policies);
+}
+
+#[test]
+fn cancelling_an_auth_operation_discards_its_unpublished_sibling_heads_linked_and_dropped_in() {
+    both(cancel_unpublished_heads);
+}
+
+#[test]
+fn peer_checks_run_during_begin_and_resume_the_same_opening_linked_and_dropped_in() {
+    both(opening_peer_pending);
+}
+
+#[test]
+fn cancelling_a_pending_begin_drops_its_provisional_framing_linked_and_dropped_in() {
+    both(opening_peer_cancel);
+}
+
+#[test]
+fn multiplexed_streams_flush_progress_between_policy_requests_linked_and_dropped_in() {
+    both(multiplex_policy_progress);
+}
+
 #[test]
 fn an_unrouted_request_is_the_kernels_no_route_refusal_and_nothing_goes_up() {
     both(no_route);
@@ -3773,4 +4375,173 @@ fn pump_until_returns_the_actual_framing_failure() {
             "{label}: propagate the real op failure"
         );
     });
+}
+
+impl AcceptHost {
+    /// Copy reply metadata while the actual door's output lease is live, on PENDING as well as
+    /// READY. The literal existing extension envelope keeps this regression usable before the
+    /// SDK counter helper and adapter fix are published.
+    fn ingest_retained(&mut self, bytes: &[u8], flags: u32) -> (Outcome, Option<u64>, bool) {
+        let mut i: IngestIn = z();
+        i.head.ticket = self.ticket;
+        i.head.flags = flags;
+        i.framing = self.framing;
+        i.bytes = bytes.as_ptr();
+        i.len = bytes.len();
+        i.sink = self.sink();
+        let mut o: FramerOut = z();
+        let result = call(self.ops.ingest, self.inst, &mut i, &mut o, slot::INGEST);
+        // SAFETY: this door answer's lease has not been released; copy its reported bytes now.
+        let ext = unsafe { bytes_of(o.head.extensions.ptr, o.head.extensions.len) };
+        let retained =
+            busbar_contract::abi::mechanism::extensions::get(&ext, "framer.retained_input")
+                .map(|v| u64::from_le_bytes(v.try_into().expect("one copied numeric count")));
+        let more = o.yielded.flags & YIELD_MORE != 0;
+        let result = self.take(result, &o);
+        if o.head.lease != 0 {
+            let mut release: busbar_contract::abi::mechanism::lifecycle::ReleaseIn = z();
+            release.lease = o.head.lease;
+            let mut out: OutHead = z();
+            assert_eq!(
+                call(
+                    self.ops.head.release,
+                    self.inst,
+                    &mut release,
+                    &mut out,
+                    life::RELEASE
+                ),
+                Outcome::Ready
+            );
+        }
+        (result, retained, more)
+    }
+
+    fn drain_retained(&mut self, mut answer: (Outcome, Option<u64>, bool)) -> u64 {
+        for _ in 0..256 {
+            assert_eq!(answer.0, Outcome::Ready);
+            if !answer.2 {
+                return answer.1.expect("current retained-input report");
+            }
+            answer = self.ingest_retained(&[], 0);
+        }
+        panic!("finite buffered output must drain");
+    }
+}
+
+fn pending_input_reports_pressure_and_resumes(label: &str, ops: &'static Ops) {
+    // The connector's existing receive window and read chunk, not a new adapter body limit.
+    const WINDOW: usize = 1024 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    let body = vec![b'x'; 2 * WINDOW];
+    let header = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(3, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script {
+            pend: 1,
+            ..Script::default()
+        },
+    );
+    let first = h.ingest_retained(header.as_bytes(), 0);
+    assert_eq!(first.0, Outcome::Pending, "{label}");
+    assert!(
+        first.1.is_some(),
+        "{label}: PENDING must report retained input too"
+    );
+    let pending = h.ticket;
+    h.ticket.slot += 1;
+    let mut sent = 0;
+    let pressure = loop {
+        assert!(
+            sent < body.len(),
+            "{label}: pending body never exerted receive pressure"
+        );
+        let answer = h.ingest_retained(&body[sent..sent + CHUNK], 0);
+        sent += CHUNK;
+        assert_eq!(answer.0, Outcome::Ready);
+        assert!(!answer.2);
+        let retained = answer.1.expect("fresh ingest reports what remains private");
+        assert!(retained <= sent as u64, "input is not counted twice");
+        if retained >= WINDOW as u64 {
+            break retained;
+        }
+    };
+    assert!(pressure < (WINDOW + CHUNK) as u64);
+    assert_eq!(h.heads_up(), 0, "auth still prevents publication");
+    h.ticket = pending;
+    let resumed = h.ingest_retained(&[], FLAG_RESUME);
+    assert_eq!(
+        h.drain_retained(resumed),
+        0,
+        "{label}: all yielded bytes leave the private count"
+    );
+    for bytes in body[sent..].chunks(CHUNK) {
+        let answer = h.ingest_retained(bytes, 0);
+        assert_eq!(h.drain_retained(answer), 0);
+    }
+    assert_eq!(h.heads_up(), 1);
+    let actual: Vec<u8> = h
+        .got
+        .iter()
+        .filter(|g| g.2 & PIECE_FIELDS == 0)
+        .flat_map(|g| g.1.iter().copied())
+        .collect();
+    assert_eq!(
+        actual, body,
+        "{label}: resume preserves the complete body exactly once"
+    );
+    let seqs = h.seqs();
+    assert_eq!(seqs.len(), 2);
+    assert_eq!(
+        seqs[0], seqs[1],
+        "auth resumes the original completion handle"
+    );
+    h.close();
+}
+
+fn head_body_larger_than_receive_window_keeps_progress(label: &str, ops: &'static Ops) {
+    const WINDOW: usize = 1024 * 1024;
+    let body = vec![b'z'; WINDOW + 32 * 1024];
+    let header = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut h = AcceptHost::open_with(
+        ops,
+        vec![line(
+            3,
+            POINT_HEAD_BODY,
+            METHOD_POST,
+            "/v1/messages",
+            (2 * WINDOW) as u64,
+        )],
+        Script::default(),
+    );
+    let initial = h.ingest_retained(header.as_bytes(), 0);
+    assert_eq!(h.drain_retained(initial), 0);
+    for bytes in body.chunks(16 * 1024) {
+        let answer = h.ingest_retained(bytes, 0);
+        assert_eq!(
+            h.drain_retained(answer),
+            0,
+            "{label}: policy-bound body collection must keep accepting input"
+        );
+    }
+    assert!(h.asked().iter().any(|a| matches!(a,
+        Asked::Auth { point: POINT_HEAD_BODY, body: Some(bytes), .. } if bytes == &body)));
+    assert_eq!(h.heads_up(), 1);
+    h.close();
+}
+
+#[test]
+fn pending_auth_reports_receive_pressure_and_resumes_linked_and_dropped_in() {
+    both(pending_input_reports_pressure_and_resumes);
+}
+
+#[test]
+fn head_body_over_one_receive_window_completes_linked_and_dropped_in() {
+    both(head_body_larger_than_receive_window_keeps_progress);
 }

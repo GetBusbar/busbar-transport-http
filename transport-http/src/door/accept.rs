@@ -1815,7 +1815,10 @@ fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
     };
     out.push_back(head_piece(id, &parts));
     if !a.held.is_empty() {
-        out.push_back(Piece::data(id, Bytes::copy_from_slice(&a.held)));
+        let body = a.held.clone();
+        #[cfg(test)]
+        crate::wipe_probe::watch("admitted body", &body);
+        out.push_back(Piece::data(id, Bytes::from(body)));
         let_held_go(&mut a.held);
     }
     if a.held_whole {

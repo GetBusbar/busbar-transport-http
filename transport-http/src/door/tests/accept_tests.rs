@@ -1063,3 +1063,163 @@ fn switched_read_ahead_and_each_owned_detach_copy_are_wiped() {
     );
     report.assert_wiped_on_linux(&["detach read", "detach leftover", "detach taken"]);
 }
+
+#[test]
+fn a_host_refusal_is_not_reported_again_as_an_abandoned_request() {
+    for head_sent in [false, true] {
+        let mut a = accepted();
+        a.ingest(
+            b"POST /v1/messages HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\nprefix",
+            false,
+        );
+        run(&mut a, SEC);
+        let stream = up(&mut a).heads[0].0;
+        if head_sent {
+            a.emit(stream, b"content-type: text/plain\r\n", false, 200)
+                .unwrap();
+            run(&mut a, SEC);
+            a.refuse(Some(stream), b"", 0, true).unwrap();
+        } else {
+            a.refuse(
+                Some(stream),
+                b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n",
+                0,
+                false,
+            )
+            .unwrap();
+        }
+        run(&mut a, SEC);
+        // Finish the carrier too: this must not create a second host-visible end.
+        a.ingest(b"", true);
+        run(&mut a, SEC);
+        assert!(a.ended());
+        assert!(
+            !up(&mut a).failed,
+            "the host already owns this refusal's end"
+        );
+    }
+    let mut a = accepted();
+    a.ingest(
+        b"POST /v1/messages HTTP/1.1\r\nhost: test\r\ncontent-length: 100\r\n\r\nprefix",
+        false,
+    );
+    run(&mut a, SEC);
+    assert_eq!(up(&mut a).heads.len(), 1);
+    a.ingest(b"", true);
+    run(&mut a, SEC);
+    assert!(up(&mut a).failed, "a genuine peer abandonment still fails");
+    run(&mut a, SEC);
+    assert!(!up(&mut a).failed, "the peer abandonment is reported once");
+}
+
+#[test]
+fn a_partial_http2_preface_is_not_detached_as_an_http1_upgrade() {
+    for split in 1..H2_PREFACE.len() {
+        let mut a = accepted();
+        a.ingest(&H2_PREFACE[..split], false);
+        assert!(
+            a.detach().unwrap().is_none(),
+            "preface prefix length {split}"
+        );
+        assert!(!a.ended(), "an undecided protocol keeps its input");
+        a.ingest(&H2_PREFACE[split..], false);
+        assert_eq!(a.agreed(), offer_position(b"h2"));
+        assert!(
+            a.detach().unwrap().is_none(),
+            "the completed h2 connection stays here"
+        );
+    }
+    let mut a = accepted();
+    let request = b"POST / HTTP/1.1\r\nhost: test\r\nconnection: upgrade\r\nupgrade: other\r\n\r\n";
+    a.ingest(request, false);
+    assert_eq!(
+        a.detach()
+            .unwrap()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        request
+    );
+}
+
+#[test]
+fn dropping_an_answer_recovers_its_poisoned_queue_and_records_the_end() {
+    let queue = Arc::new(Mutex::new(ReplyQ::default()));
+    let poison = Arc::clone(&queue);
+    let _ = std::panic::catch_unwind(move || {
+        let _guard = poison.lock().unwrap();
+        panic!("the isolated test queue is poisoned");
+    });
+    drop(Reply(Arc::clone(&queue), None));
+    assert!(queue.lock().unwrap_or_else(PoisonError::into_inner).gone);
+}
+
+#[test]
+fn the_admitted_body_copy_keeps_wiping_custody_until_the_host_takes_it() {
+    struct BodyOpen;
+
+    impl Kernel for BodyOpen {
+        fn ticket(&self) -> Ticket {
+            OP_TICKET
+        }
+
+        fn auth_call(
+            &mut self,
+            _: u32,
+            _: AuthRef,
+            _: UnitRef,
+            _: u32,
+            _: u64,
+            _: &HeadViewArgs<'_>,
+            _: Option<&[u8]>,
+        ) -> Pend<AuthCalled> {
+            Poll::Ready(Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }, Vec::new())))
+        }
+
+        fn hand_in(
+            &mut self,
+            seq: u32,
+            auth: AuthRef,
+            unit: UnitRef,
+            line: u32,
+            stream: u64,
+            head: &HeadViewArgs<'_>,
+        ) -> Result<(u32, UnitRef), ServiceError> {
+            Open.hand_in(seq, auth, unit, line, stream, head)
+        }
+
+        fn refuse(
+            &mut self,
+            seq: u32,
+            unit: UnitRef,
+            cause: u32,
+            line: u32,
+            stream: u64,
+            head: &HeadViewArgs<'_>,
+        ) -> Result<RefusalCopy, ServiceError> {
+            Open.refuse(seq, unit, cause, line, stream, head)
+        }
+    }
+
+    let mut a = Accepted::accept(
+        SEC,
+        vec![Line::any_needing(
+            1,
+            busbar_contract::abi::auth::POINT_HEAD_BODY,
+            1024,
+        )],
+    );
+    let probe = crate::wipe_probe::Probe::start();
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 14\r\n\r\nrequest-secret",
+        false,
+    );
+    run_with(&mut a, SEC, &mut BodyOpen);
+    assert!(a
+        .pieces()
+        .iter()
+        .any(|piece| piece.bytes.as_ref() == b"request-secret"));
+    drop(a);
+    probe.finish().assert_wiped_on_linux(&["admitted body"]);
+}

@@ -90,15 +90,15 @@ fn open(p: &Plugin<Transport>) {
 /// One scripted exchange through the dispatcher: begin a dialled http/1.1 connection, encode one
 /// request. What comes back is the wire bytes the door rendered.
 fn script(p: &Plugin<Transport>) -> Vec<u8> {
-    let wire = vec![0_u8; 8192];
-    let frame = vec![0_u8; 8192];
-    let pieces: Vec<FramePiece> = vec![z(); 8];
-    let sink = || FramerSink {
-        wire: wire.as_ptr().cast_mut(),
+    let mut wire = vec![0_u8; 8192];
+    let mut frame = vec![0_u8; 8192];
+    let mut pieces: Vec<FramePiece> = vec![z(); 8];
+    let mut sink = || FramerSink {
+        wire: wire.as_mut_ptr(),
         wire_cap: wire.len(),
-        frame: frame.as_ptr().cast_mut(),
+        frame: frame.as_mut_ptr(),
         frame_cap: frame.len(),
-        pieces: pieces.as_ptr().cast_mut(),
+        pieces: pieces.as_mut_ptr(),
         pieces_cap: pieces.len(),
         now_monotonic_ns: 1,
         now_unix_ns: 1,
@@ -140,6 +140,15 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
             name: s("content-length"),
             value: s("7"),
         },
+        // The client defaults the host adds before auth, rather than at encode.
+        Field {
+            name: s("accept"),
+            value: s("*/*"),
+        },
+        Field {
+            name: s("host"),
+            value: s("127.0.0.1:40123"),
+        },
     ];
     let body = b"{\"a\":1}";
     let mut e: EncodeIn = z();
@@ -174,7 +183,7 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
         text.starts_with("POST /v1/chat HTTP/1.1\r\n"),
         "the door rendered a request: {text:?}"
     );
-    assert!(a.ends_with(b"{\"a\":1}"), "the body rides the message");
+    assert_eq!(a, b"POST /v1/chat HTTP/1.1\r\ncontent-type: application/json\r\ncontent-length: 7\r\naccept: */*\r\nhost: 127.0.0.1:40123\r\n\r\n{\"a\":1}", "the whole pre-auth head and body cross unchanged");
     assert_eq!(a, b, "both doors write the same bytes");
 }
 

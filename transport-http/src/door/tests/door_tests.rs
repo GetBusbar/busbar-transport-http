@@ -499,3 +499,20 @@ fn an_sse_target_locates_as_its_http_twin() {
         assert_eq!(defaults(sse), defaults(http), "{sse}");
     }
 }
+
+#[test]
+fn every_owned_target_buffer_is_wiped_after_normalization_and_percent_expansion() {
+    let target = format!(
+        "\t /discard/../credential-{}?key={}#discard \t",
+        " ".repeat(1024),
+        "target-secret".repeat(100)
+    );
+    let probe = crate::wipe_probe::Probe::start();
+    let encoded = zeroize::Zeroizing::new(dest_head::encode_target(target.as_bytes()).unwrap());
+    assert!(encoded.windows(3).any(|part| part == b"%20"));
+    assert!(!encoded.contains(&b'#'));
+    drop(encoded);
+    probe
+        .finish()
+        .assert_wiped_on_linux(&["target filtered", "target path", "target encoded"]);
+}

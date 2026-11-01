@@ -181,6 +181,9 @@ impl Client {
         if private {
             pairs.extend([("X-Api-Key", "dummy-one"), ("x-api-key", "dummy-two")]);
         }
+        self.encode_fields(&pairs)
+    }
+    fn encode_fields(&mut self, pairs: &[(&str, &str)]) -> Vec<u8> {
         let fields: Vec<_> = pairs
             .iter()
             .map(|(name, value)| Field {
@@ -245,11 +248,16 @@ impl Drop for Client {
 }
 
 fn classification() -> Vec<u8> {
-    let name = b"X-Api-Key";
+    classification_for(&["X-Api-Key"])
+}
+
+fn classification_for(names: &[&str]) -> Vec<u8> {
     let mut value = 1_u32.to_le_bytes().to_vec();
-    value.extend_from_slice(&1_u32.to_le_bytes());
-    value.extend_from_slice(&(name.len() as u32).to_le_bytes());
-    value.extend_from_slice(name);
+    value.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for name in names {
+        value.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        value.extend_from_slice(name.as_bytes());
+    }
     extensions::encode(&[("fields.sensitive", &value)])
 }
 
@@ -362,4 +370,54 @@ fn malformed_present_classification_fails_before_any_request_headers_reach_the_e
     let invalid = extensions::encode(&[("fields.sensitive", b"bad")]);
     assert_eq!(client.emit(1, &private, true, &invalid), Outcome::Failed);
     assert!(header_blocks(&client.sent).is_empty());
+}
+
+#[test]
+fn a_previously_public_exact_value_becomes_never_indexed_when_classified_sensitive() {
+    let mut client = Client::new();
+    let request = client.encode(true);
+    assert_eq!(client.emit(1, &request, true, &[]), Outcome::Ready);
+    for _ in 0..4 {
+        client.ingest(&[]);
+    }
+    assert_eq!(
+        client.emit(2, &request, true, &classification()),
+        Outcome::Ready
+    );
+    assert_eq!(client.emit(3, &request, true, &[]), Outcome::Ready);
+    for _ in 0..4 {
+        client.ingest(&[]);
+    }
+    let blocks = header_blocks(&client.sent);
+    assert_eq!(blocks.len(), 3);
+    let flags: Vec<_> = blocks.values().map(|block| never_indexed(block)).collect();
+    assert_eq!(flags, [0, 2, 0], "a dynamic-table exact match must honor each request's classification without marking its public siblings");
+}
+
+#[test]
+fn a_sensitive_exact_static_table_value_is_a_never_indexed_literal() {
+    let mut client = Client::new();
+    // RFC 7541 Appendix A entry16 is this exact name and value.
+    let request = client.encode_fields(&[
+        ("accept-encoding", "gzip, deflate"),
+        ("x-public", "visible"),
+        ("content-type", "application/grpc"),
+    ]);
+    assert_eq!(client.emit(1, &request, true, &[]), Outcome::Ready);
+    assert_eq!(
+        client.emit(2, &request, true, &classification_for(&["accept-encoding"])),
+        Outcome::Ready
+    );
+    assert_eq!(client.emit(3, &request, true, &[]), Outcome::Ready);
+    for _ in 0..4 {
+        client.ingest(&[]);
+    }
+    let blocks = header_blocks(&client.sent);
+    assert_eq!(blocks.len(), 3);
+    let flags: Vec<_> = blocks.values().map(|block| never_indexed(block)).collect();
+    assert_eq!(
+        flags,
+        [0, 1, 0],
+        "an exact static-table match must preserve the sensitive flag on the wire"
+    );
 }

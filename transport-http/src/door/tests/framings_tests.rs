@@ -121,3 +121,30 @@ fn a_poisoned_slot_is_still_freed_by_its_removal() {
     assert_eq!(untoken(a).map(|t| t.0), untoken(b).map(|t| t.0));
     assert!(table.reach(b).is_ok(), "the slot serves the next framing");
 }
+
+/// Accelerate only the private table's generation to its final representable value. This does
+/// not claim billions of real connection cycles; it proves the boundary where wrapping aliases.
+#[test]
+fn an_exhausted_slot_never_mints_a_generation_zero_alias() {
+    let table = Framings::default();
+    let original = table.insert(framing()).unwrap();
+    let (index, _) = untoken(original).unwrap();
+    table.reach(original).unwrap().generation = u32::MAX;
+    let final_token = token(index, u32::MAX);
+    assert!(table.reach(final_token).is_ok());
+    table.remove(final_token).unwrap();
+    let next = table.insert(framing()).unwrap();
+    assert_ne!(untoken(next).unwrap().0, index, "exhausted slot is retired");
+    assert_eq!(table.reach(original).err(), Some(Reach::Gone));
+    assert_eq!(table.reach(final_token).err(), Some(Reach::Gone));
+    assert_eq!(table.reach(token(index, 0)).err(), Some(Reach::Gone));
+    assert!(table.reach(next).is_ok());
+    table.remove(next).unwrap();
+    let reused = table.insert(framing()).unwrap();
+    assert_eq!(
+        untoken(reused).unwrap().0,
+        untoken(next).unwrap().0,
+        "ordinary slots still recycle"
+    );
+    assert_ne!(reused, next);
+}

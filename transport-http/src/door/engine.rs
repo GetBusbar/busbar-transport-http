@@ -415,7 +415,11 @@ impl Framing {
             b = b.header(k, v);
         }
         let body = match whole.decoded {
-            Some(decoded) => Bytes::from(decoded),
+            Some(decoded) => {
+                #[cfg(test)]
+                crate::wipe_probe::watch("queued decoded body", &decoded);
+                Bytes::from(decoded)
+            }
             // The body goes on as it lies in the buffer, not copied. The head before it is the
             // span that carries credentials (an `authorization` field, a token in the target) and
             // it is in the request's own fields now: wiped where it was read. A decoded chunked
@@ -423,6 +427,8 @@ impl Framing {
             None => {
                 let mut bytes = std::mem::take(&mut **buf);
                 zeroize::Zeroize::zeroize(&mut bytes[..whole.head_end]);
+                #[cfg(test)]
+                crate::wipe_probe::watch("queued request body", &bytes);
                 Bytes::from(bytes).slice(whole.head_end..)
             }
         };

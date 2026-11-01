@@ -1286,3 +1286,79 @@ fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
     assert_eq!(failed_on(1, &mut f), 1, "the live stream is told once");
     assert_eq!(failed_on(3, &mut f), 1, "the refused stream is told once");
 }
+
+#[test]
+fn ipv6_authorities_use_the_url_serialization_before_auth_and_on_both_wires() {
+    for (dial, authority) in [
+        ("https://[0:0:0:0:0:0:0:1]:443/x", "[::1]"),
+        (
+            "https://[2001:0DB8:0:0:0:1:0:1]:8443/x",
+            "[2001:db8::1:0:1]:8443",
+        ),
+        ("http://[2001:0:0:1:0:0:1:1]/x", "[2001::1:0:0:1:1]"),
+        ("https://[::FFFF:192.0.2.1]/x", "[::ffff:c000:201]"),
+        ("http://[0:0:0:0:0:0:0:0]/x", "[::]"),
+    ] {
+        assert_eq!(
+            canonical_host(dial.parse().unwrap())
+                .authority()
+                .unwrap()
+                .as_str(),
+            authority
+        );
+        assert_eq!(
+            client_defaults(&dial.parse().unwrap()),
+            format!("accept: */*\r\nhost: {authority}\r\n")
+        );
+        for proto in [Proto::H1, Proto::H2] {
+            let framing = Framing::dial(dial, proto, posture(30), 0).unwrap();
+            assert_eq!(framing.dial.authority().unwrap().as_str(), authority);
+        }
+    }
+}
+
+#[test]
+fn a_task_spawned_in_the_last_round_runs_without_an_unrelated_host_wake() {
+    let io = HostIo::new(0);
+    let tasks = Tasks::default();
+    let ran = Arc::new(AtomicBool::new(false));
+    let child_ran = Arc::clone(&ran);
+    let spawn = tasks.spawner();
+    tasks.spawner().execute(async move {
+        spawn.execute(async move {
+            child_ran.store(true, Ordering::Release);
+        });
+    });
+    io.rounds(|cx| {
+        tasks.run(cx);
+        Ok::<(), Failure>(())
+    })
+    .unwrap();
+    assert!(
+        ran.load(Ordering::Acquire),
+        "the spawned child is driven on the same host operation"
+    );
+}
+
+#[test]
+fn queued_request_body_ownership_is_wiped_when_the_framing_is_dropped() {
+    for chunked in [false, true] {
+        let probe = crate::wipe_probe::Probe::start();
+        let mut framing = Framing::dial("http://peer.test/", Proto::H2, posture(30), 0).unwrap();
+        let request: &[u8] = if chunked {
+            b"POST / HTTP/1.1\r\nhost: peer.test\r\ntransfer-encoding: chunked\r\n\r\ne\r\nrequest-secret\r\n0\r\n\r\n"
+        } else {
+            b"POST / HTTP/1.1\r\nhost: peer.test\r\ncontent-length: 14\r\n\r\nrequest-secret"
+        };
+        framing.emit(1, request, true, 0, 0).unwrap();
+        assert!(matches!(framing.exchanges[0].1, Stage::Queued(..)));
+        drop(framing);
+        // The chunk decoder's allocation moves into the queued body. Preserve its original
+        // registration and require one actual wipe/free receipt, not a second stage label.
+        probe.finish().assert_wiped_on_linux(&[if chunked {
+            "chunk decoded"
+        } else {
+            "queued request body"
+        }]);
+    }
+}

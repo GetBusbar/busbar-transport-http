@@ -238,6 +238,8 @@ impl ChunkedDecoder {
                 ChunkState::Data => {
                     let n = self.want.min(rest.len());
                     self.body.extend_from_slice(&rest[..n]);
+                    #[cfg(test)]
+                    crate::wipe_probe::watch("chunk decoded", &self.body);
                     self.want -= n;
                     if self.want == 0 {
                         self.state = ChunkState::AfterData;
@@ -264,6 +266,8 @@ impl ChunkedDecoder {
                     let end = memchr::memchr(b'\n', rest);
                     let part = &rest[..end.unwrap_or(rest.len())];
                     self.line.extend_from_slice(part);
+                    #[cfg(test)]
+                    crate::wipe_probe::watch("chunk line", &self.line);
                     let Some(end) = end else {
                         return Ok(bytes.len());
                     };

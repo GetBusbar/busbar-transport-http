@@ -68,6 +68,8 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
         .copied()
         .filter(|b| *b != b'\t')
         .collect();
+    #[cfg(test)]
+    crate::wipe_probe::watch("target filtered", &target);
     let target = target
         .iter()
         .position(|b| *b == b'#')
@@ -81,6 +83,8 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
         .filter(|_| path.first().is_none_or(|b| *b != b'/' && *b != b'\\'))
         .chain(path.iter().map(|b| if *b == b'\\' { b'/' } else { *b }))
         .collect();
+    #[cfg(test)]
+    crate::wipe_probe::watch("target path", &path);
     let mut segments: Vec<&[u8]> = Vec::new();
     let raw: Vec<&[u8]> = path.split(|b| *b == b'/').skip(1).collect();
     let last = raw.len().saturating_sub(1);
@@ -105,6 +109,8 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     for seg in segments {
         out.push(b'/');
         for &b in seg {
+            #[cfg(test)]
+            crate::wipe_probe::watch("target encoded", &out);
             if in_path_set(b) {
                 hex(&mut out, b);
             } else {
@@ -115,6 +121,8 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     if let Some(query) = query {
         out.push(b'?');
         for &b in query {
+            #[cfg(test)]
+            crate::wipe_probe::watch("target encoded", &out);
             if in_query_set(b) {
                 hex(&mut out, b);
             } else {
@@ -122,5 +130,7 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
             }
         }
     }
+    #[cfg(test)]
+    crate::wipe_probe::watch("target encoded", &out);
     Ok(out)
 }

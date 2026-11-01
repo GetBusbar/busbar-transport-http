@@ -557,3 +557,32 @@ fn linked_session_is_every_claim_rows_session() {
         .iter()
         .all(|c| (c.session != 0) == crate::linked::SESSION));
 }
+
+#[test]
+fn chunk_decoding_wipes_owned_lines_and_each_body_allocation_on_abandonment_or_completion() {
+    for complete in [false, true] {
+        let probe = crate::wipe_probe::Probe::start();
+        let mut decoder = crate::raw::ChunkedDecoder::default();
+        let line = b"4000;credential=chunk-line-secret";
+        decoder.feed(line).unwrap();
+        decoder.feed(b"\r\n").unwrap();
+        for _ in 0..16 {
+            decoder.feed(&[b'x'; 1024]).unwrap();
+        }
+        assert_eq!(decoder.body_len(), 16 * 1024);
+        if complete {
+            decoder
+                .feed(b"\r\n0\r\nx-secret: trailer-secret\r\n\r\n")
+                .unwrap();
+            assert!(decoder.is_done());
+            let body = decoder.take();
+            assert_eq!(body.as_slice(), &[b'x'; 16 * 1024]);
+            drop(body);
+        } else {
+            drop(decoder);
+        }
+        probe
+            .finish()
+            .assert_wiped_on_linux(&["chunk decoded", "chunk line"]);
+    }
+}
