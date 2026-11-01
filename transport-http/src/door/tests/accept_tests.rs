@@ -67,6 +67,208 @@ fn accepted() -> Accepted {
     Accepted::accept(SEC, vec![Line::any(1)])
 }
 
+fn selected_policy(generation: u64, line: u32, points: u32, body_limit: u64) -> Arc<Policy> {
+    use busbar_contract::abi::transport::{guest_policy::GuestLine, route};
+    Arc::new(Policy {
+        listener: 7,
+        generation,
+        lines: vec![GuestLine {
+            line,
+            points,
+            auth: AuthRef {
+                id: generation,
+                mac: generation,
+            },
+            body_limit,
+            methods: route::METHOD_ANY,
+            path_form: route::PATH_CONTAINS,
+            path: "/".into(),
+            fields: Vec::new(),
+            rung: 0,
+        }],
+    })
+}
+
+struct Selecting {
+    policy: Arc<Policy>,
+    auths: Vec<u64>,
+    handed: Vec<u32>,
+    wait: bool,
+    loan_wait: bool,
+    points: Vec<u32>,
+    completions: Vec<(u32, u32)>,
+}
+
+impl Kernel for Selecting {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
+    fn open_policy(&mut self, _: &mut Loans, _: u64) -> Result<Option<Arc<Policy>>, ServiceError> {
+        Ok((!self.loan_wait).then(|| Arc::clone(&self.policy)))
+    }
+    fn auth_call(
+        &mut self,
+        seq: u32,
+        auth: AuthRef,
+        _: UnitRef,
+        point: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+        _: Option<&[u8]>,
+    ) -> Pend<AuthCalled> {
+        self.auths.push(auth.id);
+        self.points.push(point);
+        self.completions.push((point, seq));
+        if self.wait {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }, Vec::new())))
+        }
+    }
+    fn hand_in(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        line: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError> {
+        self.handed.push(line);
+        Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }))
+    }
+    fn refuse(
+        &mut self,
+        _: u32,
+        _: UnitRef,
+        _: u32,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+    ) -> Result<RefusalCopy, ServiceError> {
+        Err(ServiceError::Unserved)
+    }
+}
+
+fn selecting() -> (Accepted, Selecting) {
+    use busbar_contract::abi::{mechanism::extensions, transport::guest_policy};
+    let initial = guest_policy::encode(7, 1, &[]).unwrap();
+    let initial = extensions::encode(&[(guest_policy::EXT_GUEST_POLICY, &initial)]);
+    let a = accepted().with_policies(Loans::from_initial(&initial).unwrap());
+    (
+        a,
+        Selecting {
+            policy: selected_policy(2, 22, 0, 0),
+            auths: Vec::new(),
+            handed: Vec::new(),
+            wait: false,
+            loan_wait: false,
+            points: Vec::new(),
+            completions: Vec::new(),
+        },
+    )
+}
+
+#[test]
+fn a_cancelled_policy_opening_hands_in_no_request_or_body() {
+    let (mut a, mut kernel) = selecting();
+    kernel.loan_wait = true;
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nabcd",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert!(up(&mut a).heads.is_empty());
+    assert!(kernel.handed.is_empty());
+    assert!(
+        a.cancel(OP_TICKET),
+        "the policy-opening operation took its input"
+    );
+    kernel.loan_wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    let got = up(&mut a);
+    assert!(got.heads.is_empty());
+    assert!(got.body.is_empty());
+    assert!(kernel.handed.is_empty());
+}
+
+#[test]
+fn a_new_request_matches_the_hosts_selected_policy_before_hand_in() {
+    let (mut a, mut kernel) = selecting();
+    a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.handed, [22]);
+    assert_eq!(up(&mut a).heads.len(), 1);
+}
+
+#[test]
+fn a_new_generation_checks_peer_before_head_body_and_keeps_its_pending_handle() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_PEER | POINT_HEAD_BODY, 8);
+    kernel.wait = true;
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nabcd",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_PEER]);
+    assert!(kernel.handed.is_empty());
+    let got = up(&mut a);
+    assert!(got.heads.is_empty() && got.body.is_empty());
+    kernel.policy = selected_policy(3, 33, POINT_HEAD_BODY, 1);
+    kernel.wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_PEER, POINT_PEER, POINT_HEAD_BODY]);
+    assert_eq!(kernel.auths, [2, 2, 2]);
+    assert_eq!(kernel.completions[0], kernel.completions[1]);
+    assert_eq!(kernel.handed, [22]);
+    assert_eq!(up(&mut a).body, b"abcd");
+}
+
+#[test]
+fn a_peer_verdict_is_reused_for_its_exact_auth_handle_but_not_after_reload() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_PEER | POINT_HEAD, 0);
+    for stream in 1..=3 {
+        if stream == 3 {
+            kernel.policy = selected_policy(3, 33, POINT_PEER | POINT_HEAD, 0);
+        }
+        a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
+        run_with(&mut a, SEC, &mut kernel);
+        assert_eq!(up(&mut a).heads.len(), 1);
+        a.emit(stream, b"content-length: 0\r\n", true, 200).unwrap();
+        a.drive(SEC);
+    }
+    assert_eq!(
+        kernel.points,
+        [POINT_PEER, POINT_HEAD, POINT_HEAD, POINT_PEER, POINT_HEAD]
+    );
+    assert_eq!(kernel.auths, [2, 2, 2, 3, 3]);
+}
+
+#[test]
+fn a_pending_request_retains_its_auth_and_body_limit_across_a_new_policy() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_HEAD_BODY, 8);
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nab",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert!(kernel.handed.is_empty());
+    kernel.policy = selected_policy(3, 33, POINT_HEAD_BODY, 1);
+    kernel.wait = true;
+    a.ingest(b"cd", false);
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.auths, [2]);
+    assert!(kernel.handed.is_empty());
+    kernel.wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.auths, [2, 2]);
+    assert_eq!(kernel.handed, [22]);
+    assert_eq!(up(&mut a).body, b"abcd");
+}
+
 /// Drive the connection at `now`, admit what it decoded, and drive what the admission let move.
 fn run(a: &mut Accepted, now: u64) {
     a.drive(now);
@@ -522,7 +724,11 @@ impl Kernel for Refusing {
 /// Drive, then admit through `k` and drive until nothing moves, as a ticketed op does.
 fn run_with(a: &mut Accepted, now: u64, k: &mut dyn Kernel) {
     a.drive(now);
-    while a.admit(k).moved {
+    loop {
+        let did = a.admit(k);
+        if did.parked || !did.moved {
+            break;
+        }
         a.drive(now);
     }
 }

@@ -33,6 +33,22 @@ pub struct Line {
 }
 
 impl Line {
+    /// A line from a decoded immutable policy loan.
+    #[must_use]
+    pub fn from_policy(line: &busbar_contract::abi::transport::guest_policy::GuestLine) -> Self {
+        Self {
+            line: line.line,
+            points: line.points,
+            auth: line.auth,
+            body_limit: line.body_limit,
+            methods: line.methods,
+            path_form: line.path_form,
+            path: line.path.clone(),
+            fields: line.fields.clone(),
+            rung: line.rung,
+        }
+    }
+
     /// The line the host lent, copied out; `None` when its route's path or a predicate name is not
     /// UTF-8 (`Lent::<LineEntry>::route_view`).
     #[must_use]

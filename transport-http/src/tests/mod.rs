@@ -12,7 +12,8 @@ impl crate::message::Whole {
     /// The body, where it lies: decoded, or the rest of the buffered bytes.
     fn body<'b>(&'b self, buffered: &'b [u8]) -> &'b [u8] {
         self.decoded
-            .as_deref()
+            .as_ref()
+            .map(|body| body.as_slice())
             .unwrap_or(&buffered[self.head_end..])
     }
 }

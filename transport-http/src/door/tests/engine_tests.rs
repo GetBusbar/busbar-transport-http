@@ -6,6 +6,74 @@
 
 use super::*;
 
+#[test]
+fn credential_flags_reach_the_final_header_values_after_partial_head_reparse() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(300), 0).unwrap();
+    let bytes = b"POST /x HTTP/1.1\r\nX-Api-Key: dummy-one\r\nx-api-key: dummy-two\r\nx-public: visible\r\nContent-Length: 0\r\n\r\n";
+    let fields = SensitiveFields::new(vec!["x-api-key".into()]).unwrap();
+    f.emit_sensitive(1, &bytes[..7], false, 0, 0, fields)
+        .unwrap();
+    f.emit(
+        3,
+        b"GET /public HTTP/1.1\r\nx-api-key: public\r\n\r\n",
+        true,
+        0,
+        0,
+    )
+    .unwrap();
+    f.emit(1, &bytes[7..], true, 0, 0).unwrap();
+    let Stage::Queued(request, _) = &f
+        .exchanges
+        .iter()
+        .find(|(stream, _)| *stream == 1)
+        .unwrap()
+        .1
+    else {
+        panic!("the real HTTP request was not built")
+    };
+    let values: Vec<_> = request.headers().get_all("x-api-key").iter().collect();
+    assert_eq!(values.len(), 2);
+    assert!(values.iter().all(|value| value.is_sensitive()));
+    assert!(!request.headers()["x-public"].is_sensitive());
+    let Stage::Queued(public, _) = &f
+        .exchanges
+        .iter()
+        .find(|(stream, _)| *stream == 3)
+        .unwrap()
+        .1
+    else {
+        panic!("the public request was not built")
+    };
+    assert!(!public.headers()["x-api-key"].is_sensitive());
+}
+
+#[test]
+fn an_empty_opening_emit_retains_its_classification_for_the_later_head() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(300), 0).unwrap();
+    f.emit_sensitive(
+        1,
+        &[],
+        false,
+        0,
+        0,
+        SensitiveFields::new(vec!["x-key".into()]).unwrap(),
+    )
+    .unwrap();
+    f.emit(
+        1,
+        b"GET /x HTTP/1.1\r\nx-key: secret\r\nx-public: visible\r\n\r\n",
+        true,
+        0,
+        0,
+    )
+    .unwrap();
+    let Stage::Queued(request, _) = &f.exchanges[0].1 else {
+        panic!("the request head was not built")
+    };
+    assert!(request.headers()["x-key"].is_sensitive());
+    assert!(!request.headers()["x-public"].is_sensitive());
+}
+
 const SEC: u64 = 1_000_000_000;
 
 fn posture(timeout_secs: u64) -> Posture {

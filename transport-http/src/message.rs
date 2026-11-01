@@ -86,7 +86,7 @@ pub(crate) fn request_target(
 #[derive(Debug)]
 pub(crate) struct Whole {
     pub(crate) head_end: usize,
-    pub(crate) decoded: Option<Vec<u8>>,
+    pub(crate) decoded: Option<zeroize::Zeroizing<Vec<u8>>>,
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.

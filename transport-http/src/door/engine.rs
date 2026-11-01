@@ -26,6 +26,7 @@ use std::time::Duration;
 
 pub(crate) use super::hyper_io::field_block;
 use super::hyper_io::{HeadWords, HostIo, Owed, Piece};
+use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::{Body, Incoming};
@@ -80,7 +81,7 @@ enum Stage {
     /// handed on in place (`Framing::message`). The head is read in place from it
     /// (`EgressHead` keeps only its end and framing); the `http::Request` built from it still holds
     /// header values in ordinary memory, until credentials stop reaching the framer as plaintext.
-    Writing(Zeroizing<Vec<u8>>, EgressHead, u64),
+    Writing(Zeroizing<Vec<u8>>, EgressHead, u64, SensitiveFields),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
     /// Sent; waiting for the response head.
@@ -171,6 +172,11 @@ impl Tasks {
         let mut tasks = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
         tasks.retain_mut(|t| t.as_mut().poll(cx).is_pending());
         let mut list = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !list.is_empty() {
+            // These tasks were spawned during this pass and have never been polled. They need
+            // the next round even if their parent completed without waking anything else.
+            cx.waker().wake_by_ref();
+        }
         tasks.append(&mut list);
         *list = tasks;
     }
@@ -304,6 +310,31 @@ impl Framing {
         now_ns: u64,
         deadline_ns: u64,
     ) -> Result<(), Failure> {
+        self.emit_marked(stream, bytes, end, now_ns, deadline_ns, None)
+    }
+
+    /// Emit the first part of a request with its immutable host-owned header classification.
+    pub fn emit_sensitive(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        now_ns: u64,
+        deadline_ns: u64,
+        sensitive: SensitiveFields,
+    ) -> Result<(), Failure> {
+        self.emit_marked(stream, bytes, end, now_ns, deadline_ns, Some(sensitive))
+    }
+
+    fn emit_marked(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        now_ns: u64,
+        deadline_ns: u64,
+        sensitive: Option<SensitiveFields>,
+    ) -> Result<(), Failure> {
         // The rest of a refused message is dropped, never read; the host's end of it frees the
         // stream.
         if let Some(i) = self
@@ -327,10 +358,10 @@ impl Framing {
                 u64::try_from(self.posture.request_timeout.as_nanos()).unwrap_or(u64::MAX),
             )
         };
-        let read = if bytes.is_empty() {
+        let read = if bytes.is_empty() && sensitive.is_none() {
             Ok(())
         } else {
-            self.message(stream, bytes, deadline)
+            self.message(stream, bytes, deadline, sensitive)
         };
         // The host's end of a message still arriving: it ended short of what its head declared.
         let read = read.and_then(|()| {
@@ -369,23 +400,42 @@ impl Framing {
         }
     }
 
-    fn message(&mut self, stream: u64, bytes: &[u8], deadline: u64) -> Result<(), Failure> {
+    fn message(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        deadline: u64,
+        sensitive: Option<SensitiveFields>,
+    ) -> Result<(), Failure> {
         let max = self.posture.max_body_bytes;
         let idx = match self.exchanges.iter().position(|(s, _)| *s == stream) {
             Some(i) => i,
             None => {
                 self.exchanges.push((
                     stream,
-                    Stage::Writing(Zeroizing::default(), EgressHead::default(), deadline),
+                    Stage::Writing(
+                        Zeroizing::default(),
+                        EgressHead::default(),
+                        deadline,
+                        sensitive.clone().unwrap_or_default(),
+                    ),
                 ));
                 self.exchanges.len() - 1
             }
         };
-        let Stage::Writing(buf, head, deadline) = &mut self.exchanges[idx].1 else {
+        let Stage::Writing(buf, head, deadline, marked) = &mut self.exchanges[idx].1 else {
             return Err(Failure(format!(
                 "stream {stream} already carries a request"
             )));
         };
+        if sensitive
+            .as_ref()
+            .is_some_and(|sensitive| sensitive != marked)
+        {
+            return Err(Failure(
+                "request sensitivity changed during its head".into(),
+            ));
+        }
         extend_wiped(buf, bytes);
         // The cap is the BODY's (`complete_message` holds the declared length to it); the head
         // `encode` rendered around it has its own allowance, hyper's HTTP/1 read buffer.
@@ -412,13 +462,16 @@ impl Framing {
             }
             // Every other line goes out as stated. The length line is the one the auth saw (THE
             // DESIGN §6 step 5): it goes out as stated, and hyper, handed it, adds none.
-            b = b.header(k, v);
+            let mut value = http::HeaderValue::from_bytes(v)
+                .map_err(|error| Failure(format!("request: {error}")))?;
+            value.set_sensitive(marked.contains(k));
+            b = b.header(k, value);
         }
         let body = match whole.decoded {
             Some(decoded) => {
                 #[cfg(test)]
                 crate::wipe_probe::watch("queued decoded body", &decoded);
-                Bytes::from(decoded)
+                held_bytes(decoded)
             }
             // The body goes on as it lies in the buffer, not copied. The head before it is the
             // span that carries credentials (an `authorization` field, a token in the target) and
@@ -429,7 +482,7 @@ impl Framing {
                 zeroize::Zeroize::zeroize(&mut bytes[..whole.head_end]);
                 #[cfg(test)]
                 crate::wipe_probe::watch("queued request body", &bytes);
-                Bytes::from(bytes).slice(whole.head_end..)
+                held_bytes(Zeroizing::new(bytes)).slice(whole.head_end..)
             }
         };
         let mut req = b
@@ -584,6 +637,17 @@ pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
+/// Share an owned body without releasing its wiping owner before the last byte view is dropped.
+pub(crate) fn held_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
+    struct Held(Zeroizing<Vec<u8>>);
+    impl AsRef<[u8]> for Held {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+    Bytes::from_owner(Held(bytes))
+}
+
 /// The dial target with its authority as 1.5.5's client sent it (its URL parser normalised the
 /// host before the request was built): the host lower-cased, an IPv4 spelling written as the
 /// dotted quad it names ([`super::offered_name`]; `https://127.1:4318/` went out as
@@ -595,7 +659,13 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
     let Some(host) = dial.host() else {
         return dial;
     };
-    let name = super::offered_name(&host.to_ascii_lowercase());
+    let name = match host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        Some(host) => format!("[{}]", super::offered_name(host)),
+        None => super::offered_name(host),
+    };
     let default_port = match dial.scheme_str() {
         Some("https") => Some(443),
         Some("http") => Some(80),

@@ -63,11 +63,9 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
         .iter()
         .rposition(|b| *b > 0x20)
         .map_or(start, |at| at + 1);
-    let target: Vec<u8> = target[start..end]
-        .iter()
-        .copied()
-        .filter(|b| *b != b'\t')
-        .collect();
+    let mut filtered = zeroize::Zeroizing::new(Vec::with_capacity(end - start));
+    filtered.extend(target[start..end].iter().copied().filter(|b| *b != b'\t'));
+    let target = filtered;
     #[cfg(test)]
     crate::wipe_probe::watch("target filtered", &target);
     let target = target
@@ -79,10 +77,12 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
         None => (target, None),
     };
     // A path is absolute on the request line.
-    let path: Vec<u8> = std::iter::once(b'/')
-        .filter(|_| path.first().is_none_or(|b| *b != b'/' && *b != b'\\'))
-        .chain(path.iter().map(|b| if *b == b'\\' { b'/' } else { *b }))
-        .collect();
+    let mut absolute = zeroize::Zeroizing::new(Vec::with_capacity(path.len().saturating_add(1)));
+    if path.first().is_none_or(|b| *b != b'/' && *b != b'\\') {
+        absolute.push(b'/');
+    }
+    absolute.extend(path.iter().map(|b| if *b == b'\\' { b'/' } else { *b }));
+    let path = absolute;
     #[cfg(test)]
     crate::wipe_probe::watch("target path", &path);
     let mut segments: Vec<&[u8]> = Vec::new();
@@ -102,7 +102,11 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
             segments.push(seg);
         }
     }
-    let mut out = Vec::with_capacity(target.len() + 8);
+    // A byte expands to at most three encoded bytes, plus one leading slash. Reserving that
+    // extent prevents any ordinary Vec growth from freeing an unwiped target prefix.
+    let mut out = zeroize::Zeroizing::new(Vec::with_capacity(
+        target.len().saturating_mul(3).saturating_add(1),
+    ));
     if segments.is_empty() {
         out.push(b'/');
     }
@@ -132,5 +136,5 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     }
     #[cfg(test)]
     crate::wipe_probe::watch("target encoded", &out);
-    Ok(out)
+    Ok(std::mem::take(&mut *out))
 }

@@ -86,6 +86,7 @@ busbar_contract::own_seal!(Own);
 // expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
+use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -101,8 +102,10 @@ use busbar_contract::abi::sdk::life::{self, Held as Opened, Life, Refreshed, Ref
 use busbar_contract::abi::sdk::services::{
     HeadViewArgs, Pend, RefusalCopy, ServiceError, Services,
 };
+use busbar_contract::abi::sdk::transport::policy::Loans;
 use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
+use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
@@ -340,6 +343,8 @@ pub struct Instance {
     framings: Framings,
     /// The listeners' guest lists, shared by the connections each accepts.
     guests: guest::Lists,
+    /// A pending Begin's provisional framing; only its owning ticket may resume it.
+    opening: Mutex<HashMap<Ticket, u64>>,
 }
 
 /// Every slot's state: the SDK's held instance over [`Instance`], with the host tables `open` was
@@ -445,6 +450,7 @@ impl Life for Instance {
             settings: Mutex::new(settings_of(settings)?),
             framings: Framings::default(),
             guests: guest::Lists::default(),
+            opening: Mutex::new(HashMap::new()),
         })
     }
 
@@ -494,6 +500,17 @@ slot!(
         let mut partial = false;
         let mut skipped = false;
         if let Some(h) = instance.get() {
+            let opening = h.life().opening.lock().unwrap_or_else(PoisonError::into_inner).get(&ticket).copied();
+            if let Some(token) = opening {
+                match h.life().framings.reach(token) {
+                    Ok(slot) => drop(slot),
+                    Err(framings::Reach::Busy) => return o.fail(Refusal::failed("cancel: framing busy")),
+                    Err(framings::Reach::Gone) => {}
+                }
+                h.life().opening.lock().unwrap_or_else(PoisonError::into_inner).remove(&ticket);
+                let _ = h.life().framings.remove(token);
+                partial = true;
+            }
             skipped = h.life().framings.each(|h| {
                 if let Held::Accept(a) = h {
                     partial |= a.cancel(ticket);
@@ -571,7 +588,7 @@ impl SafeSlot for Refuse {
         with(
             REFUSE,
             &p,
-            i.head,
+            i.field(|x| &x.head),
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -678,9 +695,43 @@ fn carries_userinfo(uri: &http::Uri) -> bool {
 /// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
 /// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
 /// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. Any other host (a DNS name, an IPv6 literal) is offered ASCII
-/// lower-cased, as WHATWG lower-cases it (`https://API.Example.com/` went out as `api.example.com`).
+/// dropped, as WHATWG drops it. IPv6 uses hexadecimal pieces and compresses the first longest run
+/// of at least two zero pieces, including IPv4-mapped addresses. DNS names are ASCII lower-cased.
 fn offered_name(host: &str) -> String {
+    if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        use std::fmt::Write;
+        let pieces = v6.segments();
+        let (mut start, mut longest, mut at) = (0, 0, 0);
+        while at < pieces.len() {
+            if pieces[at] != 0 {
+                at += 1;
+                continue;
+            }
+            let first = at;
+            while at < pieces.len() && pieces[at] == 0 {
+                at += 1;
+            }
+            if at - first > longest && at - first >= 2 {
+                start = first;
+                longest = at - first;
+            }
+        }
+        let mut out = String::new();
+        let mut at = 0;
+        while at < pieces.len() {
+            if longest != 0 && at == start {
+                out.push_str("::");
+                at += longest;
+            } else {
+                if !out.is_empty() && !out.ends_with(':') {
+                    out.push(':');
+                }
+                let _ = write!(out, "{:x}", pieces[at]);
+                at += 1;
+            }
+        }
+        return out;
+    }
     let bare = host.strip_suffix('.').unwrap_or(host);
     if let Ok(v4) = bare.parse::<sdk::net::Ipv4Addr>() {
         return v4.to_string();
@@ -787,6 +838,32 @@ impl SafeSlot for Begin {
         };
         let settings = inst.settings();
         if i.side == SIDE_ACCEPT {
+            let opening = inst
+                .opening
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&i.head.ticket)
+                .copied();
+            if let Some(token) = opening {
+                if i.head.flags & FLAG_RESUME == 0 {
+                    return failed(
+                        &mut o,
+                        "begin: the opening operation must be resumed".into(),
+                    );
+                }
+                return begin_peer(
+                    &p,
+                    i.field(|x| &x.head),
+                    token,
+                    i.field(|x| &x.sink),
+                    &mut o,
+                );
+            }
+            let loans = match Loans::from_initial(i.field(|x| &x.head.extensions).bytes()) {
+                Ok(loans) => loans,
+                Err(why) => return failed(&mut o, format!("begin: {why}")),
+            };
+            let selected = loans.is_some();
             // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
             // listener did (`accept`): no agreed protocol is read here. It is framed under the
             // listener's guest list, in the kernel's match order (`BeginIn::lines`).
@@ -817,10 +894,29 @@ impl SafeSlot for Begin {
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
             let mut h = Held::Accept(
                 Accepted::accept(i.sink.now_monotonic_ns, lines)
+                    .with_policies(loans)
                     .with_body_max(settings.posture.max_body_bytes)
                     .with_scheme(scheme)
                     .with_alpn(alpn),
             );
+            if selected {
+                // Peer checks use the opening generation, before the host confirms READY and
+                // releases its initial policy pin. A PENDING Begin keeps this exact framing.
+                let Some(token) = inst.framings.insert_held(h) else {
+                    return failed(&mut o, "begin: every framing slot is in use".into());
+                };
+                inst.opening
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(i.head.ticket, token);
+                return begin_peer(
+                    &p,
+                    i.field(|x| &x.head),
+                    token,
+                    i.field(|x| &x.sink),
+                    &mut o,
+                );
+            }
             let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
             if r != Outcome::Ready {
                 return r;
@@ -881,6 +977,59 @@ impl SafeSlot for Begin {
     }
 }
 
+fn begin_peer(
+    p: &sdk::Instance<'_, State>,
+    head: Lent<'_, InHead>,
+    token: u64,
+    sink: Lent<'_, FramerSink>,
+    o: &mut Out<'_, FramerOut>,
+) -> Outcome {
+    let Some(held) = p.get() else {
+        return failed(o, "begin: no open instance".into());
+    };
+    let inst = held.life();
+    let services = held.host().and_then(|h| h.services());
+    let mut slot = match inst.framings.reach(token) {
+        Ok(slot) => slot,
+        Err(why) => return failed(o, format!("begin: {}", why.why())),
+    };
+    let Held::Accept(a) = slot.held() else {
+        return failed(o, "begin: the opening framing is not accepting".into());
+    };
+    let did = a.admit_peer(&mut HostKernel {
+        services: services.as_ref(),
+        ticket: head.ticket,
+        conn: token,
+        policy: PolicyCall {
+            extensions: head.field(|x| &x.extensions).bytes(),
+            leases: held.leases(),
+            out: &mut *o,
+        },
+    });
+    if did.parked {
+        return Outcome::Pending;
+    }
+    let ready = a.peer_ready();
+    if ready {
+        a.drive(sink.now_monotonic_ns);
+        fill(a, sink, o, class_of, fault_of);
+        o.set(|x| &x.yielded.agreed, a.agreed());
+        o.set(|x| &x.framing, token);
+    }
+    drop(slot);
+    inst.opening
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&head.ticket);
+    if ready {
+        Outcome::Ready
+    } else {
+        let _ = inst.framings.remove(token);
+        o.error("begin: the opening peer policy was refused");
+        Outcome::Refused
+    }
+}
+
 /// `ingest`.
 pub struct Ingest;
 impl SafeSlot for Ingest {
@@ -896,7 +1045,7 @@ impl SafeSlot for Ingest {
         with(
             INGEST,
             &p,
-            i.head,
+            i.field(|x| &x.head),
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -926,11 +1075,16 @@ impl SafeSlot for Emit {
     ) -> Outcome {
         let bytes = i.bytes();
         let (now, deadline) = (i.sink.now_monotonic_ns, i.deadline_ns);
+        let sensitive =
+            match SensitiveFields::from_extensions(i.field(|x| &x.head.extensions).bytes()) {
+                Ok(sensitive) => sensitive,
+                Err(error) => return failed(&mut o, format!("emit: {error}")),
+            };
         let mut full = false;
         let r = with(
             EMIT,
             &p,
-            i.head,
+            i.field(|x| &x.head),
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -940,7 +1094,18 @@ impl SafeSlot for Emit {
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_status(&i, false).map_err(refused_status)?;
-                    f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+                    if let Some(sensitive) = sensitive {
+                        f.emit_sensitive(
+                            i.stream,
+                            bytes,
+                            i.end_of_frame != 0,
+                            now,
+                            deadline,
+                            sensitive,
+                        )
+                    } else {
+                        f.emit(i.stream, bytes, i.end_of_frame != 0, now, deadline)
+                    }
                 }
                 Held::Accept(a) if resumed => {
                     // Its answer states the stream's queue as it stands: the first run's
@@ -978,7 +1143,7 @@ impl SafeSlot for Timer {
         with(
             TIMER,
             &p,
-            i.head,
+            i.field(|x| &x.head),
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
@@ -1063,8 +1228,11 @@ impl SafeSlot for Detach {
 }
 
 // One bounded copy from detached custody into the host's frame sink.
-fn take_detached(rest: &mut std::collections::VecDeque<u8>, n: usize) -> Vec<u8> {
-    let taken: Vec<u8> = rest.drain(..n).collect();
+fn take_detached(
+    rest: &mut std::collections::VecDeque<u8>,
+    n: usize,
+) -> zeroize::Zeroizing<Vec<u8>> {
+    let taken = zeroize::Zeroizing::new(rest.drain(..n).collect());
     #[cfg(test)]
     crate::wipe_probe::watch("detach taken", &taken);
     taken
@@ -1128,11 +1296,12 @@ impl SafeSlot for Encode {
         let Ok(target) = target else {
             return failed(&mut o, format!("encode: {}", dest_head::REFUSED));
         };
+        let target = target.map(zeroize::Zeroizing::new);
         if !method.is_empty() {
             pairs.push(("method", method));
         }
-        if let Some(target) = target.as_deref() {
-            pairs.push(("path", target));
+        if let Some(target) = target.as_ref() {
+            pairs.push(("path", target.as_slice()));
         }
         for f in fields.iter() {
             let Ok(name) = f.field(|x| &x.name).as_str() else {
@@ -1204,7 +1373,7 @@ framer_op!(
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,
-    head: InHead,
+    head: Lent<'_, InHead>,
     token: u64,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
@@ -1216,10 +1385,12 @@ fn with(
     };
     let inst = held.life();
     let services = held.host().and_then(|h| h.services());
-    let mut kernel = HostKernel {
+    let kernel = KernelContext {
         services: services.as_ref(),
         ticket: head.ticket,
         conn: token,
+        extensions: head.field(|x| &x.extensions).bytes(),
+        leases: held.leases(),
     };
     // GUEST-LIST ADMISSION RUNS ON EVERY OP THAT DRIVES: a drive may decode a request (a
     // pipelined HTTP/1.1 request is read as soon as the answer before it is written, in whichever
@@ -1227,14 +1398,16 @@ fn with(
     // re-call) the may-pend `auth.call` is never made ([`Accepted::admit`]): a request whose line's
     // auth must be called waits for the next ticketed op; every other step (the match, the
     // kernel's refusals, the size gate, the hand-in) runs.
-    let kernel = Some(&mut kernel);
+    let kernel = Some(kernel);
     // Reached by its token alone; a framing another op holds is answered at once.
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
         Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
     };
-    let resumed = head.flags & FLAG_RESUME != 0;
-    step(slot.held(), sink, o, kernel, |h| f(h, resumed))
+    let h = slot.held();
+    let resumed = head.flags & FLAG_RESUME != 0
+        || matches!(&*h, Held::Accept(a) if a.policy_pending(head.ticket));
+    step(h, sink, o, kernel, |h| f(h, resumed))
 }
 
 /// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
@@ -1247,7 +1420,7 @@ fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
     o: &mut Out<'_, FramerOut>,
-    kernel: Option<&mut HostKernel<'_>>,
+    kernel: Option<KernelContext<'_>>,
     f: impl FnOnce(&mut Held) -> Result<(), engine::Failure>,
 ) -> Outcome {
     if let Err(e) = f(h) {
@@ -1266,28 +1439,60 @@ fn step(
         }
         Held::Accept(a) => {
             a.drive(sink.now_monotonic_ns);
-            if let Some(k) = kernel {
+            let mut more = false;
+            if let Some(context) = kernel {
                 // Admit until nothing moves: every request decoded in this op is answered, admitted
                 // or parked in it, never left waiting for a wake no op owes it. Each round moves a
                 // request on or ends the loop, and the requests are the ones the bytes already
                 // taken hold.
                 loop {
-                    let did = a.admit(k);
+                    let did = a.admit(&mut HostKernel {
+                        services: context.services,
+                        ticket: context.ticket,
+                        conn: context.conn,
+                        policy: PolicyCall {
+                            extensions: context.extensions,
+                            leases: context.leases,
+                            out: &mut *o,
+                        },
+                    });
+                    if did.policy_requested {
+                        o.set(|x| &x.yielded.agreed, a.agreed());
+                        return Outcome::Ready;
+                    }
+                    if did.policy_failed {
+                        return failed(o, "the host stream policy reply was invalid".into());
+                    }
                     if did.parked {
                         // A pending `auth.call` (the SDK's `Pend`, on this ticketed op): the op
                         // yields nothing until the host's wake re-issues it on the same ticket
                         // (the transport contract's "a framer pends only on a ticketed auth call").
                         // The parked call holds its own `(ticket, seq)`: only that ticket's resume
                         // re-issues it, and a fresh op on another ticket flows past it.
+                        report_receive(a, context, o);
                         return Outcome::Pending;
                     }
                     if !did.moved {
+                        more = did.more;
                         break;
                     }
                     a.drive(sink.now_monotonic_ns);
                 }
             }
             fill(a, sink, o, class_of, fault_of);
+            a.published();
+            if let Some(context) = kernel {
+                report_receive(a, context, o);
+            }
+            if more {
+                let flags = o.get().yielded.flags | YIELD_MORE;
+                o.set(|x| &x.yielded.flags, flags);
+            }
+            if o.get().yielded.flags & YIELD_MORE == 0 {
+                if let Some(context) = kernel {
+                    a.operation_done(context.ticket);
+                }
+            }
             // The protocol this accepted connection speaks, as its position in the accepting offer
             // (`FramerYield::agreed`), on every accepting yield.
             o.set(|x| &x.yielded.agreed, a.agreed());
@@ -1296,16 +1501,44 @@ fn step(
     Outcome::Ready
 }
 
+/// The output lease owns this numeric snapshot through READY or PENDING. Policy-open control
+/// replies keep their own extension and are immediately recalled before any further socket read.
+fn report_receive(a: &Accepted, context: KernelContext<'_>, out: &mut Out<'_, FramerOut>) {
+    let bytes = busbar_contract::abi::sdk::transport::receive::encode(a.retained_input() as u64);
+    out.lease(
+        |o| &o.head.extensions,
+        context.leases,
+        bytes,
+        busbar_contract::abi::mechanism::call::BLOB_OCTETS,
+    );
+}
+
 /// THE HOST AUTH HANDLE as the accepted side calls it: the SDK's `Services` wrappers, each call
 /// under the op's ticket and the completion sequence the framing issued
 /// (`abi::mechanism::ticket::CompletionHandle`), on connection `conn` (the framing's token).
-pub(crate) struct HostKernel<'a> {
+#[derive(Clone, Copy)]
+struct KernelContext<'a> {
     services: Option<&'a Services>,
     ticket: Ticket,
     conn: u64,
+    extensions: &'a [u8],
+    leases: &'a busbar_contract::abi::sdk::life::Leases,
 }
 
-impl HostKernel<'_> {
+struct PolicyCall<'a, 'o, 'f> {
+    extensions: &'a [u8],
+    leases: &'a busbar_contract::abi::sdk::life::Leases,
+    out: &'o mut Out<'f, FramerOut>,
+}
+
+pub(crate) struct HostKernel<'a, 'o, 'f> {
+    services: Option<&'a Services>,
+    ticket: Ticket,
+    conn: u64,
+    policy: PolicyCall<'a, 'o, 'f>,
+}
+
+impl HostKernel<'_, '_, '_> {
     const fn handle(&self, seq: u32) -> CompletionHandle {
         CompletionHandle {
             ticket: self.ticket,
@@ -1315,9 +1548,28 @@ impl HostKernel<'_> {
     }
 }
 
-impl Kernel for HostKernel<'_> {
+impl Kernel for HostKernel<'_, '_, '_> {
     fn ticket(&self) -> Ticket {
         self.ticket
+    }
+
+    fn open_policy(
+        &mut self,
+        loans: &mut Loans,
+        stream: u64,
+    ) -> Result<
+        Option<std::sync::Arc<busbar_contract::abi::transport::guest_policy::Policy>>,
+        ServiceError,
+    > {
+        loans
+            .open(
+                self.ticket,
+                stream,
+                self.policy.extensions,
+                self.policy.out,
+                self.policy.leases,
+            )
+            .map_err(|_| ServiceError::Unserved)
     }
 
     #[allow(clippy::too_many_arguments)]

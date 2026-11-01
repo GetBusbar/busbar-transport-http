@@ -36,7 +36,7 @@
 //! kernel cannot give leaves the stream unanswered: hyper ends it with no bytes, for
 //! this transport writes no refusal bytes of its own.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -50,7 +50,9 @@ use busbar_contract::abi::host::service::{
 };
 use busbar_contract::abi::mechanism::ticket::Ticket;
 use busbar_contract::abi::sdk::services::{HeadViewArgs, Pend, Place, RefusalCopy, ServiceError};
+use busbar_contract::abi::sdk::transport::policy::Loans;
 use busbar_contract::abi::transport::fields;
+use busbar_contract::abi::transport::guest_policy::Policy;
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper_util::server::conn::auto;
@@ -211,9 +213,7 @@ struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
 /// mid-answer (an HTTP/2 reset): either way the framing is told ([`ReplyQ::gone`]).
 impl Drop for Reply {
     fn drop(&mut self) {
-        if let Ok(mut q) = self.0.lock() {
-            q.gone = true;
-        }
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).gone = true;
     }
 }
 
@@ -255,6 +255,12 @@ impl Body for Reply {
     }
 }
 
+/// An immutable stream loan and its once-decoded local route rows.
+struct StreamPolicy {
+    loan: Arc<Policy>,
+    lines: Arc<[Line]>,
+}
+
 /// One request's answer side.
 struct Answer {
     /// Where the head goes, until the first emit.
@@ -273,6 +279,9 @@ struct Answer {
     parts: Option<http::request::Parts>,
     /// Where the request stands on its way through the guest list.
     gate: Gate,
+    policy: Option<Arc<StreamPolicy>>,
+    loan_ticket: Option<Ticket>,
+    opened_on: Option<Ticket>,
     /// The body held for a `HeadBody` auth; zeroised once handed on, and every allocation it
     /// outgrew zeroised as it grew ([`extend_wiped`]).
     held: Vec<u8>,
@@ -297,6 +306,8 @@ struct Answer {
 enum Gate {
     /// Decoded, not yet matched.
     Arrived,
+    /// The selected generation's matched auth has not completed its connection point.
+    Peer(usize),
     /// Matched line `.0`, whose auth needs `HeadBody`: the body is being held.
     Hold(usize),
     /// Matched line `.0`: its auth is called at its head point.
@@ -309,6 +320,16 @@ enum Gate {
     Refused,
     /// Neither admitted nor refused: left unanswered, for hyper to end.
     Failed,
+}
+
+fn request_gate(points: u32, line: usize) -> Gate {
+    if points & POINT_HEAD_BODY != 0 {
+        Gate::Hold(line)
+    } else if points & POINT_HEAD != 0 {
+        Gate::Auth(line)
+    } else {
+        Gate::HandIn(line)
+    }
 }
 
 /// What the service and the framing share.
@@ -334,6 +355,18 @@ pub trait Kernel {
     /// The ticket of the op the calls are made on; a call that pends is parked on it.
     /// [`Ticket::NONE`] on an op with no ticket, where no `auth.call` is made.
     fn ticket(&self) -> Ticket;
+
+    /// Select a stream's immutable host policy before matching or reading its body.
+    ///
+    /// # Errors
+    /// The policy reply is invalid or the host did not provide this service.
+    fn open_policy(
+        &mut self,
+        _loans: &mut Loans,
+        _stream: u64,
+    ) -> Result<Option<Arc<Policy>>, ServiceError> {
+        Err(ServiceError::Unserved)
+    }
 
     /// `auth.call`: the flow, the request's unit and the names to strip.
     #[allow(clippy::too_many_arguments)]
@@ -386,6 +419,12 @@ pub struct Admitted {
     pub moved: bool,
     /// An `auth.call` is pending: its stream is parked until the next drive.
     pub parked: bool,
+    /// The operation issued an empty `guest.open` yield.
+    pub policy_requested: bool,
+    /// A malformed policy reply cannot silently discard a host-granted stream.
+    pub policy_failed: bool,
+    /// Flush current progress before opening another waiting stream.
+    pub more: bool,
 }
 
 /// One accepted connection's HTTP machine.
@@ -420,12 +459,24 @@ pub struct Accepted {
     raw: Option<Vec<u8>>,
     /// The listener's guest list, in match order.
     lines: Arc<[Line]>,
+    loans: Option<Loans>,
+    /// Operations whose original input was consumed before a policy roundtrip.
+    policy_input: HashSet<Ticket>,
+    last_policy: Option<Arc<StreamPolicy>>,
+    /// Heads handed in but not yet completely copied to a READY answer.
+    publishing: Vec<u64>,
+    /// Unpublished stream custody held by active operations, absent on ordinary body chunks.
+    claimed: Vec<(Ticket, u64)>,
     /// The distinct auth handles the lines call at the peer point, in list order.
     peer_auths: Vec<AuthRef>,
     /// How many of them answered CONTINUE.
     peer_done: usize,
     /// A pending peer call's handle, `(ticket, seq)`.
     peer_parked: Option<(Ticket, u32)>,
+    /// Successful connection verdicts are reusable only for the exact sealed auth handle.
+    checked_peers: Vec<AuthRef>,
+    /// A generation's pending connection verdict belongs to one stream and operation.
+    policy_peer_parked: Vec<(AuthRef, Ticket, u32, u64)>,
     /// The last completion sequence number issued.
     seq: u32,
     /// The upstream's scheme the auth handle is shown (`SCHEME_*`, never `0`), as the host stated
@@ -450,6 +501,15 @@ pub struct Accepted {
 impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
+        if let Some(rest) = self.leftover.as_mut() {
+            // Draining a VecDeque leaves the removed slots outside its live slices. Reinitialize
+            // every slot within its existing allocation, then wipe both live slices. This does
+            // not grow the allocation and also wipes bytes already handed to the next framer.
+            rest.resize(rest.capacity(), 0);
+            let (front, back) = rest.as_mut_slices();
+            front.zeroize();
+            back.zeroize();
+        }
         // A body held for a `HeadBody` auth when the framing is torn down mid-hold.
         if let Ok(mut sh) = self.shared.lock() {
             for a in sh.streams.values_mut() {
@@ -460,6 +520,13 @@ impl Drop for Accepted {
 }
 
 impl Accepted {
+    /// Use host-selected per-stream policies when the initial Begin advertised them.
+    #[must_use]
+    pub fn with_policies(mut self, loans: Option<Loans>) -> Self {
+        self.loans = loans;
+        self
+    }
+
     /// Serve an accepted connection at host time `now_ns`, under guest list `lines`.
     #[must_use]
     pub fn accept(now_ns: u64, lines: impl Into<Arc<[Line]>>) -> Self {
@@ -509,9 +576,16 @@ impl Accepted {
             leftover: None,
             raw: Some(Vec::new()),
             lines,
+            loans: None,
+            policy_input: HashSet::new(),
+            last_policy: None,
+            publishing: Vec::new(),
+            claimed: Vec::new(),
             peer_auths,
             peer_done: 0,
             peer_parked: None,
+            checked_peers: Vec::new(),
+            policy_peer_parked: Vec::new(),
             seq: 0,
             scheme: SCHEME_PLAIN,
             refused_whole: false,
@@ -677,25 +751,68 @@ impl Accepted {
         self
     }
 
+    /// The initial connection policy's peer checks completed without ending the connection.
+    pub fn peer_ready(&self) -> bool {
+        self.peer_done == self.peer_auths.len() && !self.ended
+    }
+
+    /// A policy roundtrip recalls the operation with its original input, already consumed.
+    pub fn policy_pending(&self, ticket: Ticket) -> bool {
+        self.policy_input.contains(&ticket)
+    }
+
     /// CANCEL of the op on `ticket`: every `auth.call` parked on it is let go (a later op calls
     /// afresh, under a new handle), and `true` when there was one (the op's bytes were taken: the
     /// cancel is partial).
     pub fn cancel(&mut self, ticket: Ticket) -> bool {
-        let mut any = false;
+        let mut any = self.policy_input.remove(&ticket);
+        self.policy_peer_parked.retain(|(_, owner, _, _)| {
+            if *owner == ticket {
+                any = true;
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(loans) = &mut self.loans {
+            any |= loans.cancel(ticket).is_some();
+        }
         if self.peer_parked.is_some_and(|(t, _)| t == ticket) {
             self.peer_parked = None;
             any = true;
         }
-        for a in self
-            .shared
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .streams
-            .values_mut()
-        {
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut aborted = Vec::new();
+        for (id, a) in &mut sh.streams {
+            if a.loan_ticket == Some(ticket) || a.opened_on == Some(ticket) {
+                aborted.push((*id, a.up));
+                a.loan_ticket = None;
+                a.opened_on = None;
+                a.policy = None;
+                a.parts = None;
+                a.body = None;
+                a.respond = None;
+                a.asked = true;
+                a.gate = Gate::Failed;
+                let_held_go(&mut a.held);
+                any = true;
+            }
             if a.parked.is_some_and(|(t, _)| t == ticket) {
                 a.parked = None;
                 any = true;
+            }
+        }
+        if !aborted.is_empty() {
+            let aborted_stream = |id: u64| aborted.iter().any(|(stream, _)| *stream == id);
+            sh.out.retain(|piece| !aborted_stream(piece.stream));
+            self.out.retain(|piece| !aborted_stream(piece.stream));
+            self.publishing.retain(|stream| !aborted_stream(*stream));
+            self.claimed.retain(|(_, stream)| !aborted_stream(*stream));
+            for (id, up) in aborted {
+                if up {
+                    self.out
+                        .push_back(Piece::failure(id, "the opening operation was cancelled"));
+                }
             }
         }
         any
@@ -769,6 +886,7 @@ impl Accepted {
                 w.wake();
             }
             drop(q);
+            let_unread_body_go(a);
             a.told = true;
             return Ok(());
         }
@@ -945,6 +1063,21 @@ impl Accepted {
         Ok(full)
     }
 
+    /// Undelivered carrier input plus pieces still waiting for the host's sink. Call after
+    /// selecting a yield so bytes copied into that yield are counted only by the host.
+    /// Hyper's parser/flow-control buffers retain their existing bounds. HeadBody collection
+    /// deliberately consumes input under the selected line's body limit; counting it as unread
+    /// input would prevent a valid body larger than the receive window from ever completing.
+    pub fn retained_input(&self) -> usize {
+        let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        self.out
+            .iter()
+            .chain(&shared.out)
+            .fold(self.io.pending_input(), |n, p| {
+                n.saturating_add(p.bytes.len())
+            })
+    }
+
     /// Drive the connection at host time `now_ns` until nothing inside it has more to do.
     pub fn drive(&mut self, now_ns: u64) {
         self.io.set_time(now_ns);
@@ -990,7 +1123,7 @@ impl Accepted {
             let open: Vec<u64> = sh
                 .streams
                 .iter()
-                .filter(|(_, a)| a.up && !a.asked && !a.switched)
+                .filter(|(_, a)| a.up && !a.asked && !a.told && !a.switched)
                 .map(|(s, _)| *s)
                 .collect();
             for s in open {
@@ -1021,7 +1154,7 @@ impl Accepted {
             let Some(a) = sh.streams.get_mut(&s) else {
                 continue;
             };
-            let tell = a.up && !a.told;
+            let tell = (a.up || a.policy.is_some() || a.loan_ticket.is_some()) && !a.told;
             a.told = true;
             a.respond = None;
             a.body = None;
@@ -1064,6 +1197,13 @@ impl Accepted {
             .collect();
         for s in gone {
             if let Some(mut a) = sh.streams.remove(&s) {
+                if let (Some(loans), Some(ticket)) = (&mut self.loans, a.loan_ticket) {
+                    loans.cancel(ticket);
+                }
+                self.policy_peer_parked
+                    .retain(|(_, _, _, stream)| *stream != s);
+                self.claimed.retain(|(_, stream)| *stream != s);
+                self.publishing.retain(|stream| *stream != s);
                 let_held_go(&mut a.held);
             }
         }
@@ -1087,6 +1227,16 @@ impl Accepted {
     ///
     /// The switch itself failed.
     pub fn detach(&mut self) -> Result<Option<&mut VecDeque<u8>>, Failure> {
+        // A prefix of the h2 preface has not identified an HTTP/1 upgrade. Keep these bytes
+        // with this framing until the protocol is known, rather than losing the prefix on a
+        // refused hand-over. Empty input retains the existing empty detach behavior.
+        if self
+            .raw
+            .as_ref()
+            .is_some_and(|raw| !raw.is_empty() && H2_PREFACE.starts_with(raw.as_slice()))
+        {
+            return Ok(None);
+        }
         let switched = self
             .shared
             .lock()
@@ -1096,6 +1246,7 @@ impl Accepted {
             .any(|a| a.switched);
         if self.leftover.is_none() && !switched {
             if let Some(raw) = self.raw.take() {
+                let mut raw = zeroize::Zeroizing::new(raw);
                 #[cfg(test)]
                 crate::wipe_probe::watch("detach leftover", &raw);
                 if raw.starts_with(H2_PREFACE) {
@@ -1103,7 +1254,7 @@ impl Accepted {
                 }
                 // hyper is dropped unanswered: the far side's bytes are the upgrade framer's now.
                 self.conn = None;
-                self.leftover = Some(raw.into());
+                self.leftover = Some(std::mem::take(&mut *raw).into());
                 self.ended = true;
             }
         }
@@ -1151,24 +1302,24 @@ impl Accepted {
             let mut upgraded =
                 upgraded.map_err(|e| Failure(format!("detach: the switch failed: {e}")))?;
             // Read the switched connection dry: hyper's own read-ahead first, then the pipe.
-            let mut rest = VecDeque::new();
+            let mut rest = zeroize::Zeroizing::new(Vec::new());
             let waker = Waker::noop();
             let mut cx = Context::from_waker(waker);
-            let mut buf = vec![0_u8; 16 * 1024];
+            let mut buf = zeroize::Zeroizing::new(vec![0_u8; 16 * 1024]);
             #[cfg(test)]
             crate::wipe_probe::watch("detach read", &buf);
             loop {
                 let mut rb = hyper::rt::ReadBuf::new(&mut buf);
                 match hyper::rt::Read::poll_read(Pin::new(&mut upgraded), &mut cx, rb.unfilled()) {
                     Poll::Ready(Ok(())) if !rb.filled().is_empty() => {
-                        rest.extend(rb.filled());
+                        extend_wiped(&mut rest, rb.filled());
                         #[cfg(test)]
-                        crate::wipe_probe::watch("detach leftover", rest.make_contiguous());
+                        crate::wipe_probe::watch("detach leftover", &rest);
                     }
                     _ => break,
                 }
             }
-            self.leftover = Some(rest);
+            self.leftover = Some(std::mem::take(&mut *rest).into());
             self.ended = true;
         }
         Ok(self.leftover.as_mut())
@@ -1223,6 +1374,9 @@ fn serve(
                 asked: false,
                 parts: Some(parts),
                 gate: Gate::Arrived,
+                policy: None,
+                loan_ticket: None,
+                opened_on: None,
                 held: Vec::new(),
                 held_whole: false,
                 held_over: false,
@@ -1260,7 +1414,11 @@ fn carry_bodies(sh: &mut Shared, lines: &[Line], bounds: &Bounds<'_>, cx: &mut C
     let Shared { out, streams, .. } = sh;
     for (id, a) in streams.iter_mut() {
         if let Gate::Hold(n) = a.gate {
-            hold_body(a, lines[n].body_limit, bounds, cx);
+            let limit = a
+                .policy
+                .as_ref()
+                .map_or_else(|| lines[n].body_limit, |p| p.lines[n].body_limit);
+            hold_body(a, limit, bounds, cx);
             continue;
         }
         if a.gate != Gate::Admitted {
@@ -1455,11 +1613,9 @@ fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
 }
 
 impl Accepted {
-    /// ADMIT what the guest list holds: the peer point first, once per connection, then every
-    /// waiting request in arrival order, each as far as it can go now. A pending `auth.call` parks
-    /// only its own stream (or, at the peer point, the connection's requests) until the next drive
-    /// re-issues it.
-    pub fn admit(&mut self, k: &mut dyn Kernel) -> Admitted {
+    /// Check the initial peer policy once, before any stream's admission. A pending peer call
+    /// retains its completion identity until the opening operation resumes.
+    pub fn admit_peer(&mut self, k: &mut dyn Kernel) -> Admitted {
         let mut did = Admitted::default();
         if self.ended && self.conn.is_none() {
             return did;
@@ -1494,6 +1650,9 @@ impl Accepted {
                     return did;
                 }
                 Poll::Ready(Ok((FLOW_CONTINUE, ..))) => {
+                    if !self.checked_peers.contains(&auth) {
+                        self.checked_peers.push(auth);
+                    }
                     self.peer_done += 1;
                     did.moved = true;
                 }
@@ -1506,14 +1665,88 @@ impl Accepted {
                 }
             }
         }
+        did
+    }
+
+    /// Admit decoded requests, retaining each selected policy through its last body byte.
+    pub fn admit(&mut self, k: &mut dyn Kernel) -> Admitted {
+        let mut did = self.admit_peer(k);
+        if did.parked
+            || self.peer_done < self.peer_auths.len()
+            || (self.ended && self.conn.is_none())
+        {
+            return did;
+        }
         let shared = self.shared.clone();
         let mut sh = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        let waiting = std::mem::take(&mut sh.waiting);
-        for id in waiting {
+        let mut waiting = std::mem::take(&mut sh.waiting);
+        if let Some(at) = waiting.iter().position(|id| {
+            sh.streams
+                .get(id)
+                .is_some_and(|a| a.loan_ticket == Some(k.ticket()))
+        }) {
+            waiting.swap(0, at);
+        }
+        let mut waiting = waiting.into_iter();
+        while let Some(id) = waiting.next() {
             let Some(mut a) = sh.streams.remove(&id) else {
                 continue;
             };
             let before = a.gate;
+            if a.gate == Gate::Arrived && a.policy.is_none() && self.loans.is_some() {
+                if a.loan_ticket.is_some_and(|ticket| ticket != k.ticket()) {
+                    sh.streams.insert(id, a);
+                    sh.waiting.push(id);
+                    continue;
+                }
+                // A policy request must be an empty READY answer. Flush progress first and
+                // never retire an operation that already has a pending auth call.
+                if did.parked || self.wire_pending() || !self.out.is_empty() || !sh.out.is_empty() {
+                    did.more = true;
+                    sh.streams.insert(id, a);
+                    sh.waiting.push(id);
+                    continue;
+                }
+                let loans = self.loans.as_mut().expect("checked above");
+                a.loan_ticket = Some(k.ticket());
+                match k.open_policy(loans, id) {
+                    Ok(Some(loan)) => {
+                        let policy = match &self.last_policy {
+                            Some(cached) if Arc::ptr_eq(&cached.loan, &loan) => Arc::clone(cached),
+                            _ => {
+                                let lines = loan.lines.iter().map(Line::from_policy).collect();
+                                let policy = Arc::new(StreamPolicy { loan, lines });
+                                self.last_policy = Some(Arc::clone(&policy));
+                                policy
+                            }
+                        };
+                        a.policy = Some(policy);
+                        a.loan_ticket = None;
+                        a.opened_on = Some(k.ticket());
+                        self.claimed.push((k.ticket(), id));
+                    }
+                    Ok(None) => {
+                        self.policy_input.insert(k.ticket());
+                        did.policy_requested = true;
+                        sh.streams.insert(id, a);
+                        sh.waiting.push(id);
+                        sh.waiting.extend(waiting);
+                        return did;
+                    }
+                    Err(_) => {
+                        self.policy_input.remove(&k.ticket());
+                        loans.cancel(k.ticket());
+                        a.loan_ticket = None;
+                        fail(&mut a, &mut did);
+                        did.policy_failed = true;
+                    }
+                }
+                if did.policy_failed {
+                    sh.streams.insert(id, a);
+                    sh.waiting.extend(waiting);
+                    return did;
+                }
+            }
             // A request parked on this op's ticket parks only its own stream: every other waiting
             // request is still matched, called and handed in here, each under its own completion
             // sequence. The op then answers PENDING and yields nothing (the transport contract), so
@@ -1524,6 +1757,9 @@ impl Accepted {
             // answers.
             did.moved |= a.gate != before;
             let done = matches!(a.gate, Gate::Admitted | Gate::Refused | Gate::Failed);
+            if a.gate == Gate::Admitted && before != Gate::Admitted && a.opened_on.is_some() {
+                self.publishing.push(id);
+            }
             if a.gate == Gate::Refused {
                 // The connection answered: it is no longer one to hand over as sent.
                 self.let_raw_go();
@@ -1536,6 +1772,47 @@ impl Accepted {
         did
     }
 
+    /// A completed operation no longer owns an unadmitted stream's cancellation.
+    pub fn operation_done(&mut self, ticket: Ticket) {
+        self.policy_input.remove(&ticket);
+        if self.claimed.is_empty() {
+            return;
+        }
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        self.claimed.retain(|(owner, stream)| {
+            if *owner != ticket {
+                return true;
+            }
+            if let Some(a) = sh.streams.get_mut(stream) {
+                if a.opened_on == Some(ticket) {
+                    a.opened_on = None;
+                }
+            }
+            false
+        });
+    }
+
+    /// A whole head copied into READY is no longer owned by the opening operation's cancel.
+    pub fn published(&mut self) {
+        if self.publishing.is_empty() {
+            return;
+        }
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = &self.out;
+        self.publishing.retain(|stream| {
+            let pending = out
+                .iter()
+                .chain(sh.out.iter())
+                .any(|piece| piece.stream == *stream && piece.fields);
+            if !pending {
+                if let Some(a) = sh.streams.get_mut(stream) {
+                    a.opened_on = None;
+                }
+            }
+            pending
+        });
+    }
+
     /// Take request `id` as far through the guest list as it can go now.
     fn admit_one(
         &mut self,
@@ -1545,6 +1822,10 @@ impl Accepted {
         k: &mut dyn Kernel,
         did: &mut Admitted,
     ) {
+        let policy = a.policy.clone();
+        let lines = policy
+            .as_ref()
+            .map_or(self.lines.as_ref(), |p| p.lines.as_ref());
         loop {
             let Some(parts) = a.parts.as_ref() else {
                 return;
@@ -1553,7 +1834,7 @@ impl Accepted {
                 Gate::Arrived => {
                     let fields = field_lines(parts);
                     let to = match guest::matched(
-                        &self.lines,
+                        lines,
                         parts.method.as_str(),
                         parts.uri.path(),
                         &fields,
@@ -1562,26 +1843,87 @@ impl Accepted {
                             return self.kernel_refuse(id, a, REFUSE_NO_ROUTE, LINE_NONE, k, did);
                         }
                         Matched::MethodMiss(n) => {
-                            let line = self.lines[n].line;
+                            let line = lines[n].line;
                             return self.kernel_refuse(id, a, REFUSE_METHOD_MISS, line, k, did);
                         }
                         Matched::Line(n) => {
-                            let points = self.lines[n].points;
-                            if points & POINT_HEAD_BODY != 0 {
-                                Gate::Hold(n)
-                            } else if points & POINT_HEAD != 0 {
-                                Gate::Auth(n)
+                            let points = lines[n].points;
+                            if points & POINT_PEER != 0
+                                && !self.checked_peers.contains(&lines[n].auth)
+                            {
+                                Gate::Peer(n)
                             } else {
-                                Gate::HandIn(n)
+                                request_gate(points, n)
                             }
                         }
                     };
                     a.gate = to;
                 }
+                Gate::Peer(n) => {
+                    let auth = lines[n].auth;
+                    if self.checked_peers.contains(&auth) {
+                        a.gate = request_gate(lines[n].points, n);
+                        continue;
+                    }
+                    if k.ticket().is_none() {
+                        return;
+                    }
+                    let pending = self
+                        .policy_peer_parked
+                        .iter()
+                        .find(|(held, _, _, _)| *held == auth)
+                        .copied();
+                    let seq = match pending {
+                        Some((_, ticket, seq, stream)) if ticket == k.ticket() && stream == id => {
+                            seq
+                        }
+                        Some(_) => return,
+                        None => self.next_seq(),
+                    };
+                    if a.opened_on != Some(k.ticket()) {
+                        a.opened_on = Some(k.ticket());
+                        self.claimed.push((k.ticket(), id));
+                    }
+                    a.parked = None;
+                    let answer = k.auth_call(
+                        seq,
+                        auth,
+                        UnitRef::NONE,
+                        POINT_PEER,
+                        id,
+                        &HeadViewArgs::default(),
+                        None,
+                    );
+                    self.policy_peer_parked
+                        .retain(|(held, _, _, _)| *held != auth);
+                    match answer {
+                        Poll::Pending => {
+                            self.policy_peer_parked.push((auth, k.ticket(), seq, id));
+                            a.parked = Some((k.ticket(), seq));
+                            did.parked = true;
+                            return;
+                        }
+                        Poll::Ready(Ok((FLOW_CONTINUE, ..))) => {
+                            self.checked_peers.push(auth);
+                            a.gate = request_gate(lines[n].points, n);
+                        }
+                        Poll::Ready(Ok(_)) => {
+                            return self.kernel_refuse(
+                                id,
+                                a,
+                                REFUSE_STOPPED,
+                                lines[n].line,
+                                k,
+                                did,
+                            );
+                        }
+                        Poll::Ready(Err(_)) => return fail(a, did),
+                    }
+                }
                 Gate::Hold(n) => {
                     if a.held_over {
                         // The size gate, before any verdict.
-                        let line = self.lines[n].line;
+                        let line = lines[n].line;
                         return self.kernel_refuse(id, a, REFUSE_OVER_GATE, line, k, did);
                     }
                     if !a.held_whole {
@@ -1595,7 +1937,7 @@ impl Accepted {
                     if k.ticket().is_none() {
                         return;
                     }
-                    let l = &self.lines[n];
+                    let l = &lines[n];
                     let (auth, line, body_point) =
                         (l.auth, l.line, l.points & POINT_HEAD_BODY != 0);
                     // A call parked on another op's ticket is re-issued only on that ticket's
@@ -1607,6 +1949,10 @@ impl Accepted {
                         None => self.next_seq(),
                     };
                     a.parked = None;
+                    if a.policy.is_some() && a.opened_on != Some(k.ticket()) {
+                        a.opened_on = Some(k.ticket());
+                        self.claimed.push((k.ticket(), id));
+                    }
                     let fields = field_lines(parts);
                     let view = head_view(parts, &fields, self.scheme);
                     let (point, body) = if body_point {
@@ -1637,7 +1983,7 @@ impl Accepted {
                     }
                 }
                 Gate::HandIn(n) => {
-                    let (auth, line) = (self.lines[n].auth, self.lines[n].line);
+                    let (auth, line) = (lines[n].auth, lines[n].line);
                     let seq = self.next_seq();
                     let fields = field_lines(parts);
                     let view = head_view(parts, &fields, self.scheme);
@@ -1818,7 +2164,10 @@ fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
         let body = a.held.clone();
         #[cfg(test)]
         crate::wipe_probe::watch("admitted body", &body);
-        out.push_back(Piece::data(id, Bytes::from(body)));
+        out.push_back(Piece::data(
+            id,
+            super::engine::held_bytes(zeroize::Zeroizing::new(body)),
+        ));
         let_held_go(&mut a.held);
     }
     if a.held_whole {

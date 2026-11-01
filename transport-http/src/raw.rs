@@ -180,9 +180,9 @@ impl<'a> Head<'a> {
 #[derive(Default)]
 pub(crate) struct ChunkedDecoder {
     state: ChunkState,
-    line: Vec<u8>,
+    line: zeroize::Zeroizing<Vec<u8>>,
     want: usize,
-    body: Vec<u8>,
+    body: zeroize::Zeroizing<Vec<u8>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +237,7 @@ impl ChunkedDecoder {
                 ChunkState::Done => return Ok(at),
                 ChunkState::Data => {
                     let n = self.want.min(rest.len());
-                    self.body.extend_from_slice(&rest[..n]);
+                    crate::door::engine::extend_wiped(&mut self.body, &rest[..n]);
                     #[cfg(test)]
                     crate::wipe_probe::watch("chunk decoded", &self.body);
                     self.want -= n;
@@ -265,7 +265,7 @@ impl ChunkedDecoder {
                 ChunkState::Size | ChunkState::Trailers => {
                     let end = memchr::memchr(b'\n', rest);
                     let part = &rest[..end.unwrap_or(rest.len())];
-                    self.line.extend_from_slice(part);
+                    crate::door::engine::extend_wiped(&mut self.line, part);
                     #[cfg(test)]
                     crate::wipe_probe::watch("chunk line", &self.line);
                     let Some(end) = end else {
@@ -301,7 +301,7 @@ impl ChunkedDecoder {
             _ if line.contains(':') => ChunkState::Trailers,
             _ => return Err(ChunkedMalformed),
         };
-        self.line.clear();
+        zeroize::Zeroize::zeroize(&mut *self.line);
         Ok(())
     }
 
@@ -319,7 +319,7 @@ impl ChunkedDecoder {
 
     /// The decoded body.
     #[must_use]
-    pub(crate) fn take(self) -> Vec<u8> {
+    pub(crate) fn take(self) -> zeroize::Zeroizing<Vec<u8>> {
         self.body
     }
 }

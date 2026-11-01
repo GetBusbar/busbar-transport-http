@@ -485,8 +485,8 @@ impl Host {
                 std::time::Instant::now() < deadline,
                 "the far end did not get there in {PUMP_DEADLINE:?}"
             );
-            if self.pump_once(got) == Some(Outcome::Ready) {
-                break;
+            if let Some(outcome) = self.pump_once(got) {
+                return outcome;
             }
         }
         Outcome::Ready

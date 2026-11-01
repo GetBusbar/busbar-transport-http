@@ -148,7 +148,7 @@ impl Framings {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        slot.generation = slot.generation.wrapping_add(1);
+        slot.generation = slot.generation.checked_add(1)?;
         slot.held = Some(Box::new(held));
         Some(token(index, slot.generation))
     }
@@ -233,11 +233,15 @@ impl Framings {
         slot.0.clear_poison();
         // Dropped outside the slot's lock: a framing's drop runs hyper's and the pipe's.
         drop(held);
-        self.free
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .idle
-            .push(index);
+        // A token must never alias an earlier generation, including at the integer boundary.
+        // A slot at its last generation is retired; ordinary slots keep their existing reuse.
+        if generation != u32::MAX {
+            self.free
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .idle
+                .push(index);
+        }
         Ok(())
     }
 }
