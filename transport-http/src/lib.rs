@@ -15,7 +15,8 @@
 //! `http` carries no session and its status class rides the first response frame: the
 //! kernel-derived leg of the fee decision the design's settlement table reads.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 // THE KIND'S SHAPE: what it declares (`meta`), what it claims
@@ -51,3 +52,8 @@ pub mod linked {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+#[path = "tests/wipe_probe.rs"]
+mod wipe_probe;

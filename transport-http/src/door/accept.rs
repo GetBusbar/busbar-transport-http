@@ -1096,6 +1096,8 @@ impl Accepted {
             .any(|a| a.switched);
         if self.leftover.is_none() && !switched {
             if let Some(raw) = self.raw.take() {
+                #[cfg(test)]
+                crate::wipe_probe::watch("detach leftover", &raw);
                 if raw.starts_with(H2_PREFACE) {
                     return Ok(None);
                 }
@@ -1153,10 +1155,16 @@ impl Accepted {
             let waker = Waker::noop();
             let mut cx = Context::from_waker(waker);
             let mut buf = vec![0_u8; 16 * 1024];
+            #[cfg(test)]
+            crate::wipe_probe::watch("detach read", &buf);
             loop {
                 let mut rb = hyper::rt::ReadBuf::new(&mut buf);
                 match hyper::rt::Read::poll_read(Pin::new(&mut upgraded), &mut cx, rb.unfilled()) {
-                    Poll::Ready(Ok(())) if !rb.filled().is_empty() => rest.extend(rb.filled()),
+                    Poll::Ready(Ok(())) if !rb.filled().is_empty() => {
+                        rest.extend(rb.filled());
+                        #[cfg(test)]
+                        crate::wipe_probe::watch("detach leftover", rest.make_contiguous());
+                    }
                     _ => break,
                 }
             }

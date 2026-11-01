@@ -1046,7 +1046,7 @@ impl SafeSlot for Detach {
         };
         let mut frame = sink.frame();
         let n = rest.len().min(frame.cap());
-        let taken: Vec<u8> = rest.drain(..n).collect();
+        let taken = take_detached(rest, n);
         frame.extend(&taken);
         let mut y = o.get().yielded;
         y.wire_len = wire_buf.written() as u64;
@@ -1060,6 +1060,14 @@ impl SafeSlot for Detach {
         o.set(|x| &x.yielded, y);
         Outcome::Ready
     }
+}
+
+// One bounded copy from detached custody into the host's frame sink.
+fn take_detached(rest: &mut std::collections::VecDeque<u8>, n: usize) -> Vec<u8> {
+    let taken: Vec<u8> = rest.drain(..n).collect();
+    #[cfg(test)]
+    crate::wipe_probe::watch("detach taken", &taken);
+    taken
 }
 
 /// `finish`.

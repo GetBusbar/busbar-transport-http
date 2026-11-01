@@ -3741,3 +3741,36 @@ fn the_accepted_side_states_the_protocol_it_agreed_linked_and_dropped_in() {
 fn a_cleartext_accepting_offer_changes_nothing_else_linked_and_dropped_in() {
     both(a_cleartext_offer_changes_nothing_else);
 }
+
+#[test]
+fn pump_until_returns_the_actual_framing_failure() {
+    both(|label, ops| {
+        let (to_server, _server) = mpsc::unbounded_channel();
+        let (release, _release) = mpsc::channel(1);
+        let sock = Arc::new(Socket {
+            rx: Mutex::new((VecDeque::from(b"not a valid framing".to_vec()), true)),
+            silent: AtomicBool::new(false),
+            to_server,
+            release,
+        });
+        let mut host = Host::open(ops, "{}", sock, ROOMY);
+        // There was no Begin: actual Ingest refuses this nonexistent framing. Stop the old pump
+        // on its next loop condition so its swallowed failure is an immediate assertion, not a
+        // thirty-second timeout.
+        let polls = std::cell::Cell::new(0);
+        let result = host.pump_until(
+            |_| {
+                let before = polls.get();
+                polls.set(before + 1);
+                before != 0
+            },
+            &mut Vec::new(),
+        );
+        host.close();
+        assert_eq!(
+            result,
+            Outcome::Failed,
+            "{label}: propagate the real op failure"
+        );
+    });
+}

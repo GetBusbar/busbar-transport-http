@@ -975,3 +975,91 @@ fn a_stalled_or_trickled_request_body_fails_its_stream() {
         "a body under 1 KiB/s past 10 s fails its stream"
     );
 }
+
+#[test]
+fn detached_unanswered_credentials_are_wiped_on_full_drain_and_abandonment() {
+    use crate::wipe_probe::Probe;
+    let request = b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nauthorization: Bearer detach-canary\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n";
+    for finish in [false, true] {
+        let mut a = accepted();
+        a.ingest(request, false);
+        run(&mut a, SEC);
+        assert_eq!(up(&mut a).heads.len(), 1);
+        let probe = Probe::start();
+        let mut handed = Vec::new();
+        loop {
+            let rest = a
+                .detach()
+                .expect("detaches")
+                .expect("unanswered connection");
+            let n = rest.len().min(7);
+            if n == 0 {
+                break;
+            }
+            let taken = crate::door::take_detached(rest, n);
+            handed.extend_from_slice(&taken);
+            drop(taken);
+            if !finish {
+                break;
+            }
+        }
+        assert_eq!(
+            handed,
+            if finish {
+                request.as_slice()
+            } else {
+                &request[..7]
+            }
+        );
+        drop(a);
+        probe
+            .finish()
+            .assert_wiped_on_linux(&["detach leftover", "detach taken"]);
+    }
+}
+
+#[test]
+fn switched_read_ahead_and_each_owned_detach_copy_are_wiped() {
+    use crate::wipe_probe::Probe;
+    let mut a = accepted();
+    a.ingest(b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n", false);
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(
+        stream,
+        b"connection: upgrade\r\nupgrade: x-test\r\n",
+        true,
+        101,
+    )
+    .unwrap();
+    run(&mut a, SEC);
+    // Exceed the actual detach read buffer so growth destroys an earlier credential allocation.
+    let payload = b"switched-credential-canary".repeat(2000);
+    a.ingest(&payload, false);
+    let probe = Probe::start();
+    let mut handed = Vec::new();
+    loop {
+        let rest = a
+            .detach()
+            .expect("switch completed")
+            .expect("switched bytes");
+        let n = rest.len().min(113);
+        if n == 0 {
+            break;
+        }
+        let taken = crate::door::take_detached(rest, n);
+        handed.extend_from_slice(&taken);
+        drop(taken);
+    }
+    assert_eq!(
+        handed, payload,
+        "every residual byte reaches the next framer unchanged"
+    );
+    drop(a);
+    let report = probe.finish();
+    assert!(
+        report.allocations_for("detach leftover") >= 2,
+        "growth freed an earlier residual allocation"
+    );
+    report.assert_wiped_on_linux(&["detach read", "detach leftover", "detach taken"]);
+}
