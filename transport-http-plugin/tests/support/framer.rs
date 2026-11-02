@@ -31,9 +31,97 @@ fn abi_bytes(b: &(impl AsRef<[u8]> + ?Sized)) -> AbiStr {
         len: b.as_ref().len(),
     }
 }
-fn count(p: &Plugin<Transport>) -> u64 {
+// Observe the real door operations and the host's mandatory custody calls separately.
+// Every custody crossing is asserted below and reconciled with the raw dispatcher total.
+std::thread_local! {
+    static RECEIPTS: std::cell::RefCell<std::collections::HashMap<u64, Vec<u32>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    static CROSSINGS: std::cell::RefCell<std::collections::HashMap<u64, (u64, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+fn actual_count(p: &Plugin<Transport>) -> u64 {
     p.inner.crossings.load(Ordering::SeqCst) - p.inner.resumes.load(Ordering::SeqCst)
 }
+fn framer_crossings(p: &Plugin<Transport>) -> u64 {
+    CROSSINGS.with(|counts| {
+        counts
+            .borrow()
+            .get(&p.instance().0)
+            .copied()
+            .unwrap_or_default()
+            .0
+    })
+}
+fn checked_call<I: InFrame, O: OutFrame>(
+    p: &Plugin<Transport>,
+    slot: u32,
+    frame: &mut Frame<I, O>,
+    recall: Option<busbar_plugin_loader::dispatch::Recall>,
+) -> Called {
+    let before = actual_count(p);
+    let mut called = match recall {
+        Some(token) => p.recall(token, slot, frame),
+        None => p.call(slot, frame),
+    };
+    let crossed = actual_count(p) - before;
+    assert!(crossed<=1,"an ordinary framer operation unexpectedly made {crossed} crossings at slot {slot}: {called:?}");
+    CROSSINGS.with(|counts| counts.borrow_mut().entry(p.instance().0).or_default().0 += crossed);
+    if called.lease != 0 {
+        assert_eq!(
+            called.outcome,
+            Outcome::Ready,
+            "only READY lends its receipt"
+        );
+        // SAFETY: OutFrame starts with the complete host OutHead. The actual product's
+        // validated receipt remains live under called.lease until the RELEASE below.
+        let head = unsafe { &*(std::ptr::from_ref(&frame.out).cast::<OutHead>()) };
+        assert_eq!(head.lease, called.lease);
+        assert_eq!(
+            head.extensions.fmt,
+            busbar_contract::abi::mechanism::call::BLOB_OCTETS
+        );
+        assert!(!head.extensions.ptr.is_null());
+        let bytes = unsafe { std::slice::from_raw_parts(head.extensions.ptr, head.extensions.len) };
+        let retained = busbar_contract::abi::sdk::transport::receive::decode(bytes)
+            .expect("well-formed actual receive receipt")
+            .expect("the lease carries a receive receipt");
+        let scope = busbar_plugin_loader::dispatch::framing_context::current()
+            .expect("receive custody belongs to the real framing scope");
+        assert_eq!(scope.owner(), p.instance().0);
+        assert_eq!(
+            scope.retained_input(),
+            retained,
+            "the dispatcher applied the receipt to this framing"
+        );
+        let mut input: busbar_contract::abi::mechanism::lifecycle::ReleaseIn = input();
+        input.lease = called.lease;
+        let mut release: Frame<_, OutHead> = Frame::new(input, output());
+        let before = actual_count(p);
+        let released = p.call(life::RELEASE, &mut release);
+        assert_eq!(
+            actual_count(p) - before,
+            1,
+            "exactly one custody RELEASE per receipt"
+        );
+        assert_eq!(
+            released.outcome,
+            Outcome::Ready,
+            "the real product accepted RELEASE"
+        );
+        assert_eq!(released.lease, 0, "RELEASE lends nothing back");
+        CROSSINGS.with(|counts| counts.borrow_mut().entry(p.instance().0).or_default().1 += 1);
+        // The product transcript records outstanding custody after the host consumed and
+        // returned its control receipt. The receipt was validated before any field was read.
+        RECEIPTS.with(|receipts| {
+            receipts
+                .borrow_mut()
+                .entry(p.instance().0)
+                .or_default()
+                .push(slot)
+        });
+        called.lease = 0;
+    }
+    called
+}
+
 enum Expected {
     Exact(String),
     Prefix(&'static str),
@@ -124,6 +212,10 @@ struct Sink {
     wire: Vec<u8>,
     frame: Vec<u8>,
     pieces: Vec<FramePiece>,
+    scope: Option<(
+        u64,
+        std::sync::Arc<busbar_plugin_loader::dispatch::framing_context::FramingContext>,
+    )>,
 }
 
 impl Sink {
@@ -143,6 +235,7 @@ impl Sink {
             wire: vec![0; wire],
             frame: vec![0; frame],
             pieces: vec![piece; pieces],
+            scope: None,
         }
     }
 
@@ -267,65 +360,88 @@ impl Op<'_> {
 
 fn go<I: InFrame, O: OutFrame>(p: &Plugin<Transport>, s: u32, i: I) -> (Called, O) {
     let mut f = Frame::new(i, output::<O>());
-    let c = p.call(s, &mut f);
+    let c = checked_call(p, s, &mut f, None);
     (c, f.out)
 }
 
 fn cross(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> (Called, FramerOut) {
-    let raw = sink.raw();
-    match op {
-        Op::Begin(side, target) => {
-            let mut i: BeginIn = input();
-            (i.side, i.sink, i.target) = (side, raw, abi_bytes(target));
-
-            i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
-            go(p, slot::BEGIN, i)
-        }
-        Op::Ingest(bytes, end) => {
-            let mut i: IngestIn = input();
-            (i.framing, i.bytes, i.len, i.end, i.sink) =
-                (framing, bytes.as_ptr(), bytes.len(), u32::from(end), raw);
-            go(p, slot::INGEST, i)
-        }
-        Op::Emit(bytes, end) => {
-            let mut i: EmitIn = input();
-            (i.framing, i.bytes, i.len, i.end_of_frame, i.sink) =
-                (framing, bytes.as_ptr(), bytes.len(), u32::from(end), raw);
-            go(p, slot::EMIT, i)
-        }
-        Op::Refuse(bytes) => {
-            let mut i: RefuseIn = input();
-            (i.framing, i.bytes, i.len, i.sink) = (framing, bytes.as_ptr(), bytes.len(), raw);
-            go(p, slot::REFUSE, i)
-        }
-        Op::Encode(body, fields) => {
-            let mut i: EncodeIn = input();
-            (i.body, i.body_len, i.sink) = (body.as_ptr(), body.len(), raw);
-            (i.fields, i.fields_len) = (fields.as_ptr(), fields.len());
-            go(p, slot::ENCODE, i)
-        }
-        Op::Adopt(leftover) => {
-            let mut i: AdoptIn = input();
-            (i.side, i.leftover, i.leftover_len, i.sink) =
-                (SIDE_ACCEPT, leftover.as_ptr(), leftover.len(), raw);
-            go(p, slot::ADOPT, i)
-        }
-        Op::Finish => {
-            let mut i: FinishIn = input();
-            (i.framing, i.sink) = (framing, raw);
-            go(p, slot::FINISH, i)
-        }
-        Op::Detach | Op::Timer => {
-            let mut i: FramingIn = input();
-            (i.framing, i.sink) = (framing, raw);
-            let s = if matches!(op, Op::Detach) {
-                slot::DETACH
-            } else {
-                slot::TIMER
-            };
-            go(p, s, i)
-        }
+    if framing == 0
+        || sink
+            .scope
+            .as_ref()
+            .is_none_or(|(token, _)| *token != framing)
+    {
+        sink.scope = Some((
+            framing,
+            busbar_plugin_loader::dispatch::framing_context::FramingContext::new(
+                p.instance().0,
+                0,
+                framing,
+                None,
+            )
+            .expect("actual product framing context"),
+        ));
     }
+    let scope = sink.scope.as_ref().unwrap().1.clone();
+    let raw = sink.raw();
+    let result =
+        busbar_plugin_loader::dispatch::framing_context::with_context(Some(scope), || match op {
+            Op::Begin(side, target) => {
+                let mut i: BeginIn = input();
+                (i.side, i.sink, i.target) = (side, raw, abi_bytes(target));
+
+                i.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+                go(p, slot::BEGIN, i)
+            }
+            Op::Ingest(bytes, end) => {
+                let mut i: IngestIn = input();
+                (i.framing, i.bytes, i.len, i.end, i.sink) =
+                    (framing, bytes.as_ptr(), bytes.len(), u32::from(end), raw);
+                go(p, slot::INGEST, i)
+            }
+            Op::Emit(bytes, end) => {
+                let mut i: EmitIn = input();
+                (i.framing, i.bytes, i.len, i.end_of_frame, i.sink) =
+                    (framing, bytes.as_ptr(), bytes.len(), u32::from(end), raw);
+                go(p, slot::EMIT, i)
+            }
+            Op::Refuse(bytes) => {
+                let mut i: RefuseIn = input();
+                (i.framing, i.bytes, i.len, i.sink) = (framing, bytes.as_ptr(), bytes.len(), raw);
+                go(p, slot::REFUSE, i)
+            }
+            Op::Encode(body, fields) => {
+                let mut i: EncodeIn = input();
+                (i.body, i.body_len, i.sink) = (body.as_ptr(), body.len(), raw);
+                (i.fields, i.fields_len) = (fields.as_ptr(), fields.len());
+                go(p, slot::ENCODE, i)
+            }
+            Op::Adopt(leftover) => {
+                let mut i: AdoptIn = input();
+                (i.side, i.leftover, i.leftover_len, i.sink) =
+                    (SIDE_ACCEPT, leftover.as_ptr(), leftover.len(), raw);
+                go(p, slot::ADOPT, i)
+            }
+            Op::Finish => {
+                let mut i: FinishIn = input();
+                (i.framing, i.sink) = (framing, raw);
+                go(p, slot::FINISH, i)
+            }
+            Op::Detach | Op::Timer => {
+                let mut i: FramingIn = input();
+                (i.framing, i.sink) = (framing, raw);
+                let s = if matches!(op, Op::Detach) {
+                    slot::DETACH
+                } else {
+                    slot::TIMER
+                };
+                go(p, s, i)
+            }
+        });
+    if result.1.framing != 0 {
+        sink.scope.as_mut().unwrap().0 = result.1.framing;
+    }
+    result
 }
 
 fn once(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> Yielded {
@@ -387,7 +503,7 @@ fn located_defaults(p: &Plugin<Transport>, target: &[u8]) -> (String, (Vec<HeadL
     (i.alpn_buf, i.alpn_cap) = (alpn.as_mut_ptr(), alpn.len());
     (i.defaults_buf, i.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
     let mut f: Frame<LocateIn, LocateOut> = Frame::new(i, output());
-    let c = p.call(slot::LOCATE, &mut f);
+    let c = checked_call(p, slot::LOCATE, &mut f, None);
     let written = (f.out.defaults_written as usize).min(defaults.len());
     let lines: Vec<HeadLine> = if c.outcome == Outcome::Ready {
         defaults[..written]
@@ -444,10 +560,7 @@ fn locate_on(
     let mut defaults = vec![0_u8; AMPLE];
     (i.defaults_buf, i.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
     let mut f: Frame<LocateIn, LocateOut> = Frame::new(i, output());
-    let c = match recall {
-        Some(token) => p.recall(token, slot::LOCATE, &mut f),
-        None => p.call(slot::LOCATE, &mut f),
-    };
+    let c = checked_call(p, slot::LOCATE, &mut f, recall);
     let (o, text) = (&f.out, c.error.as_deref().map(lossy));
     let written = (o.authority_written as usize).min(authority.len());
     let authority = if c.outcome == Outcome::Ready {
@@ -483,6 +596,13 @@ fn yielded_line(wire: &[u8], frames: &[Vec<u8>], raw: &[u8], flags: u32, framing
 }
 
 fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatcher) -> Vec<String> {
+    CROSSINGS.with(|counts| {
+        counts.borrow_mut().insert(p.instance().0, (0, 0));
+    });
+    RECEIPTS.with(|receipts| {
+        receipts.borrow_mut().insert(p.instance().0, Vec::new());
+    });
+    let raw_before = actual_count(p);
     let mut transcript = Vec::new();
     let inputs: Value = serde_json::from_str(include_str!("../conformance.json")).unwrap();
     let k = &inputs["transport"];
@@ -493,12 +613,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     assert!(!facts.datagram);
     transcript.push(format!("facts {facts:?}"));
     let begin = || once(p, 0, Op::Begin(SIDE_DIAL, b""), &mut Sink::ample()).line();
-    let before = count(p);
+    let before = framer_crossings(p);
     let answer = begin();
     assert!(answer.starts_with("Refused "));
     transcript.push(format!("begin unopened: {answer}"));
-    assert_eq!(count(p) - before, 0);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 0);
+    let before = framer_crossings(p);
     let mut i: ValidateIn = input();
     i.settings = Blob::json(b"{}");
     let (c, _): (_, OutHead) = go(p, life::VALIDATE, i);
@@ -508,8 +628,8 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         c.lease != 0,
         c.error
     ));
-    assert_eq!(count(p) - before, 1);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 1);
+    let before = framer_crossings(p);
     let mut i: OpenIn = input();
     i.settings = Blob::json(b"{}");
     i.generation = 1;
@@ -520,22 +640,26 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         c.lease != 0,
         c.error
     ));
-    assert_eq!(count(p) - before, 1);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 1);
+    let before = framer_crossings(p);
+    let actual_before = actual_count(p);
     let answer = p.ready(d, std::time::Duration::from_secs(30));
+    CROSSINGS.with(|counts| {
+        counts.borrow_mut().entry(p.instance().0).or_default().0 += actual_count(p) - actual_before
+    });
     assert!(answer.is_ok());
     transcript.push(format!("ready has_ready={} {answer:?}", p.has_ready()));
-    assert_eq!(count(p) - before, u64::from(p.has_ready()));
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, u64::from(p.has_ready()));
+    let before = framer_crossings(p);
     assert_eq!(carrier_ops(p), [Outcome::Refused; 8]);
-    assert_eq!(count(p) - before, 8);
+    assert_eq!(framer_crossings(p) - before, 8);
     match &k["locate"] {
         Value::String(v) if v == "refused" => {
             {
                 let label = "locate";
-                let before = count(&p);
+                let before = framer_crossings(&p);
                 let value = (|| locate(&p, b"conformance", AMPLE).0)();
-                assert_eq!(count(&p) - before, 1, "{label} crossings");
+                assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
                 let answer = value;
                 assert!(answer.starts_with("Refused "), "{label}: {answer}");
                 transcript.push(format!("{label}: {answer}"));
@@ -556,9 +680,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                 {
                     let label = &format!("locate #{n}");
                     let want = want;
-                    let before = count(&p);
+                    let before = framer_crossings(&p);
                     let value = (|| locate(&p, &target, AMPLE).0)();
-                    assert_eq!(count(&p) - before, 1, "{label} crossings");
+                    assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
                     let answer = value;
                     match want {
                         Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -585,7 +709,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             {
                 let label = "locate short";
                 let want = want;
-                let before = count(&p);
+                let before = framer_crossings(&p);
                 let value = (|| {
                     let (first, token) = locate(&p, &target, 1);
                     let Some((token, needed)) = token else {
@@ -594,7 +718,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
                     let again = locate_on(&p, &target, needed as usize, Some(token)).0;
                     format!("needed={needed} then {again}")
                 })();
-                assert_eq!(count(&p) - before, 2, "{label} crossings");
+                assert_eq!(framer_crossings(&p) - before, 2, "{label} crossings");
                 let answer = value;
                 match want {
                     Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -606,9 +730,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             for (n, t) in texts(&l["refuses"], "locate.refuses").iter().enumerate() {
                 {
                     let label = &format!("locate refused #{n}");
-                    let before = count(&p);
+                    let before = framer_crossings(&p);
                     let value = (|| locate(&p, t, AMPLE).0)();
-                    assert_eq!(count(&p) - before, 1, "{label} crossings");
+                    assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
                     let answer = value;
                     assert!(answer.starts_with("Failed "), "{label}: {answer}");
                     transcript.push(format!("{label}: {answer}"));
@@ -646,12 +770,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     let token = {
         let label = "begin dial";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| {
             let y = pump(&p, 0, Op::Begin(SIDE_DIAL, &target), &mut tight);
             (y.line(), y.framing)
         })();
-        assert_eq!(count(&p) - before, pinned, "{label} crossings");
+        assert_eq!(framer_crossings(&p) - before, pinned, "{label} crossings");
         let (answer, result) = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -672,10 +796,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "dial answer";
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| pump(&p, token, Op::Ingest(&answer, false), &mut tight).line())();
             assert_eq!(
-                count(&p) - before,
+                framer_crossings(&p) - before,
                 frame_sinkfuls(&heard),
                 "{label} crossings"
             );
@@ -709,9 +833,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             .unwrap_or_default();
         let (defaults, states_length) = {
             let label = "dial defaults";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| located_defaults(&p, &target))();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             transcript.push(format!("{label}: {answer}"));
             result
@@ -742,12 +866,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             .collect();
         {
             let label = "dial encode";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| {
                 let y = once(&p, 0, Op::Encode(&body, &fields), &mut Sink::ample());
                 (y.line(), y.wire)
             })();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             transcript.push(format!("{label}: {answer}"));
             result
@@ -757,10 +881,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "emit";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| pump(&p, token, Op::Emit(&emit, true), &mut tight).line())();
         assert_eq!(
-            count(&p) - before,
+            framer_crossings(&p) - before,
             sinkfuls(wire.len(), TIGHT_WIRE),
             "{label} crossings"
         );
@@ -782,9 +906,13 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "ingest";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| pump(&p, token, Op::Ingest(&ingest, false), &mut tight).line())();
-        assert_eq!(count(&p) - before, ingest_calls, "{label} crossings");
+        assert_eq!(
+            framer_crossings(&p) - before,
+            ingest_calls,
+            "{label} crossings"
+        );
         let answer = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -797,9 +925,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "ingest end";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| pump(&p, token, Op::Ingest(&[], true), &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
         let answer = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -813,10 +941,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     {
         let label = "finish";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| pump(&p, token, Op::Finish, &mut tight).line())();
         assert_eq!(
-            count(&p) - before,
+            framer_crossings(&p) - before,
             sinkfuls(finish.len(), TIGHT_WIRE),
             "{label} crossings"
         );
@@ -830,9 +958,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     };
     {
         let label = "finish again";
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| once(&p, token, Op::Finish, &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Failed "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
@@ -871,9 +999,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = &format!("encode #{n}");
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(&p, 0, Op::Encode(&body, &fields), &mut Sink::ample()).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -899,12 +1027,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         let token = {
             let label = "begin accept";
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| {
                 let y = pump(&p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
                 (y.line(), y.framing)
             })();
-            assert_eq!(count(&p) - before, pinned, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, pinned, "{label} crossings");
             let (answer, result) = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -921,10 +1049,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             {
                 let label = "accept opening";
                 let want = want;
-                let before = count(&p);
+                let before = framer_crossings(&p);
                 let value = (|| pump(&p, token, Op::Ingest(&opening, false), &mut tight).line())();
                 assert_eq!(
-                    count(&p) - before,
+                    framer_crossings(&p) - before,
                     sinkfuls(answer.len(), TIGHT_WIRE),
                     "{label} crossings"
                 );
@@ -949,10 +1077,18 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "refuse";
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
+            let before_raw = actual_count(p);
+            let before_releases = CROSSINGS.with(|counts| counts.borrow()[&p.instance().0].1);
             let value = (|| pump(&p, token, Op::Refuse(&bytes), &mut tight).line())();
             assert_eq!(
-                count(&p) - before,
+                CROSSINGS.with(|counts| counts.borrow()[&p.instance().0].1) - before_releases,
+                12,
+                "exactly twelve receive-receipt RELEASEs"
+            );
+            assert_eq!(actual_count(p)-before_raw,24,"twelve original framer crossings plus twelve separately validated custody RELEASEs");
+            assert_eq!(
+                framer_crossings(&p) - before,
                 sinkfuls(wire.len(), TIGHT_WIRE),
                 "{label} crossings; last collected answer: {value}"
             );
@@ -972,9 +1108,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         {
             let label = "timer";
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| pump(&p, token, Op::Timer, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             match want {
                 Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -985,9 +1121,9 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         };
         {
             let label = "finish refused";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(&p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -996,12 +1132,12 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
         let token = {
             let label = "begin upgrade";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| {
                 let y = once(&p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
                 (y.line(), y.framing)
             })();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let (answer, result) = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1011,16 +1147,16 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
     }
     {
         let label = "ingest on no framing";
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| once(&p, u64::MAX, Op::Ingest(b"x", false), &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Failed "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
         ()
     };
 
-    let before = count(p);
+    let before = framer_crossings(p);
     let mut i: TickIn = input();
     i.now_ns = 1;
     let (c, o): (_, TickOut) = go(p, life::TICK, i);
@@ -1031,8 +1167,8 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         c.error,
         o.next_tick_ns
     ));
-    assert_eq!(count(p) - before, 1);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 1);
+    let before = framer_crossings(p);
     let mut i: RefreshIn = input();
     i.settings = Blob::json(b"{}");
     i.generation = 2;
@@ -1043,8 +1179,8 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         c.lease != 0,
         c.error
     ));
-    assert_eq!(count(p) - before, 1);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 1);
+    let before = framer_crossings(p);
     let (c, _): (_, OutHead) = go(p, life::CLOSE, input::<InHead>());
     assert_eq!(c.outcome, Outcome::Ready);
     transcript.push(format!(
@@ -1052,12 +1188,23 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         c.lease != 0,
         c.error
     ));
-    assert_eq!(count(p) - before, 1);
-    let before = count(p);
+    assert_eq!(framer_crossings(p) - before, 1);
+    let before = framer_crossings(p);
     let answer = begin();
     assert!(answer.starts_with("Fault "));
     transcript.push(format!("begin after close: {answer}"));
-    assert_eq!(count(p) - before, 0);
+    assert_eq!(framer_crossings(p) - before, 0);
+    let (framer, releases) = CROSSINGS.with(|counts| counts.borrow()[&p.instance().0]);
+    let receipts = RECEIPTS.with(|receipts| receipts.borrow()[&p.instance().0].clone());
+    let mut expected_receipts = vec![slot::REFUSE; 12];
+    expected_receipts.push(slot::INGEST);
+    assert_eq!(receipts,expected_receipts,"all twelve refusal drains and the one accepted upgrade ingest carry exactly their receive receipts");
+    assert_eq!(
+        releases, 13,
+        "each of the thirteen validated receipts is RELEASEd exactly once"
+    );
+    assert_eq!(actual_count(p)-raw_before,framer+releases,"every actual crossing belongs to an exactly pinned operation or an explicitly validated receipt RELEASE");
+    transcript.push(format!("validated receipt RELEASE crossings: {releases}"));
     transcript
 }
 
@@ -1117,9 +1264,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if refused(whole) {
         {
             let label = "detach";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(p, token, Op::Detach, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1127,9 +1274,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
         };
         {
             let label = "adopt";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (refused_)();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1137,9 +1284,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
         };
         {
             let label = "finish upgrade";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1156,9 +1303,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if refused(detach) {
         {
             let label = "detach";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(p, token, Op::Detach, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1170,9 +1317,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
 
         {
             let label = "ingest before upgrade";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(p, token, Op::Ingest(&ingest, false), &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1182,10 +1329,10 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
         {
             let label = "detach";
             let want = want;
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| pump(p, token, Op::Detach, &mut tight).line())();
             assert_eq!(
-                count(&p) - before,
+                framer_crossings(&p) - before,
                 sinkfuls(detached.len(), TIGHT_FRAME),
                 "{label} crossings"
             );
@@ -1202,9 +1349,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if whole.is_null() {
         {
             let label = "finish upgrade";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (|| once(p, token, Op::Finish, &mut tight).line())();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Ready "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1214,9 +1361,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     if refused(adopt) {
         {
             let label = "adopt";
-            let before = count(&p);
+            let before = framer_crossings(&p);
             let value = (refused_)();
-            assert_eq!(count(&p) - before, 1, "{label} crossings");
+            assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
             let answer = value;
             assert!(answer.starts_with("Refused "), "{label}: {answer}");
             transcript.push(format!("{label}: {answer}"));
@@ -1237,12 +1384,16 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     let adopted = {
         let label = "adopt";
         let want = want;
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| {
             let y = pump(p, 0, Op::Adopt(&left), &mut tight);
             (y.line(), y.framing)
         })();
-        assert_eq!(count(&p) - before, crossings, "{label} crossings");
+        assert_eq!(
+            framer_crossings(&p) - before,
+            crossings,
+            "{label} crossings"
+        );
         let (answer, result) = value;
         match want {
             Expected::Exact(v) => assert_eq!(answer, v, "{label}"),
@@ -1253,9 +1404,9 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
     };
     {
         let label = "finish adopted";
-        let before = count(&p);
+        let before = framer_crossings(&p);
         let value = (|| once(p, adopted, Op::Finish, &mut tight).line())();
-        assert_eq!(count(&p) - before, 1, "{label} crossings");
+        assert_eq!(framer_crossings(&p) - before, 1, "{label} crossings");
         let answer = value;
         assert!(answer.starts_with("Ready "), "{label}: {answer}");
         transcript.push(format!("{label}: {answer}"));
@@ -1274,4 +1425,48 @@ fn begin_dial_want(dial: &Value, flags: u32) -> Expected {
         flags,
         true,
     ))
+}
+
+#[test]
+fn an_actual_receive_receipt_without_its_framing_context_is_refused_and_released() {
+    let d = busbar_plugin_loader::dispatch::Dispatcher::new(Default::default());
+    let linked: Plugin<Transport> = load_linked(&super::row(), super::bind(&d)).unwrap();
+    let dropped: Plugin<Transport> =
+        load_dropped(&super::cdylib(), &super::row().statement, super::bind(&d)).unwrap();
+    for p in [linked, dropped] {
+        super::open(&p);
+        assert!(busbar_plugin_loader::dispatch::framing_context::current().is_none());
+        let mut sink = Sink::ample();
+        let mut begin: BeginIn = input();
+        begin.side = SIDE_ACCEPT;
+        begin.scheme = busbar_contract::abi::host::service::SCHEME_PLAIN;
+        begin.sink = sink.raw();
+        let mut frame: Frame<_, FramerOut> = Frame::new(begin, output());
+        assert_eq!(p.call(slot::BEGIN, &mut frame).outcome, Outcome::Ready);
+        let token = frame.out.framing;
+        assert_ne!(token, 0);
+        let bytes = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
+        let mut refuse: RefuseIn = input();
+        refuse.framing = token;
+        refuse.bytes = bytes.as_ptr();
+        refuse.len = bytes.len();
+        refuse.sink = sink.raw();
+        let mut frame: Frame<_, FramerOut> = Frame::new(refuse, output());
+        let before = actual_count(&p);
+        let answer = p.call(slot::REFUSE, &mut frame);
+        assert_eq!(
+            answer.outcome,
+            Outcome::Fault,
+            "receive custody requires its actual framing context"
+        );
+        assert_eq!(
+            answer.lease, 0,
+            "the rejected receipt leaves no lease with the caller"
+        );
+        assert_eq!(
+            actual_count(&p) - before,
+            2,
+            "one actual REFUSE and one mandatory cleanup RELEASE of its rejected receipt"
+        );
+    }
 }
