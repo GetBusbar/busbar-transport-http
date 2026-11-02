@@ -356,11 +356,16 @@ fn encode_keeps_target_wiping_custody_on_success_short_sink_and_invalid_fields()
         // SAFETY: the linked door and its ops are static ABI records owned by this crate.
         let ops = unsafe { &*(*crate::door::door()).ops().cast::<Ops>() };
         let probe = Probe::start();
-        let result = ops.encode.expect("Encode is served")(
-            std::ptr::null_mut(),
-            std::ptr::from_ref(&input).cast(),
-            std::ptr::from_mut(&mut output).cast(),
-        )
+        // SAFETY: EncodeIn/FramerOut are this linked table's exact ENCODE frames; field, target,
+        // body and writable wire storage remain owned and live until this synchronous call returns.
+        // ENCODE is stateless and permits the null instance used here.
+        let result = unsafe {
+            ops.encode.expect("Encode is served")(
+                std::ptr::null_mut(),
+                std::ptr::from_ref(&input).cast(),
+                std::ptr::from_mut(&mut output).cast(),
+            )
+        }
         .outcome();
         assert_eq!(
             result,

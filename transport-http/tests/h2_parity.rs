@@ -46,7 +46,16 @@ fn s(text: &str) -> AbiStr {
     }
 }
 
-fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O, index: u32) {
+/// # Safety
+/// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+/// the instance belonging to this door (or null only for an operation permitting no instance).
+unsafe fn call<I, O>(
+    op: Option<Op>,
+    inst: *mut std::ffi::c_void,
+    i: &mut I,
+    o: &mut O,
+    index: u32,
+) {
     // SAFETY: `I`/`O` lead with their heads.
     unsafe {
         let ih = std::ptr::from_mut(i).cast::<InHead>();
@@ -54,11 +63,14 @@ fn call<I, O>(op: Option<Op>, inst: *mut std::ffi::c_void, i: &mut I, o: &mut O,
         (*ih).op = index;
         (*std::ptr::from_mut(o).cast::<OutHead>()).size = size_of::<O>() as u32;
     }
-    let r = (op.expect("slot"))(
-        inst,
-        std::ptr::from_ref(i).cast(),
-        std::ptr::from_mut(o).cast(),
-    );
+    // SAFETY: the caller upholds this raw shim's exact slot, frame, instance and live-range contract.
+    let r = unsafe {
+        (op.expect("slot"))(
+            inst,
+            std::ptr::from_ref(i).cast(),
+            std::ptr::from_mut(o).cast(),
+        )
+    };
     assert_eq!(
         r.outcome(),
         busbar_contract::abi::mechanism::call::Outcome::Ready
@@ -147,13 +159,17 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
         flags: 0,
     };
     let mut o: OpenOut = z();
-    call(
-        ops.head.open,
-        std::ptr::null_mut(),
-        &mut i,
-        &mut o,
-        life::OPEN,
-    );
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe {
+        call(
+            ops.head.open,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::OPEN,
+        )
+    };
     let inst = o.instance;
     let mut wire = vec![0_u8; 64 * 1024];
     let mut frame = vec![0_u8; 1024];
@@ -181,7 +197,9 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     b.facts = &facts;
     b.sink = sink();
     let mut fo: FramerOut = z();
-    call(ops.begin, inst, &mut b, &mut fo, slot::BEGIN);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe { call(ops.begin, inst, &mut b, &mut fo, slot::BEGIN) };
     let framing = fo.framing;
     out.extend_from_slice(&wire[..fo.yielded.wire_len as usize]);
     // THE HOST'S MERGE (THE DESIGN §6 step 5): the lines the framer's `locate` states for the
@@ -195,7 +213,9 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     (li.alpn_buf, li.alpn_cap) = (l.as_mut_ptr(), l.len());
     (li.defaults_buf, li.defaults_cap) = (defaults.as_mut_ptr(), defaults.len());
     let mut lo: LocateOut = z();
-    call(ops.locate, inst, &mut li, &mut lo, slot::LOCATE);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe { call(ops.locate, inst, &mut li, &mut lo, slot::LOCATE) };
     let stated = String::from_utf8_lossy(&defaults[..lo.defaults_written as usize]).into_owned();
     let lines: Vec<(&str, &str)> = stated
         .split("\r\n")
@@ -238,7 +258,9 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     e.body_len = body.len();
     e.sink = sink();
     let mut eo: FramerOut = z();
-    call(ops.encode, inst, &mut e, &mut eo, slot::ENCODE);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe { call(ops.encode, inst, &mut e, &mut eo, slot::ENCODE) };
     let message = wire[..eo.yielded.wire_len as usize].to_vec();
     let mut m: EmitIn = z();
     m.framing = framing;
@@ -248,11 +270,15 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     m.end_of_frame = 1;
     m.sink = sink();
     let mut mo: FramerOut = z();
-    call(ops.emit, inst, &mut m, &mut mo, slot::EMIT);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe { call(ops.emit, inst, &mut m, &mut mo, slot::EMIT) };
     out.extend_from_slice(&wire[..mo.yielded.wire_len as usize]);
     let mut c: InHead = z();
     let mut co: OutHead = z();
-    call(ops.head.close, inst, &mut c, &mut co, life::CLOSE);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    unsafe { call(ops.head.close, inst, &mut c, &mut co, life::CLOSE) };
     out
 }
 

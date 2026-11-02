@@ -42,7 +42,10 @@ fn ops() -> &'static Ops {
     // SAFETY: the linked door owns its static transport table.
     unsafe { &*(*door).ops().cast::<Ops>() }
 }
-fn call<I, O>(
+/// # Safety
+/// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+/// the instance belonging to this door (or null only for an operation permitting no instance).
+unsafe fn call<I, O>(
     op: Option<Op>,
     instance: *mut c_void,
     input: &mut I,
@@ -87,13 +90,17 @@ impl Client {
         let mut input: OpenIn = z();
         let mut output: OpenOut = z();
         assert_eq!(
-            call(
-                ops().head.open,
-                std::ptr::null_mut(),
-                &mut input,
-                &mut output,
-                life::OPEN
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops().head.open,
+                    std::ptr::null_mut(),
+                    &mut input,
+                    &mut output,
+                    life::OPEN,
+                )
+            },
             Outcome::Ready
         );
         let mut client = Self {
@@ -116,13 +123,17 @@ impl Client {
         input.sink = client.sink();
         let mut output: FramerOut = z();
         assert_eq!(
-            call(
-                ops().begin,
-                client.instance,
-                &mut input,
-                &mut output,
-                slot::BEGIN
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops().begin,
+                    client.instance,
+                    &mut input,
+                    &mut output,
+                    slot::BEGIN,
+                )
+            },
             Outcome::Ready
         );
         client.framing = output.framing;
@@ -162,13 +173,17 @@ impl Client {
         input.sink = self.sink();
         let mut output: FramerOut = z();
         assert_eq!(
-            call(
-                ops().ingest,
-                self.instance,
-                &mut input,
-                &mut output,
-                slot::INGEST
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops().ingest,
+                    self.instance,
+                    &mut input,
+                    &mut output,
+                    slot::INGEST,
+                )
+            },
             Outcome::Ready
         );
         self.take(&output);
@@ -199,13 +214,17 @@ impl Client {
         input.sink = self.sink();
         let mut output: FramerOut = z();
         assert_eq!(
-            call(
-                ops().encode,
-                self.instance,
-                &mut input,
-                &mut output,
-                slot::ENCODE
-            ),
+            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+            // and the door instance for this synchronous call; the selected slot and index agree.
+            unsafe {
+                call(
+                    ops().encode,
+                    self.instance,
+                    &mut input,
+                    &mut output,
+                    slot::ENCODE,
+                )
+            },
             Outcome::Ready
         );
         self.wire[..output.yielded.wire_len as usize].to_vec()
@@ -220,13 +239,17 @@ impl Client {
         input.head.extensions = blob(extension);
         input.sink = self.sink();
         let mut output: FramerOut = z();
-        let outcome = call(
-            ops().emit,
-            self.instance,
-            &mut input,
-            &mut output,
-            slot::EMIT,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let outcome = unsafe {
+            call(
+                ops().emit,
+                self.instance,
+                &mut input,
+                &mut output,
+                slot::EMIT,
+            )
+        };
         if outcome == Outcome::Ready {
             self.take(&output);
         }
@@ -237,13 +260,17 @@ impl Drop for Client {
     fn drop(&mut self) {
         let mut input: InHead = z();
         let mut output: OutHead = z();
-        let _ = call(
-            ops().head.close,
-            self.instance,
-            &mut input,
-            &mut output,
-            life::CLOSE,
-        );
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        let _ = unsafe {
+            call(
+                ops().head.close,
+                self.instance,
+                &mut input,
+                &mut output,
+                life::CLOSE,
+            )
+        };
     }
 }
 

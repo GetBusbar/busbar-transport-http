@@ -63,7 +63,16 @@ fn ops() -> &'static Ops {
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
 
-fn call<I, O>(op: Option<Op>, inst: *mut c_void, i: &mut I, o: &mut O, index: u32) -> Outcome {
+/// # Safety
+/// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+/// the instance belonging to this door (or null only for an operation permitting no instance).
+unsafe fn call<I, O>(
+    op: Option<Op>,
+    inst: *mut c_void,
+    i: &mut I,
+    o: &mut O,
+    index: u32,
+) -> Outcome {
     // SAFETY: `I` leads with an `InHead`, `O` with an `OutHead` (the table's own structs).
     unsafe {
         let ih = std::ptr::from_mut(i).cast::<InHead>();
@@ -93,13 +102,17 @@ fn open(json: &str) -> *mut c_void {
     let mut i: OpenIn = z();
     i.settings = settings(json);
     let mut o: OpenOut = z();
-    let r = call(
-        ops().head.open,
-        std::ptr::null_mut(),
-        &mut i,
-        &mut o,
-        life::OPEN,
-    );
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe {
+        call(
+            ops().head.open,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::OPEN,
+        )
+    };
     assert_eq!(r, Outcome::Ready);
     o.instance
 }
@@ -112,13 +125,17 @@ fn validate(json: &str) -> (Outcome, String) {
     i.err_buf = reason.as_mut_ptr();
     i.err_cap = reason.len();
     let mut o: OutHead = z();
-    let r = call(
-        ops().head.validate,
-        std::ptr::null_mut(),
-        &mut i,
-        &mut o,
-        life::VALIDATE,
-    );
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe {
+        call(
+            ops().head.validate,
+            std::ptr::null_mut(),
+            &mut i,
+            &mut o,
+            life::VALIDATE,
+        )
+    };
     (r, text(o.error))
 }
 
@@ -128,7 +145,9 @@ fn refresh(inst: *mut c_void, json: &str) -> (Outcome, String) {
     i.generation = 2;
     i.settings = settings(json);
     let mut o: OutHead = z();
-    let r = call(ops().head.refresh, inst, &mut i, &mut o, life::REFRESH);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(ops().head.refresh, inst, &mut i, &mut o, life::REFRESH) };
     (r, text(o.error))
 }
 
@@ -156,7 +175,9 @@ fn locate_lending(
         (i.defaults_buf, i.defaults_cap) = (d.as_mut_ptr(), cap);
     }
     let mut o: LocateOut = z();
-    let r = call(ops().locate, inst, &mut i, &mut o, slot::LOCATE);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(ops().locate, inst, &mut i, &mut o, slot::LOCATE) };
     (
         r,
         l[..o.alpn_written as usize].to_vec(),
@@ -178,7 +199,9 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
     let mut i: ReleaseIn = z();
     i.lease = 7;
     let mut o: OutHead = z();
-    let r = call(ops().head.release, inst, &mut i, &mut o, life::RELEASE);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(ops().head.release, inst, &mut i, &mut o, life::RELEASE) };
     assert_eq!(
         (r, text(o.error)),
         (Outcome::Refused, NO_SUCH_LEASE.to_owned())
@@ -287,10 +310,15 @@ fn validate_answers_the_canon_settings_texts() {
 // ── the role stubs and the missing instance ──────────────────────────────────────────────────────
 
 /// One op of `inst` over all-zero `in` and `out`: its outcome and its text.
-fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, String) {
+/// # Safety
+/// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
+/// the instance belonging to this door (or null only for an operation permitting no instance).
+unsafe fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, String) {
     let mut i: I = z();
     let mut o: O = z();
-    let r = call(f, inst, &mut i, &mut o, index);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(f, inst, &mut i, &mut o, index) };
     // SAFETY: every `out` leads with an `OutHead`.
     let head = unsafe { std::ptr::from_ref(&o).cast::<OutHead>().read() };
     (r, text(head.error))
@@ -310,39 +338,57 @@ fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words(
         )
     };
     assert_eq!(
-        op::<ListenIn, ListenOut>(o.listen, inst, slot::LISTEN),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<ListenIn, ListenOut>(o.listen, inst, slot::LISTEN) },
         refused("listen")
     );
     assert_eq!(
-        op::<AcceptIn, AcceptOut>(o.accept, inst, slot::ACCEPT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<AcceptIn, AcceptOut>(o.accept, inst, slot::ACCEPT) },
         refused("accept")
     );
     assert_eq!(
-        op::<DialIn, ConnOut>(o.dial, inst, slot::DIAL),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<DialIn, ConnOut>(o.dial, inst, slot::DIAL) },
         refused("dial")
     );
     assert_eq!(
-        op::<ReadIn, IoOut>(o.read, inst, slot::READ),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<ReadIn, IoOut>(o.read, inst, slot::READ) },
         refused("read")
     );
     assert_eq!(
-        op::<WriteIn, IoOut>(o.write, inst, slot::WRITE),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<WriteIn, IoOut>(o.write, inst, slot::WRITE) },
         refused("write")
     );
     assert_eq!(
-        op::<ConnIn, OutHead>(o.flush, inst, slot::FLUSH),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<ConnIn, OutHead>(o.flush, inst, slot::FLUSH) },
         refused("flush")
     );
     assert_eq!(
-        op::<ShutIn, OutHead>(o.shut, inst, slot::SHUT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<ShutIn, OutHead>(o.shut, inst, slot::SHUT) },
         refused("shut")
     );
     assert_eq!(
-        op::<ArrivalIn, ArrivalOut>(o.arrival, inst, slot::ARRIVAL),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<ArrivalIn, ArrivalOut>(o.arrival, inst, slot::ARRIVAL) },
         refused("arrival")
     );
     assert_eq!(
-        op::<AdoptIn, FramerOut>(o.adopt, inst, slot::ADOPT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<AdoptIn, FramerOut>(o.adopt, inst, slot::ADOPT) },
         refused("adopt")
     );
 }
@@ -358,32 +404,46 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
     i.side = SIDE_DIAL;
     i.target = s("http://a.test/");
     let mut out: FramerOut = z();
-    let r = call(o.begin, none, &mut i, &mut out, slot::BEGIN);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(o.begin, none, &mut i, &mut out, slot::BEGIN) };
     assert_eq!((r, text(out.head.error)), failed("begin"));
     assert_eq!(
-        op::<IngestIn, FramerOut>(o.ingest, none, slot::INGEST),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<IngestIn, FramerOut>(o.ingest, none, slot::INGEST) },
         failed("ingest")
     );
     assert_eq!(
-        op::<EmitIn, FramerOut>(o.emit, none, slot::EMIT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<EmitIn, FramerOut>(o.emit, none, slot::EMIT) },
         failed("emit")
     );
     assert_eq!(
-        op::<FramingIn, FramerOut>(o.timer, none, slot::TIMER),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FramingIn, FramerOut>(o.timer, none, slot::TIMER) },
         failed("timer")
     );
     assert_eq!(
-        op::<FinishIn, FramerOut>(o.finish, none, slot::FINISH),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FinishIn, FramerOut>(o.finish, none, slot::FINISH) },
         failed("finish")
     );
     // RED (codeaudit craft L mod.rs:999): `detach` named a framing it never looked at (`detach:
     // no such framing`); `refuse` is the other op with no instance.
     assert_eq!(
-        op::<FramingIn, FramerOut>(o.detach, none, slot::DETACH),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FramingIn, FramerOut>(o.detach, none, slot::DETACH) },
         failed("detach")
     );
     assert_eq!(
-        op::<RefuseIn, FramerOut>(o.refuse, none, slot::REFUSE),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<RefuseIn, FramerOut>(o.refuse, none, slot::REFUSE) },
         failed("refuse")
     );
 }
@@ -396,27 +456,39 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
     let o = ops();
     let gone = |op: &str| (Outcome::Failed, format!("{op}: no such framing"));
     assert_eq!(
-        op::<IngestIn, FramerOut>(o.ingest, inst, slot::INGEST),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<IngestIn, FramerOut>(o.ingest, inst, slot::INGEST) },
         gone("ingest")
     );
     assert_eq!(
-        op::<EmitIn, FramerOut>(o.emit, inst, slot::EMIT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<EmitIn, FramerOut>(o.emit, inst, slot::EMIT) },
         gone("emit")
     );
     assert_eq!(
-        op::<FramingIn, FramerOut>(o.timer, inst, slot::TIMER),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FramingIn, FramerOut>(o.timer, inst, slot::TIMER) },
         gone("timer")
     );
     assert_eq!(
-        op::<FinishIn, FramerOut>(o.finish, inst, slot::FINISH),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FinishIn, FramerOut>(o.finish, inst, slot::FINISH) },
         gone("finish")
     );
     assert_eq!(
-        op::<RefuseIn, FramerOut>(o.refuse, inst, slot::REFUSE),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<RefuseIn, FramerOut>(o.refuse, inst, slot::REFUSE) },
         gone("refuse")
     );
     assert_eq!(
-        op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { op::<FramingIn, FramerOut>(o.detach, inst, slot::DETACH) },
         gone("detach")
     );
 }
@@ -458,7 +530,9 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     b.sink = sink();
     let mut bo: FramerOut = z();
     assert_eq!(
-        call(o.begin, inst, &mut b, &mut bo, slot::BEGIN),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { call(o.begin, inst, &mut b, &mut bo, slot::BEGIN) },
         Outcome::Ready
     );
     let framing = bo.framing;
@@ -482,7 +556,9 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     e.sink = sink();
     let mut eo: FramerOut = z();
     assert_eq!(
-        call(o.encode, inst, &mut e, &mut eo, slot::ENCODE),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { call(o.encode, inst, &mut e, &mut eo, slot::ENCODE) },
         Outcome::Ready
     );
     let message = wire[..eo.yielded.wire_len as usize].to_vec();
@@ -495,7 +571,9 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     m.sink = sink();
     let mut mo: FramerOut = z();
     assert_eq!(
-        call(o.emit, inst, &mut m, &mut mo, slot::EMIT),
+        // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+        // and the door instance for this synchronous call; the selected slot and index agree.
+        unsafe { call(o.emit, inst, &mut m, &mut mo, slot::EMIT) },
         Outcome::Ready
     );
     // The far end closes: no byte, the end of its stream.
@@ -504,7 +582,9 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     i.end = 1;
     i.sink = sink();
     let mut io: FramerOut = z();
-    let r = call(o.ingest, inst, &mut i, &mut io, slot::INGEST);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(o.ingest, inst, &mut i, &mut io, slot::INGEST) };
     // SAFETY: every `out` leads with an `OutHead`.
     let said = text(unsafe { std::ptr::from_ref(&io).cast::<OutHead>().read() }.error);
     assert_eq!(
@@ -537,7 +617,9 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
     i.side = SIDE_DIAL;
     i.target = s(target);
     let mut out: FramerOut = z();
-    let r = call(ops().begin, inst, &mut i, &mut out, slot::BEGIN);
+    // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
+    // and the door instance for this synchronous call; the selected slot and index agree.
+    let r = unsafe { call(ops().begin, inst, &mut i, &mut out, slot::BEGIN) };
     assert_eq!(
         (r, text(out.head.error).as_str()),
         (
