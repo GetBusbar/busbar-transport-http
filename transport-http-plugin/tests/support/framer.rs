@@ -479,7 +479,7 @@ fn yielded_line(wire: &[u8], frames: &[Vec<u8>], raw: &[u8], flags: u32, framing
 
 fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatcher) -> Vec<String> {
     let mut transcript = Vec::new();
-    let inputs: Value = serde_json::from_str(include_str!("conformance.json")).unwrap();
+    let inputs: Value = serde_json::from_str(include_str!("../conformance.json")).unwrap();
     let k = &inputs["transport"];
     let facts = p
         .context::<busbar_plugin_loader::dispatch::kinds::transport::TransportFacts>()

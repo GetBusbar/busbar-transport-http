@@ -202,8 +202,8 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-#[path = "framer.rs.inc"]
+#[path = "support/framer.rs"]
 mod framer;
 
-#[path = "negative.rs.inc"]
+#[path = "support/negative.rs"]
 mod negative;
