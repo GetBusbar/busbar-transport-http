@@ -99,7 +99,12 @@ fn texts(v: &serde_json::Value, what: &str) -> Vec<Vec<u8>> {
 fn lossy(b: &[u8]) -> String {
     match std::str::from_utf8(b) {
         Ok(text) if !text.starts_with('\u{e000}') => text.to_owned(),
-        _ => format!("\u{e000}{}", hex::encode(b)),
+        _ => format!(
+            "\u{e000}{}",
+            b.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
     }
 }
 
