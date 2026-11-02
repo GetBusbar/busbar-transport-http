@@ -1129,34 +1129,66 @@ impl AcceptHost {
         facts: fn(&mut ConnFacts),
         scheme: u8,
     ) -> Self {
+        Self::open_in(ops, None, lines, script, facts, scheme)
+    }
+
+    /// A second accepted connection on the SAME open instance as `first` (and so the same script),
+    /// under guest list `lines`: the instance's kept lists are met again.
+    fn open_again(first: &Self, lines: Vec<LineEntry>) -> Self {
+        Self::open_in(
+            first.ops,
+            Some((first.inst, first.ctx)),
+            lines,
+            Script::default(),
+            |_| {},
+            SCHEME_PLAIN,
+        )
+    }
+
+    /// [`AcceptHost::open_on`] on `existing` (an open instance and its context) when given, else on
+    /// a fresh instance.
+    fn open_in(
+        ops: &'static Ops,
+        existing: Option<(*mut c_void, u64)>,
+        lines: Vec<LineEntry>,
+        script: Script,
+        facts: fn(&mut ConnFacts),
+        scheme: u8,
+    ) -> Self {
         let state = facts;
-        let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
-        SCRIPTS.lock().expect("scripts").insert(ctx, script);
-        let tables = HostTables {
-            size: size_of::<HostTables>() as u32,
-            _reserved: 0,
-            ctx: HostCtx { handle: ctx },
-            wake: None,
-            conns: std::ptr::null(),
-            services: &*SLOTS,
-            io: std::ptr::null(),
+        let (instance, ctx) = match existing {
+            Some(on) => on,
+            None => {
+                let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
+                SCRIPTS.lock().expect("scripts").insert(ctx, script);
+                let tables = HostTables {
+                    size: size_of::<HostTables>() as u32,
+                    _reserved: 0,
+                    ctx: HostCtx { handle: ctx },
+                    wake: None,
+                    conns: std::ptr::null(),
+                    services: &*SLOTS,
+                    io: std::ptr::null(),
+                };
+                let mut i: OpenIn = z();
+                i.host = &tables;
+                let mut o: OpenOut = z();
+                assert_eq!(
+                    call(
+                        ops.head.open,
+                        std::ptr::null_mut(),
+                        &mut i,
+                        &mut o,
+                        life::OPEN
+                    ),
+                    Outcome::Ready
+                );
+                (o.instance, ctx)
+            }
         };
-        let mut i: OpenIn = z();
-        i.host = &tables;
-        let mut o: OpenOut = z();
-        assert_eq!(
-            call(
-                ops.head.open,
-                std::ptr::null_mut(),
-                &mut i,
-                &mut o,
-                life::OPEN
-            ),
-            Outcome::Ready
-        );
         let mut h = Self {
             ops,
-            inst: o.instance,
+            inst: instance,
             framing: 0,
             wire: vec![0; 64 * 1024],
             frame: vec![0; 64 * 1024],
@@ -3530,6 +3562,69 @@ fn a_cleartext_offer_changes_nothing_else(label: &str, ops: &'static Ops) {
 }
 
 /// Run `cell` through the linked door and the dropped-in one.
+/// A second connection on ONE instance whose listener's list differs from the first's in one
+/// member only is framed under ITS list, not the copy the instance kept for the first: a stale
+/// reuse would admit it under the old auth handle or body limit.
+fn a_changed_list_is_not_reused(label: &str, ops: &'static Ops) {
+    // The auth handle alone differs.
+    let first = admitted(
+        ops,
+        vec![line(8, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    let mut other = line(8, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    other.auth = AuthRef { id: 555, mac: 7 };
+    let mut second = AcceptHost::open_again(&first, vec![other]);
+    assert_eq!(second.ingest(POST_HELLO), Outcome::Ready);
+    let asked = first.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 555, .. },
+                Asked::HandIn { auth: 555, .. },
+            ]
+        ),
+        "{label}: the second connection is called under its own handle: {asked:?}"
+    );
+    first.close();
+
+    // The body limit alone differs: within it, then over it.
+    let first = admitted(
+        ops,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 16)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(first.heads_up(), 1, "{label}: within its limit it goes up");
+    let mut second = AcceptHost::open_again(
+        &first,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 4)],
+    );
+    assert_eq!(second.ingest(POST_HELLO), Outcome::Ready);
+    assert_eq!(
+        second.heads_up(),
+        0,
+        "{label}: over the second list's limit, nothing goes up"
+    );
+    let asked = first.asked();
+    assert!(
+        matches!(
+            asked.last(),
+            Some(Asked::Refuse {
+                cause: REFUSE_OVER_GATE,
+                line: 8,
+                ..
+            })
+        ),
+        "{label}: refused at the second list's gate: {asked:?}"
+    );
+    first.close();
+}
+
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
     for (label, ops) in [("linked", linked()), ("dropped", d)] {
@@ -3550,6 +3645,11 @@ fn a_path_no_line_admits_the_method_of_is_the_kernels_method_miss() {
 #[test]
 fn a_head_auth_stop_is_the_kernels_refusal_with_the_unit() {
     both(head_stop);
+}
+
+#[test]
+fn a_changed_guest_list_on_one_instance_is_not_served_from_the_kept_copy() {
+    both(a_changed_list_is_not_reused);
 }
 
 #[test]

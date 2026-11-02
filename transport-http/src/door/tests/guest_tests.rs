@@ -106,3 +106,50 @@ fn a_query_key_is_compared_as_it_decodes() {
         Some("c=3")
     );
 }
+
+/// The kept lists: a list `same` recognises is the kept `Arc` and `copy` never runs; a new one is
+/// copied and kept; the oldest of `LISTS_KEPT` goes first, and a reused one counts as just used.
+#[test]
+fn the_kept_lists_are_reused_and_the_oldest_evicted() {
+    let list = |id: u32| vec![line(id, METHOD_GET, PATH_EXACT, "/", &[])];
+    let by_id = |id: u32| move |kept: &[Line]| kept.first().is_some_and(|l| l.line == id);
+    let lists = Lists::default();
+
+    let first = lists.shared(by_id(0), || Some(list(0))).expect("copied");
+    let again = lists
+        .shared(by_id(0), || panic!("a kept list is not copied again"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &again), "the kept copy is shared");
+
+    // A changed list is copied.
+    let changed = lists.shared(by_id(1), || Some(list(1))).expect("copied");
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert!(
+        lists.shared(by_id(2), || None).is_none(),
+        "copy answered none"
+    );
+
+    // Fill to the bound; list 0 is used again so list 1 is now the oldest.
+    for id in 2..LISTS_KEPT as u32 {
+        lists.shared(by_id(id), || Some(list(id))).expect("copied");
+    }
+    let reused = lists
+        .shared(by_id(0), || panic!("still kept"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &reused));
+    lists
+        .shared(by_id(100), || Some(list(100)))
+        .expect("copied");
+    let mut copies = 0;
+    lists
+        .shared(by_id(1), || {
+            copies += 1;
+            Some(list(1))
+        })
+        .expect("recopied");
+    assert_eq!(copies, 1, "the oldest was evicted");
+    let still = lists
+        .shared(by_id(0), || panic!("the reused list survived"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &still));
+}
