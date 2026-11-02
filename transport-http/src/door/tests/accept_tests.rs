@@ -835,8 +835,6 @@ fn reset(a: &mut Accepted) {
     run(a, SEC);
 }
 
-/// THE FAR SIDE ABANDONS AN ANSWER (Q128 reader A, MEDIUM; THE DESIGN §1 l.199-201, §6 item 6
-
 #[test]
 fn a_stream_the_far_side_resets_mid_answer_ends_failed_and_is_let_go() {
     let (mut a, stream) = h2_request();

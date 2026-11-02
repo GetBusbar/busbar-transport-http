@@ -343,8 +343,6 @@ fn h1_wire(message: &[u8]) -> String {
     String::from_utf8_lossy(&f.take_wire(usize::MAX)).into_owned()
 }
 
-/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "Nothing is added to the head after the auth has
-
 #[test]
 fn the_door_adds_no_line_to_the_head_it_is_handed() {
     let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
@@ -412,8 +410,6 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
         "a later request naming no target goes to `/`, not the dial's path: {third:?}"
     );
 }
-
-/// RED (busbar ARCHITECT ruling on busbar#780 (2), 1.5.5 parity): a target whose host is an IPv4
 
 #[test]
 fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
@@ -700,8 +696,6 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
     }
 }
 
-/// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
-
 #[test]
 fn the_wire_head_is_the_head_the_auth_saw() {
     let seen: &[(&str, &[u8])] = &[
@@ -782,8 +776,6 @@ fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
         (lines, authority.unwrap_or_default())
     })
 }
-
-/// RED (ruling 23; BUSBAR-1.6.0.md l.3779, §4 item 5: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH
 
 #[test]
 fn the_head_on_the_wire_is_every_line_the_auth_saw() {

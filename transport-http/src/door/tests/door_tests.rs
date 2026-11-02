@@ -240,8 +240,6 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     assert_eq!(offer_for(false, false, true), b"");
 }
 
-/// RED (busbar ARCHITECT ruling on #780 (2), 1.5.5 parity): `locate` offers, and has the far end's
-
 #[test]
 fn locate_offers_the_address_an_ipv4_spelling_names() {
     for (target, authority, name) in [

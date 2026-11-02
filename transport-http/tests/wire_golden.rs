@@ -734,8 +734,6 @@ fn an_h2_request_over_a_secured_connection_says_scheme_https() {
     );
 }
 
-/// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "The transport finalises the head (its own lines: host,
-
 #[test]
 fn locate_states_the_framers_own_head_lines() {
     let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");
