@@ -80,6 +80,10 @@ pub(crate) fn render_head(
     }
     let mut size = method.len() + path.len() + 64;
     for (name, value) in fields {
+        // The method and path are the request line, judged above, and never written as fields.
+        if name.eq_ignore_ascii_case("method") || name.eq_ignore_ascii_case("path") {
+            continue;
+        }
         // A value is what `emit`'s request builder takes as one (`http::HeaderValue`: visible
         // bytes, SP, HTAB and obs-text, RFC 9110 5.5), judged here, not there.
         if !is_token(name.as_bytes())

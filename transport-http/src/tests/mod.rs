@@ -557,3 +557,26 @@ fn linked_session_is_every_claim_rows_session() {
         .iter()
         .all(|c| (c.session != 0) == crate::linked::SESSION));
 }
+
+/// RED (codeaudit r1-prod0-6): `encode` pushes the encoded target as `path` AHEAD of the raw
+/// envelope `path` field, and `render_head` judged every pair's value as a header value, the
+/// request-line pairs it never writes as fields included: a path holding a control byte (which
+/// `encode_target` percent-encodes, never refuses) failed the whole encode.
+#[test]
+fn an_envelope_path_with_a_control_byte_encodes_percent_encoded() {
+    let head = crate::transport::render_head(
+        &[
+            ("method", b"GET".as_slice()),
+            ("path", b"/v1/models/a%01b".as_slice()),
+            ("method", b"GET".as_slice()),
+            ("path", b"/v1/models/a\x01b".as_slice()),
+        ],
+        0,
+    )
+    .expect("the encoded target is the request line");
+    assert!(
+        head.starts_with(b"GET /v1/models/a%01b HTTP/1.1\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&head)
+    );
+}
