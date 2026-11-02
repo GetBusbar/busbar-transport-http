@@ -1046,7 +1046,14 @@ impl SafeSlot for Detach {
         };
         let mut frame = sink.frame();
         let n = rest.len().min(frame.cap());
-        let taken: Vec<u8> = rest.drain(..n).collect();
+        // What leaves `rest` may be the connection as sent (credential lines): copied into a
+        // wiped-on-drop buffer, and its place in `rest` zeroed before it is let go.
+        let taken: zeroize::Zeroizing<Vec<u8>> =
+            zeroize::Zeroizing::new(rest.range(..n).copied().collect());
+        for b in rest.range_mut(..n) {
+            zeroize::Zeroize::zeroize(b);
+        }
+        rest.drain(..n);
         frame.extend(&taken);
         let mut y = o.get().yielded;
         y.wire_len = wire_buf.written() as u64;

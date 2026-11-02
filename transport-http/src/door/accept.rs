@@ -449,6 +449,7 @@ pub struct Accepted {
 impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
+        self.let_leftover_go();
         // A body held for a `HeadBody` auth when the framing is torn down mid-hold.
         let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         for a in sh.streams.values_mut() {
@@ -583,6 +584,16 @@ impl Accepted {
     fn let_raw_go(&mut self) {
         if let Some(mut raw) = self.raw.take() {
             raw.zeroize();
+        }
+    }
+
+    /// Wipe what a detach left waiting (it may be the connection as sent, credential lines
+    /// included).
+    fn let_leftover_go(&mut self) {
+        if let Some(left) = self.leftover.as_mut() {
+            let (x, y) = left.as_mut_slices();
+            x.zeroize();
+            y.zeroize();
         }
     }
 

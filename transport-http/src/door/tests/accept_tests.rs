@@ -389,6 +389,25 @@ fn an_unanswered_connection_detaches_as_sent_for_the_upgrade_framer_to_answer() 
 }
 
 #[test]
+fn a_detached_connection_as_sent_is_wiped_when_the_framing_goes() {
+    let request: &[u8] = b"GET /ws HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nauthorization: Bearer s3cret-token\r\n\r\n";
+    let mut a = accepted();
+    a.ingest(request, false);
+    run(&mut a, SEC);
+    a.detach().expect("handed over").expect("nothing answered");
+    a.let_leftover_go();
+    let (x, y) = a.leftover.as_ref().expect("still held").as_slices();
+    assert!(
+        x.len() + y.len() >= request.len(),
+        "the leftover is wiped in place, not dropped early"
+    );
+    assert!(
+        x.iter().chain(y).all(|b| *b == 0),
+        "the credential line is still in the leftover"
+    );
+}
+
+#[test]
 fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
     let mut a = accepted();
     a.ingest(GET, false);
