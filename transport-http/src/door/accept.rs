@@ -1955,9 +1955,11 @@ impl Accepted {
         did: &mut Admitted,
     ) {
         let policy = a.policy.clone();
+        // Hold this generation independently while admission advances the sequence counter.
+        let default_lines = self.lines.clone();
         let lines = policy
             .as_ref()
-            .map_or(self.lines.as_ref(), |p| p.lines.as_ref());
+            .map_or(default_lines.as_ref(), |p| p.lines.as_ref());
         loop {
             let Some(parts) = a.parts.as_ref() else {
                 return;

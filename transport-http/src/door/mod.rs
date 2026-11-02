@@ -103,7 +103,9 @@ use busbar_contract::abi::sdk::services::{
     HeadViewArgs, Pend, RefusalCopy, ServiceError, Services,
 };
 use busbar_contract::abi::sdk::transport::policy::Loans;
-use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
+use busbar_contract::abi::sdk::transport::{
+    form_codes, settings_reading, SettingRow, DEFAULT_BODY_MAX,
+};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
 use busbar_contract::abi::transport::check::check_emit_flags;
 use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
@@ -396,7 +398,22 @@ fn bad_count(path: &str) -> &'static str {
 /// key this transport does not declare, a value its declaration refuses. An absent blob reads as
 /// `{}`.
 fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
-    let v = settings_reading(bytes, &SETTING_ROWS.map(|(p, _, _)| p))?;
+    let rows = SETTING_ROWS.map(|(path, kind, default)| SettingRow {
+        path,
+        kind,
+        default,
+    });
+    let v = settings_reading(bytes, &rows).map_err(|refusal| {
+        // Keep this door's established count diagnostics, including each setting's unit.
+        for row in rows.iter().filter(|row| row.kind == SETTING_COUNT) {
+            if refusal.text()
+                == Some(format!("settings: {} must be a count above 0", row.path).as_str())
+            {
+                return Refusal::failed(bad_count(row.path));
+            }
+        }
+        refusal
+    })?;
     let flag = |k: &'static str| match v.get(k) {
         None => Ok(false),
         Some(x) => x
@@ -1240,7 +1257,7 @@ fn take_detached(
     rest: &mut std::collections::VecDeque<u8>,
     n: usize,
 ) -> zeroize::Zeroizing<Vec<u8>> {
-    let taken = zeroize::Zeroizing::new(rest.drain(..n).collect());
+    let taken = zeroize::Zeroizing::new(rest.drain(..n).collect::<Vec<_>>());
     #[cfg(test)]
     crate::wipe_probe::watch("detach taken", &taken);
     taken

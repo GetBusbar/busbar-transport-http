@@ -238,6 +238,7 @@ fn a_peer_verdict_is_reused_for_its_exact_auth_handle_but_not_after_reload() {
         assert_eq!(up(&mut a).heads.len(), 1);
         a.emit(stream, b"content-length: 0\r\n", true, 200).unwrap();
         a.drive(SEC);
+        assert!(a.take_wire(usize::MAX).starts_with(b"HTTP/1.1 200 OK\r\n"));
     }
     assert_eq!(
         kernel.points,
@@ -1535,7 +1536,7 @@ fn an_http2_client_decodes_the_actual_trailer_wire_as_fields_after_the_body() {
         .unwrap()
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                use tokio::io::AsyncWriteExt;
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let (client, mut peer) = tokio::io::duplex(64 * 1024);
                 let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
                 let task = tokio::spawn(connection);
@@ -1544,6 +1545,26 @@ fn an_http2_client_decodes_the_actual_trailer_wire_as_fields_after_the_body() {
                     .body(())
                     .unwrap();
                 let (response, _) = sender.send_request(request, true).unwrap();
+                // The client must have opened its request on the wire before its response
+                // arrives; send_request queues it until the connection task is polled.
+                let mut preface = [0; 24];
+                peer.read_exact(&mut preface).await.unwrap();
+                assert_eq!(&preface, H2_PREFACE);
+                let mut sent = false;
+                for _ in 0..16 {
+                    let mut head = [0; 9];
+                    peer.read_exact(&mut head).await.unwrap();
+                    let len = (usize::from(head[0]) << 16)
+                        | (usize::from(head[1]) << 8)
+                        | usize::from(head[2]);
+                    let mut payload = vec![0; len];
+                    peer.read_exact(&mut payload).await.unwrap();
+                    if head[3] == 1 && u32::from_be_bytes(head[5..9].try_into().unwrap()) == 1 {
+                        sent = true;
+                        break;
+                    }
+                }
+                assert!(sent, "the client opened the response's stream");
                 peer.write_all(&wire).await.unwrap();
                 let response = tokio::time::timeout(Duration::from_secs(5), response)
                     .await

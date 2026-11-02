@@ -32,7 +32,7 @@ fn a_chunked_body_survives_arriving_one_byte_at_a_time() {
         decoder.feed(&[*byte]).unwrap();
     }
     assert!(decoder.is_done());
-    assert_eq!(decoder.take(), b"Wikipedia");
+    assert_eq!(decoder.take().as_slice(), b"Wikipedia");
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn a_chunked_body_with_no_trailers_ends_at_the_terminal_chunk() {
     let mut decoder = ChunkedDecoder::default();
     decoder.feed(b"3\r\nabc\r\n0\r\n\r\n").unwrap();
     assert!(decoder.is_done());
-    assert_eq!(decoder.take(), b"abc");
+    assert_eq!(decoder.take().as_slice(), b"abc");
 }
 
 /// A trailer line is read for its grammar, though its content is discarded.
@@ -86,7 +86,7 @@ fn chunk_extensions_are_ignored_rather_than_read() {
     let mut decoder = ChunkedDecoder::default();
     decoder.feed(b"3;name=value\r\nabc\r\n0\r\n\r\n").unwrap();
     assert!(decoder.is_done());
-    assert_eq!(decoder.take(), b"abc");
+    assert_eq!(decoder.take().as_slice(), b"abc");
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
         .feed(b"3 \t;name=value\r\nabc\r\n0\r\n\r\n")
         .unwrap();
     assert!(decoder.is_done());
-    assert_eq!(decoder.take(), b"abc");
+    assert_eq!(decoder.take().as_slice(), b"abc");
 }
 
 /// RED (codeaudit correctness L raw.rs:255): the decoder deleted EVERY CR in a size or trailer
@@ -228,9 +228,9 @@ fn a_cr_that_does_not_end_a_line_is_malformed() {
         decoder.feed(&whole[..at]).expect("the first part");
         decoder.feed(&whole[at..]).expect("the rest");
         assert!(decoder.is_done(), "split at {at}");
-        assert_eq!(decoder.take(), b"hello");
+        assert_eq!(decoder.take().as_slice(), b"hello");
     }
     let mut decoder = ChunkedDecoder::default();
     decoder.feed(b"5\nhello\n0\n\n").expect("bare LFs");
-    assert_eq!(decoder.take(), b"hello");
+    assert_eq!(decoder.take().as_slice(), b"hello");
 }
