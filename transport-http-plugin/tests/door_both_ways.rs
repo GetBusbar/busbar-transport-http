@@ -42,8 +42,8 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::route::{
-    FieldPredicate, LineEntry, RouteMatch, FIELD_VALUE_PREFIX, METHOD_ANY, METHOD_GET, METHOD_POST,
-    PATH_EXACT, PATH_PREFIX,
+    FieldPredicate, LineEntry, RouteMatch, FIELD_PRESENT, FIELD_VALUE_PREFIX, METHOD_ANY,
+    METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
@@ -3714,6 +3714,81 @@ fn a_changed_list_is_not_reused(label: &str, ops: &'static Ops) {
             }),
         ),
     ];
+    // Predicate members, observed through whether the request matches. `rung` is not pinned here:
+    // the door matches in table order and only carries the rung through, so no request can tell it.
+    let pred = |id: u32, op: u32, name: &'static str, value: &'static str| {
+        let preds: &'static [FieldPredicate] = Box::leak(Box::new([FieldPredicate {
+            op,
+            _reserved: 0,
+            name: s(name),
+            value: s(value),
+        }]));
+        let mut l = post(id);
+        l.route.fields = preds.as_ptr();
+        l.route.fields_len = preds.len();
+        l
+    };
+    let tiered_pro = tiered_post("pro-1");
+    let extra = [
+        // The base requires `x-tier` to start `pro`, the alt has no predicate: a stale copy
+        // would refuse a non-matching tier.
+        (
+            "predicate count",
+            vec![tiered_line(8, "pro")],
+            vec![post(8)],
+            tiered_post("free"),
+            true,
+        ),
+        (
+            "predicate count (reverse)",
+            vec![post(8)],
+            vec![tiered_line(8, "pro")],
+            tiered_post("free"),
+            false,
+        ),
+        // Same value, other header name: the request carries `x-tier` only.
+        (
+            "predicate name",
+            vec![tiered_line(8, "pro")],
+            vec![pred(8, FIELD_VALUE_PREFIX, "x-other", "pro")],
+            tiered_pro.clone(),
+            false,
+        ),
+        // Same name: prefix needs `zzz`, presence needs only the header.
+        (
+            "predicate op",
+            vec![pred(8, FIELD_VALUE_PREFIX, "x-tier", "zzz")],
+            vec![pred(8, FIELD_PRESENT, "x-tier", "zzz")],
+            tiered_pro.clone(),
+            true,
+        ),
+    ];
+    for (member, base, alt, req, alt_matches) in extra {
+        let first = AcceptHost::open_with(ops, base, Script::default());
+        let mut second = AcceptHost::open_again(&first, alt);
+        let _ = second.ingest(&req);
+        let asked = first.asked();
+        let ok = if alt_matches {
+            matches!(
+                &asked[..],
+                [Asked::Auth { .. }, Asked::HandIn { line: 8, .. }]
+            )
+        } else {
+            matches!(
+                &asked[..],
+                [Asked::Refuse {
+                    cause: REFUSE_NO_ROUTE,
+                    ..
+                }]
+            )
+        };
+        assert!(
+            ok,
+            "{label}: a list differing in its {member} only is framed under its own list: {asked:?}"
+        );
+        first.close();
+    }
+
     for (member, base, alt, expect) in cases {
         let first = AcceptHost::open_with(ops, base, Script::default());
         let mut second = AcceptHost::open_again(&first, alt);
