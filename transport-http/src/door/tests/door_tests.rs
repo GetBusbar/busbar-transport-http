@@ -194,7 +194,17 @@ fn every_classed_claim_has_the_fault_table() {
             .filter(|r| r.claim == claim)
             .map(|r| (r.lo, r.hi, r.fault))
             .collect();
-        assert_eq!(rows.len(), HTTP_FAULTS.len(), "claim {claim}");
+        let want: Vec<(u32, u32, u32)> = HTTP_FAULTS
+            .iter()
+            .map(|&(lo, hi, fault)| (lo, hi, fault as u32))
+            .collect();
+        assert_eq!(rows, want, "claim {claim}: the fault table's rows");
+        let classes: Vec<(u32, u32, u32)> = STATUS_ROWS
+            .iter()
+            .filter(|r| r.claim == claim)
+            .map(|r| (r.lo, r.hi, r.class))
+            .collect();
+        assert_eq!(classes, HTTP_CLASSES, "claim {claim}: the status rows");
     }
 }
 
