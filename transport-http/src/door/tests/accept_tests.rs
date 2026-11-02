@@ -1083,3 +1083,18 @@ fn a_request_with_a_non_text_host_is_never_handed_in() {
     let u = up(&mut a);
     assert!(u.heads.is_empty(), "nothing went up: {u:?}");
 }
+
+/// RED (codeaudit r2-prod0-2): an absolute-form target carrying userinfo (`user:pass@`) was
+/// admitted and the credential bytes went up in the head's authority slot. RFC 9110 4.2.4: treat
+/// it as an error; the request is never handed in and nothing carrying the credential goes up.
+#[test]
+fn an_absolute_form_target_with_userinfo_is_never_handed_in() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET http://alice:s3cret@api.example.com/v1/models HTTP/1.1\r\nhost: api.example.com\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert!(u.heads.is_empty(), "nothing went up: {u:?}");
+}

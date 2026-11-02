@@ -1544,6 +1544,12 @@ impl Accepted {
                     {
                         return fail(a, did);
                     }
+                    // An absolute-form target's userinfo is a credential riding the URL (RFC 9110
+                    // 4.2.4: an error): never shown to the auth nor sent up, as the dialled side
+                    // refuses it too.
+                    if super::carries_userinfo(&parts.uri) {
+                        return fail(a, did);
+                    }
                     let fields = field_lines(parts);
                     let to = match guest::matched(
                         &self.lines,
