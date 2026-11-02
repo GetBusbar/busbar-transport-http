@@ -15,7 +15,8 @@
 //! and (where the caller named one) authority in the stream's head slots, then its body as data
 //! pieces, then the empty piece that says the request is whole. The answer comes down through
 //! `emit`: the FIRST emit on a stream is its head, a field block (`abi::transport::fields`) with the
-//! status in `EmitIn::status`; every later emit is body bytes, the last one ending the frame. A head
+//! status in `EmitIn::status`; later emits are body bytes, or a final field block flagged
+//! `EMIT_TRAILERS`. Final fields follow queued body data and end the answer. A head
 //! that states `content-length` frames the body by it; one that does not is chunked (HTTP/1.1),
 //! exactly as hyper framed an answer whose size it did not know.
 //!
@@ -192,6 +193,11 @@ impl Bounds<'_> {
 #[derive(Default)]
 struct ReplyQ {
     chunks: VecDeque<Bytes>,
+    /// Final fields follow every queued data frame and precede the body's end.
+    trailers: Option<http::HeaderMap>,
+    /// HTTP/1 only writes names declared in the initial Trailer field.
+    trailer_names: Option<HashSet<http::HeaderName>>,
+    trailers_supported: bool,
     queued: usize,
     ended: bool,
     full: bool,
@@ -238,6 +244,9 @@ impl Body for Reply {
             q.queued -= c.len();
             return Poll::Ready(Some(Ok(Frame::data(c))));
         }
+        if let Some(trailers) = q.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
+        }
         if q.ended {
             return Poll::Ready(None);
         }
@@ -247,7 +256,7 @@ impl Body for Reply {
 
     fn is_end_stream(&self) -> bool {
         let q = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        q.ended && q.chunks.is_empty()
+        q.ended && q.chunks.is_empty() && q.trailers.is_none()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -263,6 +272,9 @@ struct StreamPolicy {
 
 /// One request's answer side.
 struct Answer {
+    /// Hyper's HTTP/1 trailer negotiation is fixed by the original request, before auth strips.
+    h1: bool,
+    trailer_peer: bool,
     /// Where the head goes, until the first emit.
     respond: Option<futures_channel::oneshot::Sender<http::Response<Reply>>>,
     /// The body queue, once the head went.
@@ -980,6 +992,11 @@ impl Accepted {
         end: bool,
         status: u32,
     ) -> Result<bool, Failure> {
+        if bytes.is_empty() && !end && status == 0 {
+            // MORE drains wire already accepted by the original emit. Hyper may have finished
+            // and removed that stream while its final bytes still wait in the connection pipe.
+            return Ok(self.stream_full(stream));
+        }
         let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         // A stream the host was never handed (refused, or not yet admitted) is no request of its.
         let Some(a) = sh.streams.get_mut(&stream).filter(|a| a.up) else {
@@ -1015,6 +1032,27 @@ impl Accepted {
             let resp = b
                 .body(Reply(q.clone(), None))
                 .map_err(|e| Failure(format!("emit: the head is not an answer: {e}")))?;
+            {
+                let mut queue = q.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.trailers_supported = a.trailer_peer
+                    && !code.is_informational()
+                    && code != http::StatusCode::NO_CONTENT
+                    && code != http::StatusCode::NOT_MODIFIED
+                    && (!a.h1 || !resp.headers().contains_key(http::header::CONTENT_LENGTH));
+                if a.h1 {
+                    queue.trailer_names = Some(
+                        resp.headers()
+                            .get_all(http::header::TRAILER)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .flat_map(|value| value.split(','))
+                            .filter_map(|name| {
+                                http::HeaderName::from_bytes(name.trim().as_bytes()).ok()
+                            })
+                            .collect(),
+                    );
+                }
+            }
             let Some(respond) = a.respond.take() else {
                 unreachable!("checked above, under the same lock")
             };
@@ -1035,10 +1073,6 @@ impl Accepted {
             return Err(Failure(format!("emit: stream {stream} has no answer")));
         };
         let mut q = q.lock().unwrap_or_else(PoisonError::into_inner);
-        if bytes.is_empty() && !end {
-            // A re-call after `YIELD_MORE` carries nothing new.
-            return Ok(q.full);
-        }
         if q.ended {
             return Err(Failure(format!(
                 "emit: stream {stream}'s answer already ended"
@@ -1059,6 +1093,91 @@ impl Accepted {
         drop(q);
         if end {
             let_unread_body_go(a);
+        }
+        Ok(full)
+    }
+
+    /// Accept one whole terminal field block. Validation precedes mutation, so a malformed or
+    /// unsupported trailer leaves the answer open for a corrected emit or a host refusal.
+    ///
+    /// # Errors
+    ///
+    /// No live headed answer, malformed fields, or final fields this protocol cannot deliver.
+    pub fn emit_trailers(&mut self, stream: u64, bytes: &[u8]) -> Result<bool, Failure> {
+        let mut trailers = http::HeaderMap::new();
+        let mut read = 0;
+        for (name, value) in fields::lines(bytes) {
+            read += name.len() + fields::SEPARATOR.len() + value.len() + fields::LINE_END.len();
+            let name = http::HeaderName::from_bytes(name)
+                .map_err(|_| Failure("emit: invalid trailer field name".into()))?;
+            let value = http::HeaderValue::from_bytes(value)
+                .map_err(|_| Failure("emit: invalid trailer field value".into()))?;
+            if fields::hop_by_hop(name.as_str(), std::iter::empty::<&[u8]>()) {
+                return Err(Failure("emit: field cannot be carried in trailers".into()));
+            }
+            trailers.append(name, value);
+        }
+        if read != bytes.len() {
+            return Err(Failure("emit: malformed terminal field block".into()));
+        }
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(answer) = shared.streams.get_mut(&stream).filter(|answer| answer.up) else {
+            return Err(Failure(format!("emit: no request on stream {stream}")));
+        };
+        if answer.respond.is_some() {
+            return Err(Failure("emit: trailers precede the answer head".into()));
+        }
+        // Hyper's HTTP/1 encoder discards these names even if declared. HTTP/2 has no such
+        // encoder restriction, and retains ordinary final metadata as the host supplied it.
+        if answer.h1
+            && trailers.keys().any(|name| {
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "cache-control"
+                        | "content-encoding"
+                        | "content-length"
+                        | "content-range"
+                        | "content-type"
+                        | "host"
+                        | "max-forwards"
+                        | "set-cookie"
+                        | "trailer"
+                        | "transfer-encoding"
+                        | "te"
+                )
+            })
+        {
+            return Err(Failure(
+                "emit: field cannot be carried in HTTP/1 trailers".into(),
+            ));
+        }
+        let Some(queue) = answer.reply.as_ref() else {
+            return Err(Failure("emit: stream has no answer".into()));
+        };
+        let mut queue = queue.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.ended || queue.gone || queue.broken {
+            return Err(Failure("emit: trailers follow an ended answer".into()));
+        }
+        if !trailers.is_empty()
+            && (!queue.trailers_supported
+                || queue.trailer_names.as_ref().is_some_and(|names| {
+                    names.is_empty() || trailers.keys().any(|name| !names.contains(name))
+                }))
+        {
+            return Err(Failure(
+                "emit: trailers were not negotiated and declared for this answer".into(),
+            ));
+        }
+        queue.trailers = (!trailers.is_empty()).then_some(trailers);
+        queue.ended = true;
+        let full = queue.full;
+        let wake = queue.waker.take();
+        drop(queue);
+        let_unread_body_go(answer);
+        drop(shared);
+        if let Some(wake) = wake {
+            wake.wake();
         }
         Ok(full)
     }
@@ -1354,6 +1473,17 @@ fn serve(
     sh: Arc<Mutex<Shared>>,
     mut req: http::Request<Incoming>,
 ) -> BoxFut<Result<http::Response<Reply>, std::io::Error>> {
+    let h1 = req.version() != http::Version::HTTP_2;
+    let trailer_peer = req.method() != http::Method::HEAD
+        && req.method() != http::Method::CONNECT
+        && (!h1
+            || (req.version() == http::Version::HTTP_11
+                && req.headers().get_all(http::header::TE).iter().any(|value| {
+                    value.to_str().is_ok_and(|line| {
+                        line.split(',')
+                            .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+                    })
+                })));
     let asks_upgrade = req.headers().contains_key(http::header::UPGRADE);
     let upgrade = asks_upgrade.then(|| hyper::upgrade::on(&mut req));
     let (parts, body) = req.into_parts();
@@ -1366,6 +1496,8 @@ fn serve(
         s.streams.insert(
             id,
             Answer {
+                h1,
+                trailer_peer,
                 respond: Some(tx),
                 reply: None,
                 upgrade,

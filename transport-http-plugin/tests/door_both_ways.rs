@@ -4545,3 +4545,230 @@ fn pending_auth_reports_receive_pressure_and_resumes_linked_and_dropped_in() {
 fn head_body_over_one_receive_window_completes_linked_and_dropped_in() {
     both(head_body_larger_than_receive_window_keeps_progress);
 }
+
+impl AcceptHost {
+    fn emit_kind(
+        &mut self,
+        stream: u64,
+        bytes: &[u8],
+        end: bool,
+        status: u32,
+        kind_flags: u32,
+        head_flags: u32,
+    ) -> (Outcome, u32) {
+        let mut input: EmitIn = z();
+        input.head.ticket = self.ticket;
+        input.head.flags = head_flags;
+        input.framing = self.framing;
+        input.stream = stream;
+        input.bytes = bytes.as_ptr();
+        input.len = bytes.len();
+        input.end_of_frame = u32::from(end);
+        input.status = status;
+        input.flags = kind_flags;
+        input.sink = self.sink();
+        let mut out: FramerOut = z();
+        let result = call(self.ops.emit, self.inst, &mut input, &mut out, slot::EMIT);
+        let flags = out.yielded.flags;
+        (self.take(result, &out), flags)
+    }
+}
+
+fn terminal_fields_on_the_actual_door(label: &str, ops: &'static Ops) {
+    use busbar_contract::abi::transport::{EMIT_TEXT, EMIT_TRAILERS};
+    for h2 in [false, true] {
+        let mut host =
+            AcceptHost::open_with(ops, vec![line(1, 0, METHOD_ANY, "/", 0)], Script::default());
+        let request = if h2 {
+            h2_requests(&[(1, "/")])
+        } else {
+            b"GET / HTTP/1.1\r\nhost: busbar.test\r\nte: trailers\r\n\r\n".to_vec()
+        };
+        assert_eq!(host.ingest(&request), Outcome::Ready, "{label}");
+        assert_eq!(host.heads_up(), 1);
+        let trailer = b"x-check: first\r\nx-check: second\r\n";
+        assert_eq!(
+            host.emit_kind(1, trailer, true, 0, EMIT_TRAILERS, 0).0,
+            Outcome::Failed,
+            "{label}: no trailer before head"
+        );
+        assert_eq!(
+            host.emit(1, b"trailer: x-check\r\n", false, 201),
+            Outcome::Ready
+        );
+        assert_eq!(host.emit(1, b"hello", false, 0), Outcome::Ready);
+        for (fields, end, status, flags) in [
+            (
+                b"x-check: good\r\nbroken".as_slice(),
+                true,
+                0,
+                EMIT_TRAILERS,
+            ),
+            (trailer.as_slice(), false, 0, EMIT_TRAILERS),
+            (trailer.as_slice(), true, 200, EMIT_TRAILERS),
+            (trailer.as_slice(), true, 0, EMIT_TRAILERS | EMIT_TEXT),
+            (trailer.as_slice(), true, 0, 0x8000_0000),
+        ] {
+            assert_eq!(
+                host.emit_kind(1, fields, end, status, flags, 0).0,
+                Outcome::Failed,
+                "{label}: malformed terminal emit is refused before mutation"
+            );
+        }
+        host.wire.resize(7, 0);
+        let (result, mut flags) = host.emit_kind(1, trailer, true, 0, EMIT_TRAILERS, 0);
+        assert_eq!(
+            result,
+            Outcome::Ready,
+            "{label}: valid trailer follows rejections"
+        );
+        for _ in 0..256 {
+            if flags & YIELD_MORE == 0 {
+                break;
+            }
+            let (result, next) = host.emit_kind(1, &[], false, 0, 0, 0);
+            assert_eq!(result, Outcome::Ready);
+            flags = next;
+        }
+        assert_eq!(flags & YIELD_MORE, 0, "{label}: finite trailer drains");
+        assert_eq!(
+            host.emit_kind(1, trailer, true, 0, EMIT_TRAILERS, 0).0,
+            Outcome::Failed,
+            "{label}: final fields are accepted once"
+        );
+        if h2 {
+            let mut at = 0;
+            let mut frames = Vec::new();
+            while at + 9 <= host.out.len() {
+                let len = (usize::from(host.out[at]) << 16)
+                    | (usize::from(host.out[at + 1]) << 8)
+                    | usize::from(host.out[at + 2]);
+                assert!(
+                    at + 9 + len <= host.out.len(),
+                    "{label}: whole captured HTTP/2 frame"
+                );
+                let stream = u32::from_be_bytes(host.out[at + 5..at + 9].try_into().unwrap());
+                if stream == 1 {
+                    frames.push((host.out[at + 3], host.out[at + 4]));
+                }
+                at += 9 + len;
+            }
+            assert_eq!(at, host.out.len());
+            assert_eq!(
+                frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+                [1, 0, 1],
+                "{label}: HEADERS, DATA, trailing HEADERS"
+            );
+            assert_eq!(
+                frames.last().unwrap().1 & 1,
+                1,
+                "{label}: trailers end stream"
+            );
+        } else {
+            assert!(
+                host.out
+                    .ends_with(b"5\r\nhello\r\n0\r\nx-check: first\r\nx-check: second\r\n\r\n"),
+                "{label}: final fields follow the body exactly once: {:?}",
+                String::from_utf8_lossy(&host.out)
+            );
+        }
+        host.close();
+    }
+}
+
+#[test]
+fn final_fields_are_terminal_wire_fields_linked_and_dropped_in() {
+    both(terminal_fields_on_the_actual_door);
+}
+
+fn pending_terminal_fields_are_consumed_once(label: &str, ops: &'static Ops) {
+    use busbar_contract::abi::transport::EMIT_TRAILERS;
+    for cancel in [false, true] {
+        let mut host = AcceptHost::open_with(
+            ops,
+            vec![
+                line(3, POINT_HEAD, METHOD_ANY, "/a", 0),
+                line(5, 0, METHOD_ANY, "/b", 0),
+            ],
+            Script {
+                pend: 1,
+                ..Script::default()
+            },
+        );
+        assert_eq!(
+            host.ingest(&h2_requests(&[(1, "/a"), (3, "/b")])),
+            Outcome::Pending
+        );
+        let first = host.ticket;
+        host.ticket.slot = 2;
+        assert_eq!(host.ingest(&[]), Outcome::Ready);
+        let stream = host
+            .words
+            .iter()
+            .find(|(_, _, path)| path == b"/b")
+            .unwrap()
+            .0;
+        assert_eq!(host.emit(stream, b"", false, 200), Outcome::Ready);
+        assert_eq!(host.emit(stream, b"hello", false, 0), Outcome::Ready);
+        assert_eq!(host.cancel(first), CANCEL_PARTIAL);
+        scripts().get_mut(&host.ctx).unwrap().pend = 1;
+        host.ticket.slot = 3;
+        host.wire.resize(7, 0);
+        assert_eq!(
+            host.emit_kind(stream, b"x-check: once\r\n", true, 0, EMIT_TRAILERS, 0)
+                .0,
+            Outcome::Pending,
+            "{label}: final fields accepted before sibling auth parks"
+        );
+        let (result, mut flags) = if cancel {
+            assert_eq!(host.cancel(host.ticket), CANCEL_PARTIAL);
+            host.ticket.slot = 4;
+            host.emit_kind(stream, &[], false, 0, 0, 0)
+        } else {
+            host.emit_kind(stream, &[], false, 0, 0, FLAG_RESUME)
+        };
+        assert_eq!(
+            result,
+            Outcome::Ready,
+            "{label}: accepted trailer survives resume/cancel"
+        );
+        for _ in 0..256 {
+            if flags & YIELD_MORE == 0 {
+                break;
+            }
+            let (result, next) = host.emit_kind(stream, &[], false, 0, 0, 0);
+            assert_eq!(result, Outcome::Ready);
+            flags = next;
+        }
+        assert_eq!(flags & YIELD_MORE, 0, "{label}: finite wire drains");
+        let (mut at, mut terminal_headers, mut data) = (0, 0, Vec::new());
+        while at + 9 <= host.out.len() {
+            let len = (usize::from(host.out[at]) << 16)
+                | (usize::from(host.out[at + 1]) << 8)
+                | usize::from(host.out[at + 2]);
+            assert!(at + 9 + len <= host.out.len());
+            let wire_stream = u32::from_be_bytes(host.out[at + 5..at + 9].try_into().unwrap());
+            if wire_stream == 3 {
+                if host.out[at + 3] == 1 && host.out[at + 4] & 1 != 0 {
+                    terminal_headers += 1;
+                }
+                if host.out[at + 3] == 0 {
+                    data.extend_from_slice(&host.out[at + 9..at + 9 + len]);
+                }
+            }
+            at += 9 + len;
+        }
+        assert_eq!(at, host.out.len());
+        assert_eq!(
+            terminal_headers, 1,
+            "{label}: accepted final fields are serialized once"
+        );
+        assert_eq!(data, b"hello", "{label}: fields never become body bytes");
+        host.close();
+    }
+}
+
+#[test]
+fn pending_or_cancelled_final_emits_keep_accepted_wire_once_linked_and_dropped_in() {
+    both(pending_terminal_fields_are_consumed_once);
+}

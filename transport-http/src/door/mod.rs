@@ -105,15 +105,16 @@ use busbar_contract::abi::sdk::services::{
 use busbar_contract::abi::sdk::transport::policy::Loans;
 use busbar_contract::abi::sdk::transport::{form_codes, settings_reading, DEFAULT_BODY_MAX};
 use busbar_contract::abi::sdk::{self as sdk, Lent, Out, Safe, SafeSlot};
+use busbar_contract::abi::transport::check::check_emit_flags;
 use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use busbar_contract::abi::transport::{
     AcceptIn, AcceptOut, AdoptIn, ArrivalIn, ArrivalOut, BeginIn, Claim, ConnIn, ConnOut, DialIn,
     EmitIn, EncodeIn, FaultRow, FinishIn, FramerOut, FramerSink, FramingIn, IngestIn, IoOut,
     ListenIn, ListenOut, LocateIn, LocateOut, Ops, ReadIn, RefuseIn, SettingDecl, ShutIn,
-    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, EXT_OFFERED_POINTS,
-    FAULT_CALLER, FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT, SETTING_FLAG,
-    SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT, STATUS_FAR_END_FAULT,
-    STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
+    StatusRow, TransportTail, WriteIn, CANCEL_NOTHING_MOVED, CANCEL_PARTIAL, EMIT_TRAILERS,
+    EXT_OFFERED_POINTS, FAULT_CALLER, FAULT_HARD, FAULT_NONE, FAULT_TRANSIENT, SETTING_COUNT,
+    SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT,
+    STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
 use busbar_contract::transport::registry::{facts as tfacts, status_ns};
 
@@ -1093,6 +1094,7 @@ impl SafeSlot for Emit {
                 Held::Dial(_) if resumed => Ok(()),
                 Held::Dial(f) => {
                     // A dialled stream's emits carry a request: no answer's status rides them.
+                    check_emit_flags(&i, SIDE_DIAL, false).map_err(refused_status)?;
                     check_emit_status(&i, false).map_err(refused_status)?;
                     if let Some(sensitive) = sensitive {
                         f.emit_sensitive(
@@ -1116,8 +1118,14 @@ impl SafeSlot for Emit {
                 Held::Accept(a) => {
                     // The first emit on an accepted stream is its answer's head, with its status;
                     // every other carries none.
-                    check_emit_status(&i, a.answers_head(i.stream)).map_err(refused_status)?;
-                    full = a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?;
+                    let answers_head = a.answers_head(i.stream);
+                    check_emit_flags(&i, SIDE_ACCEPT, answers_head).map_err(refused_status)?;
+                    check_emit_status(&i, answers_head).map_err(refused_status)?;
+                    full = if i.flags & EMIT_TRAILERS != 0 {
+                        a.emit_trailers(i.stream, bytes)?
+                    } else {
+                        a.emit(i.stream, bytes, i.end_of_frame != 0, i.status)?
+                    };
                     Ok(())
                 }
             },

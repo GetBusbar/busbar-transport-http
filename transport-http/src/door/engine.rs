@@ -348,7 +348,7 @@ impl Framing {
             return Ok(());
         }
         // A re-call after `YIELD_MORE` carries no new bytes: nothing to add to any message.
-        if bytes.is_empty() && !end {
+        if bytes.is_empty() && !end && sensitive.is_none() {
             return Ok(());
         }
         let deadline = if deadline_ns != 0 {

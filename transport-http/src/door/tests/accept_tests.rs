@@ -1429,3 +1429,163 @@ fn the_admitted_body_copy_keeps_wiping_custody_until_the_host_takes_it() {
     drop(a);
     probe.finish().assert_wiped_on_linux(&["admitted body"]);
 }
+
+#[test]
+fn final_fields_follow_data_on_the_actual_http1_wire_and_keep_repeated_values() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET / HTTP/1.1\r\nhost: test\r\nte: trailers\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(stream, b"trailer: x-check\r\n", false, 201).unwrap();
+    a.emit(stream, b"hello", false, 0).unwrap();
+    a.emit_trailers(stream, b"x-check: first\r\nx-check: second\r\n")
+        .unwrap();
+    run(&mut a, SEC);
+    let wire = undated(a.take_wire(usize::MAX));
+    assert!(wire.starts_with(b"HTTP/1.1 201 Created\r\n"));
+    assert!(
+        wire.ends_with(b"5\r\nhello\r\n0\r\nx-check: first\r\nx-check: second\r\n\r\n"),
+        "the fields terminate chunk framing, never appear as body data: {:?}",
+        String::from_utf8_lossy(&wire)
+    );
+    assert!(a.emit_trailers(stream, b"x-check: twice\r\n").is_err());
+    assert!(a.emit(stream, b"after", true, 0).is_err());
+}
+
+#[test]
+fn a_rejected_terminal_field_block_leaves_the_answer_correctable() {
+    let (mut a, stream) = h2_request();
+    assert!(a.emit_trailers(stream, b"x-check: before\r\n").is_err());
+    assert!(a.answers_head(stream));
+    a.emit(stream, b"", false, 200).unwrap();
+    a.emit(stream, b"hello", false, 0).unwrap();
+    for malformed in [
+        b"x-check: good\r\nbroken".as_slice(),
+        b"x-check: a\0b\r\n",
+        b"bad name: value\r\n",
+        b"connection: close\r\n",
+    ] {
+        assert!(a.emit_trailers(stream, malformed).is_err());
+        let shared = a.shared.lock().unwrap();
+        let queue = shared.streams[&stream]
+            .reply
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap();
+        assert!(
+            !queue.ended && queue.trailers.is_none(),
+            "no malformed prefix accepted"
+        );
+    }
+    a.emit_trailers(stream, b"x-check: valid\r\n").unwrap();
+    run(&mut a, SEC);
+    assert_eq!(
+        h2_types(&a.take_wire(usize::MAX)),
+        [1, 0, 1],
+        "HEADERS, DATA, terminal HEADERS"
+    );
+}
+
+#[test]
+fn http1_refuses_trailers_that_hyper_cannot_deliver() {
+    for (request, head) in [
+        (
+            b"GET / HTTP/1.1\r\nhost: test\r\n\r\n".as_slice(),
+            b"trailer: x-check\r\n".as_slice(),
+        ),
+        (b"GET / HTTP/1.1\r\nhost: test\r\nte: trailers\r\n\r\n", b""),
+        (
+            b"GET / HTTP/1.1\r\nhost: test\r\nte: trailers\r\n\r\n",
+            b"trailer: x-check\r\ncontent-length: 5\r\n",
+        ),
+        (
+            b"HEAD / HTTP/1.1\r\nhost: test\r\nte: trailers\r\n\r\n",
+            b"trailer: x-check\r\n",
+        ),
+    ] {
+        let mut a = accepted();
+        a.ingest(request, false);
+        run(&mut a, SEC);
+        let stream = up(&mut a).heads[0].0;
+        a.emit(stream, head, false, 200).unwrap();
+        assert!(a.emit_trailers(stream, b"x-check: value\r\n").is_err());
+    }
+}
+
+#[test]
+fn an_http2_client_decodes_the_actual_trailer_wire_as_fields_after_the_body() {
+    let (mut a, stream) = h2_request();
+    a.emit(stream, b"", false, 201).unwrap();
+    a.emit(stream, b"hello", false, 0).unwrap();
+    a.emit_trailers(
+        stream,
+        b"grpc-status: 0\r\nx-check: first\r\nx-check: second\r\n",
+    )
+    .unwrap();
+    run(&mut a, SEC);
+    let mut wire = frame(4, 0, 0, &[]);
+    wire.extend(a.take_wire(usize::MAX));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                use tokio::io::AsyncWriteExt;
+                let (client, mut peer) = tokio::io::duplex(64 * 1024);
+                let (mut sender, connection) = h2::client::handshake(client).await.unwrap();
+                let task = tokio::spawn(connection);
+                let request = http::Request::builder()
+                    .uri("http://busbar.test/")
+                    .body(())
+                    .unwrap();
+                let (response, _) = sender.send_request(request, true).unwrap();
+                peer.write_all(&wire).await.unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(5), response)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(response.status(), 201);
+                let mut body = response.into_body();
+                let mut data = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    data.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(data, b"hello");
+                let trailers = body.trailers().await.unwrap().unwrap();
+                assert_eq!(trailers["grpc-status"], "0");
+                let repeated: Vec<_> = trailers
+                    .get_all("x-check")
+                    .iter()
+                    .map(|value| value.as_bytes())
+                    .collect();
+                assert_eq!(repeated, [b"first".as_slice(), b"second".as_slice()]);
+                task.abort();
+            })
+            .await
+            .expect("the complete body and trailers arrive within the bound");
+        });
+}
+
+#[test]
+fn http1_trailer_negotiation_matches_hypers_comma_and_repeated_te_fields() {
+    for te in ["te: gzip, Trailers\r\n", "te: gzip\r\nte: trailers\r\n"] {
+        let mut a = accepted();
+        a.ingest(
+            format!("GET / HTTP/1.1\r\nhost: test\r\n{te}\r\n").as_bytes(),
+            false,
+        );
+        run(&mut a, SEC);
+        let stream = up(&mut a).heads[0].0;
+        a.emit(stream, b"trailer: X-Check\r\n", false, 200).unwrap();
+        a.emit_trailers(stream, b"x-check: kept\r\n").unwrap();
+        run(&mut a, SEC);
+        assert!(a
+            .take_wire(usize::MAX)
+            .ends_with(b"0\r\nx-check: kept\r\n\r\n"));
+    }
+}
