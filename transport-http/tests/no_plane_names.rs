@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// The crate's purity vocabulary: the plane-crate spellings, the dialect words (named so a
-
 struct Vocab {
     plane_crates: Vec<String>,
     dialect_words: HashMap<String, String>,
@@ -72,7 +71,6 @@ fn load_vocab() -> Vocab {
 }
 
 /// The core names a transport may not reach for, in both spellings.
-
 const CORE_NAMES: &[&str] = &[
     "busbar-kernel",
     "busbar_kernel",
@@ -102,7 +100,6 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Whether `word` occurs in `haystack` with a non-alphanumeric neighbour on each side.
-
 fn contains_word(haystack: &str, word: &str) -> bool {
     let lower = haystack.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -158,7 +155,6 @@ fn the_source_names_no_plane() {
 }
 
 /// No dependency of this crate — including a dev-dependency — is a plane crate or a core crate.
-
 #[test]
 fn the_manifest_names_neither_a_plane_nor_core() {
     let vocab = load_vocab();
@@ -183,7 +179,6 @@ fn the_manifest_names_neither_a_plane_nor_core() {
 }
 
 /// The scan is not vacuous: a planted name is found, in both spellings and in the manifest's shape.
-
 #[test]
 fn the_scan_would_catch_a_planted_name() {
     let vocab = load_vocab();

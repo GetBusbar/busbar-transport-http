@@ -99,7 +99,6 @@ fn asked(proto: Proto, timeout_secs: u64) -> Framing {
 }
 
 /// Every body byte handed up on stream 1 (the head piece and failure pieces excluded), and whether
-
 fn body(f: &mut Framing) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut whole = false;
@@ -139,7 +138,6 @@ fn literal(name: &str, value: &str) -> Vec<u8> {
 }
 
 /// Response trailers are excluded from the body, matching the 1.5.5 reqwest data-frame reader.
-
 #[test]
 fn an_h1_trailer_section_is_not_body() {
     let mut f = asked(Proto::H1, 300);
@@ -186,7 +184,6 @@ fn declared(f: &mut Framing) -> Option<Option<u64>> {
 }
 
 /// The head piece states the body length the answer's head declared (`Content-Length`, busbar
-
 #[test]
 fn the_head_piece_states_the_body_length_the_head_declared() {
     let mut f = asked(Proto::H1, 300);
@@ -214,7 +211,6 @@ fn the_head_piece_states_the_body_length_the_head_declared() {
 }
 
 /// The length a head declares is read whole or not at all: identical duplicates are one length,
-
 #[test]
 fn a_declared_length_is_one_valid_content_length() {
     let head = |values: &[&str]| {
@@ -238,7 +234,6 @@ fn a_declared_length_is_one_valid_content_length() {
 }
 
 /// The 1.5.5 total timeout runs from send through the end of the response body.
-
 #[test]
 fn a_body_still_arriving_at_the_request_timeout_is_cut_h1() {
     let mut f = asked(Proto::H1, 5);
@@ -279,7 +274,6 @@ fn a_body_still_arriving_at_the_request_timeout_is_cut_h2() {
 }
 
 /// Streamed responses are not capped by the request-body limit, matching the 1.5.5 client.
-
 #[test]
 fn a_streamed_response_past_the_request_body_cap_passes_through() {
     let mut f = asked(Proto::H1, 300);
@@ -308,7 +302,6 @@ fn a_streamed_response_past_the_request_body_cap_passes_through() {
 }
 
 /// The clock is the ATTEMPT's, stamped before the dial: a connect that took 200s leaves the
-
 #[test]
 fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
     let connected = 200 * SEC;
@@ -377,7 +370,6 @@ fn answered(f: &mut Framing) {
 }
 
 /// A later request on a pooled connection uses its stated target.
-
 #[test]
 fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialled() {
     let mut f = Framing::dial("http://127.0.0.1:9/card", Proto::H1, posture(30), 0).expect("dial");
@@ -430,7 +422,6 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
 }
 
 /// DNS hosts are sent in lowercase, matching the 1.5.5 client.
-
 #[test]
 fn a_dns_host_goes_out_lower_case() {
     let target: http::Uri = "http://API.Example.com:8080/x".parse().expect("uri");
@@ -442,7 +433,6 @@ fn a_dns_host_goes_out_lower_case() {
 }
 
 /// What one emit of an envelope rendered by `encode` does on a fresh HTTP/1.1 framing whose body
-
 fn rendered_and_sent(
     cap: usize,
     fields: &[(&str, &[u8])],
@@ -467,7 +457,6 @@ fn rendered_and_sent(
 }
 
 /// `limits.request_body_max_bytes` caps the body; a body at the cap still carries its head.
-
 #[test]
 fn a_request_body_at_the_cap_goes_out_with_its_head() {
     let fields: &[(&str, &[u8])] = &[
@@ -485,7 +474,6 @@ fn a_request_body_at_the_cap_goes_out_with_its_head() {
 }
 
 /// A chunked request body is held to `limits.request_body_max_bytes`.
-
 #[test]
 fn a_chunked_request_body_is_held_to_the_cap() {
     let chunked = |n: usize| {
@@ -521,7 +509,6 @@ fn a_chunked_request_body_is_held_to_the_cap() {
 }
 
 /// Bytes beyond the stated request length are refused before transmission.
-
 #[test]
 fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
@@ -560,7 +547,6 @@ fn h2_frame_types(wire: &[u8]) -> Vec<u8> {
 }
 
 /// Remaining pieces of a refused HTTP/2 request cannot start a fresh request.
-
 #[test]
 fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
@@ -631,7 +617,6 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
 }
 
 /// Refusing an HTTP/1 request drops its exchange and fails the framing.
-
 #[test]
 fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
     for message in [
@@ -650,7 +635,6 @@ fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
 }
 
 /// Field values retain their wire bytes, including obs-text, as in hyper's 1.5.5 rendering.
-
 #[test]
 fn an_obs_text_field_value_goes_out_byte_for_byte() {
     let (r, wire) = rendered_and_sent(
@@ -672,7 +656,6 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
 }
 
 /// Dial authorities use the same normalization as the 1.5.5 URL parser.
-
 #[test]
 fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
     for (dial, authority) in [
@@ -745,7 +728,6 @@ fn the_wire_head_is_the_head_the_auth_saw() {
 }
 
 /// What an HTTP/2 far end reads off `wire`, a client connection's bytes: its first request's
-
 fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
     use tokio::io::AsyncWriteExt;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -831,7 +813,6 @@ fn the_head_on_the_wire_is_every_line_the_auth_saw() {
 }
 
 /// A refused HTTP/1 emit fails the framing and retains no exchange.
-
 #[test]
 fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
     let capped = Posture {
@@ -859,7 +840,6 @@ fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
 }
 
 /// Request trailer fields are kept separate from the header section, as RFC 9110 requires.
-
 #[test]
 fn a_request_trailer_never_joins_the_header_section() {
     let wire = h1_wire(
@@ -877,7 +857,6 @@ fn a_request_trailer_never_joins_the_header_section() {
 }
 
 /// A request target outside origin form is refused rather than rewritten.
-
 #[test]
 fn a_target_not_in_origin_form_is_refused_not_rewritten() {
     for target in ["?a=1", "#f", "v1/chat", "http://other/x", "*"] {
@@ -917,7 +896,6 @@ fn queued(f: &mut Framing) -> usize {
 }
 
 /// HTTP/2 body reads advance only as far as the host has consumed.
-
 #[test]
 fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     let mut f = asked(Proto::H2, 300);
@@ -951,7 +929,6 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
 }
 
 /// An `sse` dial writes the same wire bytes as its `http` equivalent.
-
 #[test]
 fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
     let message =
@@ -980,7 +957,6 @@ fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
 }
 
 /// A framing that fails in the same drive that queued output (a body shorter than its declared
-
 #[test]
 fn a_framing_failing_with_output_owed_fails_each_live_stream_after_it() {
     let mut f = asked(Proto::H1, 300);
@@ -1032,7 +1008,6 @@ fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
 }
 
 /// A refused request message names its cause.
-
 #[test]
 fn a_refused_request_message_names_its_cause() {
     let capped = Posture {
@@ -1071,7 +1046,6 @@ fn a_refused_request_message_names_its_cause() {
 }
 
 /// Failure text exposes no byte of the dial target or request path.
-
 #[test]
 fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
     let Err(dial) = Framing::dial("http://SECRETD host/", Proto::H1, posture(30), 0) else {
@@ -1087,7 +1061,6 @@ fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
 }
 
 /// A failed first request leaves the dial URI's path available for the next request.
-
 #[test]
 fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
     let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
@@ -1122,7 +1095,6 @@ fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
 }
 
 /// A `Transfer-Encoding` response reports no declared length, as RFC 9112 requires.
-
 #[test]
 fn a_transfer_encoding_answer_states_no_declared_length() {
     let mut f = asked(Proto::H1, 300);
@@ -1136,7 +1108,6 @@ fn a_transfer_encoding_answer_states_no_declared_length() {
 }
 
 /// The head allowance bounds the complete request head.
-
 #[test]
 fn a_request_head_over_its_allowance_is_refused() {
     let mut head = b"GET /x HTTP/1.1\r\n".to_vec();
@@ -1174,7 +1145,6 @@ fn asked_with(proto: Proto, method: &str) -> Framing {
 }
 
 /// Responses that carry no body report no declared body length.
-
 #[test]
 fn an_answer_with_no_body_states_no_declared_length() {
     for (method, head) in [
@@ -1221,7 +1191,6 @@ fn an_answer_with_no_body_states_no_declared_length() {
 }
 
 /// Dropping an HTTP/2 framing releases its client connection.
-
 #[test]
 fn a_dropped_h2_framing_frees_its_connection() {
     let f = asked(Proto::H2, 300);
@@ -1234,7 +1203,6 @@ fn a_dropped_h2_framing_frees_its_connection() {
 }
 
 /// A connection failure does not report a second failure for an already refused stream.
-
 #[test]
 fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");

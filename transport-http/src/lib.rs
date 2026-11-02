@@ -18,12 +18,10 @@ mod transport;
 pub(crate) use message::{complete_message, request_target, retry_after_secs, EgressHead};
 
 /// THE TRANSPORT AXIS ENTRY: what the composition root folds for this row: its key, the
-
 pub mod linked {
     /// The row's registry key: the entry's first claim.
     pub const KEY: &str = crate::meta::KEY;
     /// The layers this framer declares it is built over: none. The connector chooses the carrier
-
     pub const COMPOSES_OVER: &[&str] = crate::meta::COMPOSES_OVER;
     /// Whether this transport carries sessions: no, as every claim row states.
     pub const SESSION: bool = crate::meta::SESSION;

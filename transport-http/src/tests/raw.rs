@@ -102,7 +102,6 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
 }
 
 /// Whitespace between a field name and its colon is refused, not normalised away.
-
 #[test]
 fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert!(Head::parse(b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n").is_err());
@@ -113,7 +112,6 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
 }
 
 /// `chunked` is the LAST coding or the message is not chunked at all.
-
 #[test]
 fn chunked_counts_only_as_the_final_transfer_coding() {
     assert_eq!(
@@ -136,7 +134,6 @@ fn chunked_counts_only_as_the_final_transfer_coding() {
 }
 
 /// The list is the whole field across every line carrying it (RFC 9110 5.3): `chunked` on one
-
 #[test]
 fn a_coding_list_spans_every_line_of_the_field() {
     for te in [
@@ -172,7 +169,6 @@ fn a_status_line_is_refused() {
 }
 
 /// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
-
 #[test]
 fn whitespace_before_a_chunk_extension_is_allowed() {
     let mut decoder = ChunkedDecoder::default();
@@ -184,7 +180,6 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
 }
 
 /// A carriage return that does not terminate a line is malformed.
-
 #[test]
 fn a_cr_that_does_not_end_a_line_is_malformed() {
     for wire in [

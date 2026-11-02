@@ -31,7 +31,6 @@ fn is_dot_dot(seg: &[u8]) -> bool {
 }
 
 /// `target` as written on the request line.
-
 pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     if target.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         return Err(REFUSED);

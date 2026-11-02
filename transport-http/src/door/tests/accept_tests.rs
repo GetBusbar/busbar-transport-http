@@ -10,7 +10,6 @@ use std::convert::Infallible;
 const SEC: u64 = 1_000_000_000;
 
 /// The kernel a `none` line meets: every hand-in CONTINUE; no auth is called on it and nothing is
-
 struct Open;
 
 /// The ticket a test kernel's op runs on: a ticketed one, where `auth.call` may be made.
@@ -322,7 +321,6 @@ fn undated(mut wire: Vec<u8>) -> Vec<u8> {
 }
 
 /// Whether `wire` holds one whole HTTP/1.1 answer: its head, then the body its `content-length`
-
 fn answer_whole(wire: &[u8]) -> bool {
     let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
@@ -343,7 +341,6 @@ fn answer_whole(wire: &[u8]) -> bool {
 }
 
 /// Render the 1.5.5 data listener's answer to `request`, with a known body size when `sized`.
-
 fn v155(
     request: &[u8],
     status: u16,
@@ -412,7 +409,6 @@ fn v155(
 }
 
 /// The door's accepted side answering `request` the same way, as a host drives it: the head emit
-
 fn door(
     request: &[u8],
     status: u16,
@@ -608,7 +604,6 @@ fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
 }
 
 /// THE COPY KEPT FOR A HAND-OVER AS SENT is bounded and kept only while a hand-over is possible
-
 #[test]
 fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
     let mut a = accepted();
@@ -633,7 +628,6 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 }
 
 /// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
-
 #[test]
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     const HEAD_LIMIT: usize = 8192 + 4096 * 100;
@@ -725,7 +719,6 @@ fn run_with(a: &mut Accepted, now: u64, k: &mut dyn Kernel) {
 }
 
 /// Every finished request is removed from the connection's retained state.
-
 #[test]
 fn a_connection_forgets_every_finished_request() {
     const N: usize = 50;
@@ -774,7 +767,6 @@ fn a_connection_forgets_every_finished_request() {
 }
 
 /// A request that carries an `Upgrade` line AND a body is served as any other: its body never fills
-
 #[test]
 fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let mut a = accepted();
@@ -813,7 +805,6 @@ fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// An HTTP/2 connection with one whole `GET /` request on stream 1, admitted and gone up: the
-
 fn h2_request() -> (Accepted, u64) {
     let mut a = accepted();
     a.ingest(H2_PREFACE, false);
@@ -879,7 +870,6 @@ fn a_stream_the_far_side_resets_before_its_head_ends_failed_and_is_let_go() {
 }
 
 /// A streaming answer held at its high-water mark, its stream reset: the host is woken (the
-
 #[test]
 fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
     let (mut a, stream) = h2_request();
@@ -924,7 +914,6 @@ fn one_get() -> (Accepted, u64) {
 }
 
 /// An invalid answer head is refused while retaining the stream for a valid answer.
-
 #[test]
 fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
     let (mut a, stream) = one_get();
@@ -953,7 +942,6 @@ fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
 }
 
 /// A malformed field line in an answer head is refused.
-
 #[test]
 fn an_answer_head_with_a_malformed_field_line_is_refused() {
     let (mut a, stream) = one_get();
@@ -972,7 +960,6 @@ fn an_answer_head_with_a_malformed_field_line_is_refused() {
 }
 
 /// Dropping an HTTP/2 connection releases its in-flight stream state.
-
 #[test]
 fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
     let (a, stream) = h2_request();
@@ -993,7 +980,6 @@ fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
 }
 
 /// A detach attempted before the protocol switch completes can be retried.
-
 #[test]
 fn a_detach_before_the_switch_completes_can_be_made_again() {
     let mut a = accepted();
@@ -1035,7 +1021,6 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
 }
 
 /// A connection error reports its cause to the affected streams.
-
 #[test]
 fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
     let (mut a, stream) = h2_request();
@@ -1056,7 +1041,6 @@ fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
 }
 
 /// A connection sending no request closes on the host's clock.
-
 #[test]
 fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
     for (what, sent) in [
@@ -1095,7 +1079,6 @@ fn h2_types(wire: &[u8]) -> Vec<u8> {
 }
 
 /// An idle HTTP/2 connection sends GOAWAY before closing; active work prevents idle closure.
-
 #[test]
 fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
     let (mut a, stream) = h2_request();
@@ -1118,7 +1101,6 @@ fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
 }
 
 /// An admitted request whose body has stalled (nothing for 30 s), or trickles below 1 KiB/s once
-
 #[test]
 fn a_stalled_or_trickled_request_body_fails_its_stream() {
     let post =
@@ -1638,7 +1620,6 @@ impl Kernel for CapturedAdmission {
 }
 
 /// The actual accepted-side parser, auth call, hand-in and emitted frame must agree. A filter
-
 #[test]
 fn an_accepted_request_preserves_the_exact_head_handed_in_after_auth() {
     for (wire, body) in [

@@ -155,7 +155,6 @@ fn locate(inst: *mut c_void, target: &str) -> (Outcome, Vec<u8>, String) {
 }
 
 /// `locate` of `target` with a defaults buffer of `cap` bytes (none lent at 0): its outcome, the
-
 fn locate_lending(
     inst: *mut c_void,
     target: &str,
@@ -184,7 +183,6 @@ fn locate_lending(
 }
 
 /// Releasing a lease that was never handed out is refused.
-
 #[test]
 fn a_release_of_a_lease_never_handed_out_is_refused() {
     use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
@@ -203,7 +201,6 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
 }
 
 /// Refresh without an open instance reports the SDK's fault.
-
 #[test]
 fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
     let (r, _) = refresh(std::ptr::null_mut(), "{}");
@@ -211,7 +208,6 @@ fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
 }
 
 /// Refresh reads new settings and retains the old settings when the new blob is invalid.
-
 #[test]
 fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
     let inst = open("");
@@ -243,7 +239,6 @@ fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
 }
 
 /// The framer's own head lines (`accept`, `host`) are owed to every request, so a host that lends
-
 #[test]
 fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
     let inst = open("");
@@ -263,7 +258,6 @@ fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
 }
 
 /// Validation returns the canonical settings explanations.
-
 #[test]
 fn validate_answers_the_canon_settings_texts() {
     assert_eq!(validate(""), (Outcome::Ready, String::new()));
@@ -307,7 +301,6 @@ unsafe fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, St
 }
 
 /// Carrier-role and unserved framer operations are refused with an explanation.
-
 #[test]
 fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words() {
     let inst = open("");
@@ -375,7 +368,6 @@ fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words(
 }
 
 /// Framer operations without an open instance fail with an explanation.
-
 #[test]
 fn a_framer_op_with_no_open_instance_is_failed_in_words() {
     let none = std::ptr::null_mut();
@@ -429,7 +421,6 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
 }
 
 /// An operation on an unknown framing names the failed operation.
-
 #[test]
 fn a_framer_op_on_an_unknown_framing_names_its_op() {
     let inst = open("");
@@ -474,7 +465,6 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
 }
 
 /// A far end that closes without answering fails in the system's words alone.
-
 #[test]
 fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     let inst = open(r#"{"advanced.upstream_http1_only":true}"#);
@@ -569,7 +559,6 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
 }
 
 /// Targets carrying userinfo are refused at both locate and begin.
-
 #[test]
 fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
     let inst = open("");
@@ -599,7 +588,6 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
 }
 
 /// The Statement carries the complete declares document.
-
 #[test]
 fn the_statement_carries_the_declares_document() {
     let ext = door::STATEMENT.extensions;

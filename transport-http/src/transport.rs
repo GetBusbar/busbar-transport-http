@@ -6,7 +6,6 @@
 use zeroize::Zeroizing;
 
 /// An RFC 9110 `token`: one or more `tchar`. A field name is one; anything else (a `:`, a space,
-
 fn is_token(name: &[u8]) -> bool {
     !name.is_empty()
         && name.iter().all(|b| {
@@ -32,7 +31,6 @@ fn is_token(name: &[u8]) -> bool {
 }
 
 /// Render the head of the one HTTP/1.1 request message an outbound envelope (`fields`,
-
 pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
     body_len: usize,

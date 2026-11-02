@@ -31,7 +31,6 @@ fn lines(block: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// A field line's name and its value without the optional whitespace (SP, HTAB) around it (RFC
-
 fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = memchr::memchr(b':', line)?;
     let value = &line[colon + 1..];
@@ -46,7 +45,6 @@ fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 impl<'a> Head<'a> {
     /// Read the head at the front of `bytes`, which may end exactly at the header terminator or
-
     pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
         const UNPARSABLE: &str = "unparsable request head";
         let block = memchr::memmem::find(bytes, b"\r\n\r\n").map_or(bytes, |p| &bytes[..p + 2]);
@@ -88,7 +86,6 @@ impl<'a> Head<'a> {
     }
 
     /// Every member of the list field `name`, across every line carrying it, each trimmed (`None`
-
     fn members(&self, name: &'static str) -> impl Iterator<Item = Option<&'a str>> {
         self.fields()
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name.as_bytes()))
@@ -97,7 +94,6 @@ impl<'a> Head<'a> {
     }
 
     /// How the body is framed.
-
     pub(crate) fn framing(&self) -> Result<BodyFraming, &'static str> {
         let (mut codings, mut chunked) = (0_usize, 0_usize);
         for coding in self.members("transfer-encoding") {
@@ -167,7 +163,6 @@ enum ChunkState {
 pub(crate) struct ChunkedMalformed;
 
 /// A size line's `1*HEXDIG` (RFC 9112 7.1: no sign, no whitespace, not empty). Chunk extensions
-
 fn chunk_size(line: &str) -> Result<usize, ChunkedMalformed> {
     let size = match line.split_once(';') {
         Some((size, _)) => size.trim_end_matches([' ', '\t']),
@@ -181,7 +176,6 @@ fn chunk_size(line: &str) -> Result<usize, ChunkedMalformed> {
 
 impl ChunkedDecoder {
     /// Feed everything that has arrived since the last call, answering how many of `bytes` the
-
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
         let mut at = 0;
         while at < bytes.len() {
@@ -233,7 +227,6 @@ impl ChunkedDecoder {
     }
 
     /// A size or trailer line has ended: its one CR before the LF is the line end's; a CR anywhere
-
     fn end_line(&mut self) -> Result<(), ChunkedMalformed> {
         if self.line.last() == Some(&b'\r') {
             self.line.pop();

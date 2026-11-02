@@ -124,7 +124,6 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
 }
 
 /// What the door wrote for the same request. `state_len` is whether the host states the length line
-
 fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     let d = busbar_transport_http::door::door();
     // SAFETY: the door's `'static` table.
@@ -297,7 +296,6 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
 }
 
 /// The HTTP/1-only setting reproduces the 1.5.5 client's request bytes.
-
 #[test]
 fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -316,7 +314,6 @@ fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
 }
 
 /// An empty HTTP/2 POST carries `content-length: 0`, matching the 1.5.5 client.
-
 #[test]
 fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -345,7 +342,6 @@ fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
 }
 
 /// An empty HTTP/1.1 POST carries no length field, matching the 1.5.5 client.
-
 #[test]
 fn an_http1_empty_post_carries_no_length_line_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()

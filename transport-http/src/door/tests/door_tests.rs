@@ -47,7 +47,6 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
 }
 
 /// Settings refuse undeclared keys, zero limits, and invalid values with canonical explanations.
-
 #[test]
 fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
     let refused = |s: &'static str| {
@@ -78,7 +77,6 @@ fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_
 }
 
 /// `locate` lowercases DNS and IPv6 names as the 1.5.5 URL parser did.
-
 #[test]
 fn locate_offers_a_dns_name_lower_cased() {
     let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
@@ -101,7 +99,6 @@ fn a_settings_blob_that_is_not_an_object_is_refused() {
 }
 
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
-
 #[test]
 fn the_declared_defaults_are_the_hosts() {
     use busbar_contract::transport::registry::{
@@ -142,7 +139,6 @@ fn a_status_code_maps_to_its_class() {
 }
 
 /// Response status codes retain their 1.5.5 breaker fault classifications.
-
 #[test]
 fn a_status_code_maps_to_the_breakers_fault_reading() {
     let expect: &[(u16, u8)] = &[
@@ -176,7 +172,6 @@ fn a_status_code_maps_to_the_breakers_fault_reading() {
 }
 
 /// Every claim that classes its answers reads them for the breaker too, with the same table, and
-
 #[test]
 fn every_classed_claim_has_the_fault_table() {
     use busbar_contract::abi::transport::check::{
@@ -197,7 +192,6 @@ fn every_classed_claim_has_the_fault_table() {
 }
 
 /// `locate` offers the same ALPN protocols as the 1.5.5 reqwest 0.12 client.
-
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     let keys = |s: &'static str| {
@@ -274,7 +268,6 @@ fn locate_offers_the_address_an_ipv4_spelling_names() {
 }
 
 /// The field block preserves hyper's 1.5.5 order and duplicates while dropping hop-by-hop fields.
-
 #[test]
 fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
     let mut h = http::HeaderMap::new();
@@ -304,7 +297,6 @@ fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
 }
 
 /// A field block is cut only at a line's start or inside a value, never inside a name: the host
-
 #[test]
 fn a_field_block_is_cut_only_where_a_continuation_extends_a_value() {
     let block = b"date: Mon\r\nx-a: 1\r\n";
@@ -319,7 +311,6 @@ fn a_field_block_is_cut_only_where_a_continuation_extends_a_value() {
 }
 
 /// The request target uses the same percent encoding as the 1.5.5 client.
-
 #[test]
 fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
     let enc = |t: &str| String::from_utf8(dest_head::encode_target(t.as_bytes()).unwrap()).unwrap();
@@ -338,7 +329,6 @@ fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
 }
 
 /// Target encoding matches the URL parser used by the 1.5.5 client.
-
 #[test]
 fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
     let table = [
@@ -387,7 +377,6 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
 }
 
 /// The entry claims `http`, `https`, and `sse`.
-
 #[test]
 fn the_entry_claims_http_https_and_sse() {
     let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
@@ -408,7 +397,6 @@ fn the_entry_claims_http_https_and_sse() {
 }
 
 /// The tail states exactly the ops this door serves: dialling, the accepted side (`begin` on
-
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
@@ -424,7 +412,6 @@ fn the_tail_states_the_ops_the_door_serves() {
 }
 
 /// Every declared inbound selector form is supported by guest-list routing.
-
 #[test]
 fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
     use busbar_contract::abi::transport::route::{
@@ -456,7 +443,6 @@ fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
 }
 
 /// An `sse` target locates like its `http` equivalent.
-
 #[test]
 fn an_sse_target_locates_as_its_http_twin() {
     for (sse, http) in [

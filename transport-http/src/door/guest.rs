@@ -46,7 +46,6 @@ impl Line {
     }
 
     /// The line the host lent, copied out; `None` when its route's path or a predicate name is not
-
     #[must_use]
     pub fn of(l: Lent<'_, LineEntry>) -> Option<Self> {
         let e = *l.get();
@@ -69,7 +68,6 @@ impl Line {
     }
 
     /// A `none` line taking every method on every path (a path holds `/`), for the accepted side's
-
     #[cfg(test)]
     #[must_use]
     pub fn any(line: u32) -> Self {
@@ -88,7 +86,6 @@ impl Line {
     }
 
     /// [`Line::any`] whose auth needs `points`, holding a body to `body_limit` at the body point,
-
     #[cfg(test)]
     #[must_use]
     pub fn any_needing(line: u32, points: u32, body_limit: u64) -> Self {
@@ -100,7 +97,6 @@ impl Line {
     }
 
     /// Whether the line the host lent is this one, read in place (nothing copied but the route
-
     #[must_use]
     pub fn same(&self, l: Lent<'_, LineEntry>) -> bool {
         let e = *l.get();
@@ -123,7 +119,6 @@ impl Line {
     }
 
     /// The line's route in the contract's vocabulary; its predicate list built only where it has
-
     fn view(&self) -> RouteView<'_> {
         RouteView {
             methods: self.methods,
@@ -161,7 +156,6 @@ pub struct Lists(Mutex<Vec<Arc<[Line]>>>);
 
 impl Lists {
     /// The list `same` recognises, else the one `copy` makes (kept for the next `begin`); `None`
-
     pub fn shared(
         &self,
         same: impl Fn(&[Line]) -> bool,
@@ -220,7 +214,6 @@ pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])
 }
 
 /// `query` without every key `names` lists as a query key ([`Place::Query`]); the pairs kept, in
-
 #[must_use]
 pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> {
     let kept: Vec<&str> = query
@@ -237,7 +230,6 @@ pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> 
 }
 
 /// Decode query components with the same percent and plus handling as 1.5.5's `pct_decode`.
-
 fn decoded(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -265,7 +257,6 @@ fn decoded(s: &str) -> Vec<u8> {
 }
 
 /// Whether field line `name` is one `names` lists as a field line ([`Place::Field`]), compared
-
 #[must_use]
 pub fn strips_field(name: &str, names: &[(String, Place)]) -> bool {
     names

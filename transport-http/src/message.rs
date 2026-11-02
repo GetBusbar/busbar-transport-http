@@ -6,14 +6,12 @@
 use crate::raw;
 
 /// Read the upstream's `Retry-After` off a response head and resolve it to whole seconds.
-
 pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
     parse_retry_after(raw, now_secs)
 }
 
 /// Parse an RFC 9110 `Retry-After` header VALUE against `now` (a Unix timestamp in seconds). Both
-
 pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
     let s = value.trim();
 
@@ -26,7 +24,6 @@ pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
 }
 
 /// Where an egress request actually goes: the dialled scheme and authority, carrying the target
-
 pub(crate) fn request_target(
     dial: &http::Uri,
     path: Option<&str>,
@@ -56,7 +53,6 @@ pub(crate) struct Whole {
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
-
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
@@ -167,7 +163,6 @@ pub(crate) struct EgressHead {
 }
 
 /// The offset just past the blank line that ends a header block, searching from `start`.
-
 fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start.min(buf.len());
     loop {

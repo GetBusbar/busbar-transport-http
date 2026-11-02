@@ -60,7 +60,6 @@ enum Sender {
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// One exchange's stage. Every stage after `Writing` carries the attempt's ONE deadline sleep, so
-
 enum Stage {
     /// The request message, still arriving, and the attempt's deadline (host ns).
     Writing(Zeroizing<Vec<u8>>, EgressHead, u64, SensitiveFields),
@@ -80,11 +79,9 @@ enum Stage {
 }
 
 /// The most a request's head (its request line and fields) may add to its body in one emitted
-
 pub(crate) const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
 
 /// How far an HTTP/2 stream's body may run ahead of the host: once this many queued bytes stand
-
 pub(crate) const BODY_HOLD: u64 = 32 * 1024;
 
 /// The pieces waiting for the host, and how many piece bytes were ever queued: the difference with
@@ -182,7 +179,6 @@ pub struct Framing {
 
 impl Framing {
     /// Open a dialled framing over `dial`, speaking `proto`, at host time `now_ns`.
-
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let dial = canonical_host(
             dial.parse()
@@ -253,7 +249,6 @@ impl Framing {
     }
 
     /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`; `end` is the
-
     pub fn emit(
         &mut self,
         stream: u64,
@@ -435,7 +430,6 @@ impl Framing {
     }
 
     /// Drive the connection at host time (`now_ns` monotonic, `now_unix_ns` wall) until nothing
-
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
@@ -472,7 +466,6 @@ impl Framing {
     }
 
     /// With output pending, state the recorded failure on every stream not already finished nor
-
     fn fail_streams(&mut self) {
         if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
             return;
@@ -489,7 +482,6 @@ impl Framing {
     }
 
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
-
     fn step(&mut self, cx: &mut Context<'_>, taken: Option<u64>) -> Result<(), Failure> {
         if let Some(h) = self.handshake.as_mut() {
             if let Poll::Ready(r) = h.as_mut().poll(cx) {
@@ -538,7 +530,6 @@ impl Owed for Framing {
         &mut self.out.pieces
     }
     /// The earliest sleep still waiting, or NOW where a body was held back for the host: once the
-
     fn next_deadline(&self) -> Option<u64> {
         let at = self.io.next_deadline();
         if !self.held {
@@ -553,7 +544,6 @@ impl Owed for Framing {
 }
 
 /// THE ONE WIPE-ON-GROW RULE for a buffer of this door's own that may hold credential bytes (the
-
 pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     let need = buf.len().saturating_add(bytes.len());
     if need > buf.capacity() {
@@ -577,7 +567,6 @@ pub(crate) fn held_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
 }
 
 /// Normalize the dial authority as the 1.5.5 client's URL parser did.
-
 fn canonical_host(dial: http::Uri) -> http::Uri {
     let dial = super::as_http(dial);
     let Some(host) = dial.host() else {
@@ -612,7 +601,6 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
 }
 
 /// THE FRAMER'S OWN HEAD LINES for a request to `target`: the client defaults the http transport
-
 pub(crate) fn client_defaults(target: &http::Uri) -> String {
     let mut lines = String::from("accept: */*\r\n");
 
@@ -633,7 +621,6 @@ pub(crate) fn client_defaults(target: &http::Uri) -> String {
 }
 
 /// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
-
 fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
     if proto == Proto::H2 {
         req.headers_mut().remove(http::header::HOST);
@@ -666,7 +653,6 @@ fn timed_out() -> (Failure, bool) {
 }
 
 /// Move one stream as far as it goes this round: `Ok(true)` = its body was held back for the
-
 fn advance(
     id: u64,
     stage: &mut Stage,
@@ -757,7 +743,6 @@ fn advance(
 }
 
 /// The response head as the frame the layer above reads: ONE field block
-
 fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> Piece {
     let bodiless = r.body().is_end_stream();
     Piece {
@@ -770,7 +755,6 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 }
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
-
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
     if headers.contains_key(http::header::TRANSFER_ENCODING) {
         return None;
@@ -792,7 +776,6 @@ fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
 }
 
 /// An HTTP/1 answer's reason phrase exactly as sent: hyper keeps a phrase that differs from the
-
 fn reason_phrase(r: &http::Response<Incoming>) -> Option<Bytes> {
     if r.version() >= http::Version::HTTP_2 {
         return None;

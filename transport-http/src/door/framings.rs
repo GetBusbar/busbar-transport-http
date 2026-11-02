@@ -14,7 +14,6 @@ const BASE: usize = 64;
 const SEGMENTS: usize = 16;
 
 /// One framing the instance holds: a dialled connection's client, or an accepted connection's
-
 pub(super) enum Held {
     /// A dialled connection (`SIDE_DIAL`).
     Dial(Framing),
@@ -140,7 +139,6 @@ impl Framings {
     }
 
     /// The framing `token` names, held for one op.
-
     pub(super) fn reach(&self, token: u64) -> Result<MutexGuard<'_, SlotState>, Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);
@@ -163,7 +161,6 @@ impl Framings {
     }
 
     /// Visit every framing no op holds right now, `f` on each. Never waits (the op holding a
-
     pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) -> bool {
         let mut skipped = false;
         for segment in self.segments.iter().filter_map(OnceLock::get) {
@@ -184,7 +181,6 @@ impl Framings {
     }
 
     /// Drop the framing `token` names and give its slot back. The one op that WAITS for its slot:
-
     pub(super) fn remove(&self, token: u64) -> Result<(), Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);

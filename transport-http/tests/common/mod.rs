@@ -7,7 +7,6 @@
 pub type H2Frame = (u8, u8, u32, Vec<u8>);
 
 /// The connection preface and every frame of `b`, the WHOLE wire: bytes past the last whole frame
-
 pub fn h2_frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
     let mut out = Vec::new();
     let mut i = 24.min(b.len());
@@ -31,7 +30,6 @@ pub fn h2_frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
 }
 
 /// Whether `b` (a client's bytes) holds a whole request: on HTTP/2 a frame on a stream that ends
-
 #[allow(dead_code)]
 pub fn request_whole(b: &[u8], h2: bool) -> bool {
     if h2 {

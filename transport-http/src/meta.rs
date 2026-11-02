@@ -14,11 +14,9 @@ pub const KEY: &str = "http";
 pub(crate) const SSE_KEY: &str = "sse";
 
 /// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
-
 pub(crate) const SECURE_KEY: &str = "https";
 
 /// The layers this framer is built over: none. The carrier is the connector's choice from the
-
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
 /// Whether this transport carries sessions: no (each claim row states `session` 0).

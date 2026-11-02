@@ -35,7 +35,6 @@ fn every_index_has_one_place() {
 }
 
 /// A framing another op holds is answered at once (`Busy`), never waited for; once it is let go
-
 #[test]
 fn a_held_framing_answers_busy_at_once() {
     let table = Framings::default();
@@ -73,7 +72,6 @@ fn a_token_that_outlived_its_framing_reaches_nothing() {
 }
 
 /// Removing a framing waits for the operation holding its slot and then releases it.
-
 #[test]
 fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
     let table = Framings::default();
@@ -99,7 +97,6 @@ fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
 }
 
 /// Removing a poisoned slot still releases it.
-
 #[test]
 fn a_poisoned_slot_is_still_freed_by_its_removal() {
     let table = Framings::default();
@@ -119,7 +116,6 @@ fn a_poisoned_slot_is_still_freed_by_its_removal() {
 }
 
 /// Accelerate only the private table's generation to its final representable value. This does
-
 #[test]
 fn an_exhausted_slot_never_mints_a_generation_zero_alias() {
     let table = Framings::default();

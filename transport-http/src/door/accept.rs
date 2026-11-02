@@ -33,16 +33,12 @@ use super::hyper_io::{HeadWords, HostIo, HostTimer, Owed, Piece};
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The accepted-side idle timeout uses the host's clock and matches the 1.5.5 data listener.
-
 pub const IDLE_TIMEOUT: Duration = HEADER_READ_TIMEOUT;
 /// An idle connection is first asked to close gracefully (HTTP/2: GOAWAY); one that has not closed
-
 pub const CLOSE_GRACE: Duration = Duration::from_secs(10);
 /// A request body the framing reads (carried up, or held for a `HeadBody` auth) that delivers
-
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// After this grace, a request body below [`MIN_BODY_BYTES_PER_SEC`] fails, matching 1.5.5.
-
 pub const BODY_THROUGHPUT_GRACE: Duration = Duration::from_secs(10);
 /// The throughput floor a request body keeps past its grace.
 pub const MIN_BODY_BYTES_PER_SEC: u64 = 1024;
@@ -64,7 +60,6 @@ type ConnResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 /// hyper's served connection, which can be asked to close gracefully.
 trait Served: Future<Output = ConnResult> + Send + Unpin {
     /// Start a graceful close (hyper-util's `graceful_shutdown`: before the protocol is read, it
-
     fn shut(&mut self);
 }
 
@@ -170,11 +165,9 @@ struct ReplyQ {
 }
 
 /// An answer body fed by the host's emits. Its size is never stated here: a head that states
-
 struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
 
 /// hyper lets an answer's body go when it is whole, and when the far side gives its stream up
-
 impl Drop for Reply {
     fn drop(&mut self) {
         self.0.lock().unwrap_or_else(PoisonError::into_inner).gone = true;
@@ -311,18 +304,14 @@ struct Shared {
 }
 
 /// What an inbound `auth.call` answers the accepted side: the flow (`FLOW_*`), the request's unit,
-
 pub type AuthCalled = (u32, UnitRef, Vec<(String, Place)>);
 
 /// THE HOST AUTH HANDLE as the accepted side calls it (`abi::host::service`, `op::AUTH_CALL`,
-
 pub trait Kernel {
     /// The ticket of the op the calls are made on; a call that pends is parked on it.
-
     fn ticket(&self) -> Ticket;
 
     /// Select a stream's immutable host policy before matching or reading its body.
-
     fn open_policy(
         &mut self,
         _loans: &mut Loans,
@@ -344,7 +333,6 @@ pub trait Kernel {
         body: Option<&[u8]>,
     ) -> Pend<AuthCalled>;
     /// `unit.hand_in`: the flow and the request's unit.
-
     #[allow(clippy::too_many_arguments)]
     fn hand_in(
         &mut self,
@@ -356,7 +344,6 @@ pub trait Kernel {
         request: &HeadViewArgs<'_>,
     ) -> Result<(u32, UnitRef), ServiceError>;
     /// `unit.refuse`: the kernel's refusal, copied.
-
     #[allow(clippy::too_many_arguments)]
     fn refuse(
         &mut self,
@@ -542,7 +529,6 @@ impl Accepted {
     }
 
     /// The largest request body (`limits.request_body_max_bytes`): a body read at the throughput
-
     #[must_use]
     pub fn with_body_max(mut self, max: usize) -> Self {
         let secs = (max as u64) / MIN_BODY_BYTES_PER_SEC;
@@ -551,7 +537,6 @@ impl Accepted {
     }
 
     /// The idle bound, at the start of a drive at host time `now`: a graceful close once the idle
-
     fn close_when_idle(&mut self, now: u64) {
         if self.closing.as_ref().is_some_and(|(at, _)| *at <= now) {
             self.closing = None;
@@ -573,7 +558,6 @@ impl Accepted {
     }
 
     /// The idle bound, at the end of a drive at host time `now`: its period starts (once) when no
-
     fn arm_idle(&mut self, now: u64) {
         if self.conn.is_none() {
             self.idle = None;
@@ -611,7 +595,6 @@ impl Accepted {
     }
 
     /// THE PROTOCOL THE SECURE LAYER AGREED (`ConnFacts::agreed_protocol`, the ALPN result), when
-
     #[must_use]
     pub fn with_alpn(mut self, protocol: &[u8]) -> Self {
         self.alpn = offer_position(protocol);
@@ -619,14 +602,12 @@ impl Accepted {
     }
 
     /// THE PROTOCOL AGREED (`FramerYield::agreed`): its 1-based position in the
-
     #[must_use]
     pub fn agreed(&self) -> u32 {
         self.spoken.unwrap_or(self.alpn)
     }
 
     /// Read the connection's first bytes until they show whether they open the HTTP/2 preface,
-
     fn note_lead(&mut self, bytes: &[u8]) {
         if self.spoken.is_some() {
             return;
@@ -662,7 +643,6 @@ impl Accepted {
     }
 
     /// Bound the copy kept for a hand-over as sent (a bound on live work is a refusal at
-
     fn bound_raw(&mut self) {
         if std::mem::take(
             &mut self
@@ -679,7 +659,6 @@ impl Accepted {
     }
 
     /// THE SCHEME the auth handle is shown for this connection's requests (`HeadView::scheme`,
-
     #[must_use]
     pub const fn with_scheme(mut self, scheme: u8) -> Self {
         self.scheme = scheme;
@@ -697,7 +676,6 @@ impl Accepted {
     }
 
     /// CANCEL of the op on `ticket`: every `auth.call` parked on it is let go (a later op calls
-
     pub fn cancel(&mut self, ticket: Ticket) -> bool {
         let mut any = self.policy_input.remove(&ticket);
         self.policy_peer_parked.retain(|(_, owner, _, _)| {
@@ -759,7 +737,6 @@ impl Accepted {
     }
 
     /// THE HOST'S REFUSAL (`refuse`, the transport ABI's `RefuseIn`):
-
     pub fn refuse(
         &mut self,
         stream: Option<u64>,
@@ -851,7 +828,6 @@ impl Accepted {
     }
 
     /// Whether `stream`'s answer queue is at its high-water mark (its emits held until a
-
     #[must_use]
     pub fn stream_full(&self, stream: u64) -> bool {
         self.shared
@@ -875,7 +851,6 @@ impl Accepted {
     }
 
     /// Bytes for `stream`'s answer: its head (a field block, with `status`) on the first emit,
-
     pub fn emit(
         &mut self,
         stream: u64,
@@ -983,7 +958,6 @@ impl Accepted {
     }
 
     /// Accept one whole terminal field block. Validation precedes mutation, so a malformed or
-
     pub fn emit_trailers(&mut self, stream: u64, bytes: &[u8]) -> Result<bool, Failure> {
         let mut trailers = http::HeaderMap::new();
         let mut read = 0;
@@ -1063,7 +1037,6 @@ impl Accepted {
     }
 
     /// Undelivered carrier input plus pieces still waiting for the host's sink. Call after
-
     pub fn retained_input(&self) -> usize {
         let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
         self.out
@@ -1204,7 +1177,6 @@ impl Accepted {
     }
 
     /// DETACH the connection for the upgrade framer to adopt, two ways:
-
     pub fn detach(&mut self) -> Result<Option<&mut VecDeque<u8>>, Failure> {
         if self
             .raw
@@ -1322,7 +1294,6 @@ impl Owed for Accepted {
 }
 
 /// One request, as hyper hands it to the service: it waits for [`Accepted::admit`] (its head goes up
-
 fn serve(
     sh: Arc<Mutex<Shared>>,
     mut req: http::Request<Incoming>,
@@ -1392,7 +1363,6 @@ fn serve(
 }
 
 /// Carry every ADMITTED request body up as far as it has arrived: data pieces, then the empty
-
 fn carry_bodies(sh: &mut Shared, lines: &[Line], bounds: &Bounds<'_>, cx: &mut Context<'_>) {
     let Shared { out, streams, .. } = sh;
     for (id, a) in streams.iter_mut() {
@@ -1446,7 +1416,6 @@ fn carry_bodies(sh: &mut Shared, lines: &[Line], bounds: &Bounds<'_>, cx: &mut C
 }
 
 /// Hold a `HeadBody` request's body as it arrives, up to `limit` bytes (the size gate's limit; over
-
 fn hold_body(a: &mut Answer, limit: u64, bounds: &Bounds<'_>, cx: &mut Context<'_>) {
     while let Some(body) = a.body.as_mut() {
         match Pin::new(&mut *body).poll_frame(cx) {
@@ -1491,7 +1460,6 @@ fn hold_body(a: &mut Answer, limit: u64, bounds: &Bounds<'_>, cx: &mut Context<'
 }
 
 /// The request as the auth handle reads it (`HeadView`): the method, the target's path, the
-
 fn head_view<'a>(
     parts: &'a http::request::Parts,
     fields: &'a [(&'a str, &'a [u8])],
@@ -1527,7 +1495,6 @@ fn field_lines(parts: &http::request::Parts) -> Vec<(&str, &[u8])> {
 }
 
 /// Strip from `parts` what the auth named: every field line it
-
 fn strip(parts: &mut http::request::Parts, names: &[(String, Place)]) -> Result<(), Failure> {
     let gone: Vec<http::HeaderName> = parts
         .headers
@@ -1556,7 +1523,6 @@ fn strip(parts: &mut http::request::Parts, names: &[(String, Place)]) -> Result<
 }
 
 /// Frame the kernel's refusal on `a`'s stream, verbatim: its status, its fields in order, its body
-
 fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
     let Some(respond) = a.respond.take() else {
         return false;
@@ -1587,7 +1553,6 @@ fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
 
 impl Accepted {
     /// Check the initial peer policy once, before any stream's admission. A pending peer call
-
     pub fn admit_peer(&mut self, k: &mut dyn Kernel) -> Admitted {
         let mut did = Admitted::default();
         if self.ended && self.conn.is_none() {
@@ -1974,7 +1939,6 @@ impl Accepted {
     }
 
     /// Ask the kernel for request `id`'s refusal (`cause`, `line`) and frame it verbatim; nothing
-
     fn kernel_refuse(
         &mut self,
         id: u64,
@@ -2011,7 +1975,6 @@ impl Accepted {
 }
 
 /// THE REQUEST BODY AN ANSWER ENDED BEFORE: once the host's answer on `a`'s stream is
-
 fn let_unread_body_go(a: &mut Answer) {
     if a.asked {
         return;
@@ -2023,7 +1986,6 @@ fn let_unread_body_go(a: &mut Answer) {
 }
 
 /// `protocol`'s 1-based position in the door's accepting offer (`super::ACCEPT_OFFER`, the
-
 fn offer_position(protocol: &[u8]) -> u32 {
     let offer = super::ACCEPT_OFFER;
     let (mut at, mut position) = (0usize, 0u32);
@@ -2042,14 +2004,12 @@ fn offer_position(protocol: &[u8]) -> u32 {
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
-
 fn let_held_go(held: &mut Vec<u8>) {
     held.zeroize();
     *held = Vec::new();
 }
 
 /// Whether request `a` is over on both sides and its record can go (retention bounds only settled
-
 fn finished(a: &Answer) -> bool {
     let request_done = match a.gate {
         Gate::Refused | Gate::Failed => true,
@@ -2065,7 +2025,6 @@ fn finished(a: &Answer) -> bool {
 }
 
 /// Whether the far side gave request `a`'s stream up while something was still owed on it: the
-
 fn given_up(a: &Answer) -> bool {
     let before_head = a
         .respond
@@ -2079,7 +2038,6 @@ fn given_up(a: &Answer) -> bool {
 }
 
 /// A stream's failure `words`, followed by why hyper ended the connection, where it ended in an
-
 fn with_cause(words: &str, cause: Option<&str>) -> String {
     match cause {
         Some(cause) => format!("{words}: {cause}"),
@@ -2088,7 +2046,6 @@ fn with_cause(words: &str, cause: Option<&str>) -> String {
 }
 
 /// Leave request `a` unanswered: its answer's sender dropped, hyper ends the stream (HTTP/2) or
-
 fn fail(a: &mut Answer, did: &mut Admitted) {
     a.respond = None;
     a.parts = None;
@@ -2099,7 +2056,6 @@ fn fail(a: &mut Answer, did: &mut Admitted) {
 }
 
 /// Request `id` is admitted: its stripped head goes up, then any body held for its auth (whole),
-
 fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
     let Some(parts) = a.parts.take() else {
         return;
@@ -2124,7 +2080,6 @@ fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
 }
 
 /// The accepted request keeps every decoded field left after the auth's declared stripping.
-
 fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
     let target = parts
         .uri

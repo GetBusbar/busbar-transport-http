@@ -49,7 +49,6 @@ fn retry_after_parses_both_normative_forms() {
 }
 
 /// RFC 9110 5.6.7: a recipient MUST accept all three HTTP-date forms, and a date with an
-
 #[test]
 fn retry_after_reads_every_http_date_form() {
     let now = 784_111_777 - 120;
@@ -71,7 +70,6 @@ fn retry_after_reads_every_http_date_form() {
 }
 
 /// The egress header block is parsed once per message, not once per `write` call.
-
 #[test]
 fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".to_vec();
@@ -98,7 +96,6 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
 }
 
 /// The egress chunked body is decoded once, not once per `write` call.
-
 #[test]
 fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
@@ -147,7 +144,6 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
 }
 
 /// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
-
 #[test]
 fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let smuggled = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
@@ -176,7 +172,6 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
 }
 
 /// Every request line names its version. Without the check any two words followed by a space parse
-
 #[test]
 fn a_start_line_with_no_http_version_is_not_a_message() {
     assert!(
@@ -200,7 +195,6 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
 }
 
 /// The envelope's bytes are an HTTP message, because that is what this wire is.
-
 #[test]
 fn the_envelope_encodes_as_an_http_message() {
     let bytes = crate::transport::render_envelope(
@@ -236,7 +230,6 @@ fn the_envelope_encodes_as_an_http_message() {
 }
 
 /// An envelope naming NO path is not one that named `/`: it renders an empty target word and reads
-
 #[test]
 fn no_target_named_and_a_stated_root_stay_distinct() {
     let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
@@ -253,7 +246,6 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
 }
 
 /// A CR or an LF in a field is not data on this wire: it ENDS the line. A caller that can put one
-
 #[test]
 fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     let poisoned: &[(&str, &[u8])] = &[
@@ -287,7 +279,6 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
 }
 
 /// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
-
 #[test]
 fn a_field_name_that_is_not_a_token_is_refused() {
     for name in [
@@ -321,7 +312,6 @@ fn a_field_name_that_is_not_a_token_is_refused() {
 }
 
 /// `encode` refuses a method that is not an RFC 9110 token, and a target carrying a space, as
-
 #[test]
 fn encode_refuses_a_request_line_its_emit_could_not_read() {
     let refused = |method: &[u8], path: &[u8]| {
@@ -339,7 +329,6 @@ fn encode_refuses_a_request_line_its_emit_could_not_read() {
 }
 
 /// A chunked request body is held to the configured body cap.
-
 #[test]
 fn a_chunked_request_body_is_held_to_the_body_cap() {
     let whole =
@@ -365,7 +354,6 @@ fn a_chunked_request_body_is_held_to_the_body_cap() {
 }
 
 /// Bytes emitted past the end of a request message are refused.
-
 #[test]
 fn bytes_past_the_end_of_a_request_message_are_refused() {
     let past_length = b"POST / HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcX";
@@ -398,7 +386,6 @@ fn bytes_past_the_end_of_a_request_message_are_refused() {
 }
 
 /// Egress header searches resume where the preceding emit stopped.
-
 #[test]
 fn the_egress_header_search_resumes_where_it_stopped() {
     let mut head = b"POST / HTTP/1.1\r\nHost: x\r\nX-Long: ".to_vec();
@@ -420,7 +407,6 @@ fn the_egress_header_search_resumes_where_it_stopped() {
 }
 
 /// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a list
-
 #[test]
 fn a_content_length_that_names_no_single_length_is_refused() {
     for head in [
@@ -441,7 +427,6 @@ fn a_content_length_that_names_no_single_length_is_refused() {
 }
 
 /// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame; the
-
 #[test]
 fn a_transfer_encoding_other_than_chunked_is_refused() {
     for te in ["gzip", "chunked, gzip", "gzip, chunked"] {
@@ -455,7 +440,6 @@ fn a_transfer_encoding_other_than_chunked_is_refused() {
 }
 
 /// Encoding refuses the same invalid messages as emit.
-
 #[test]
 fn encode_refuses_what_emit_would_refuse() {
     let refused = |fields: &[(&str, &[u8])], body: &[u8], what: &str| {
@@ -498,7 +482,6 @@ fn encode_refuses_what_emit_would_refuse() {
 }
 
 /// The `linked` entry's `SESSION` is what every claim row the door states says (sibling alignment
-
 #[test]
 fn linked_session_is_every_claim_rows_session() {
     let session = crate::linked::SESSION;

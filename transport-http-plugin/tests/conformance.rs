@@ -33,7 +33,6 @@ fn s(text: &str) -> AbiStr {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -80,7 +79,6 @@ fn open(p: &Plugin<Transport>) {
 }
 
 /// One scripted exchange through the dispatcher: begin a dialled http/1.1 connection, encode one
-
 fn script(p: &Plugin<Transport>) -> Vec<u8> {
     let mut wire = vec![0_u8; 8192];
     let mut frame = vec![0_u8; 8192];

@@ -6,7 +6,6 @@
 use busbar_contract::SelectorForm;
 
 /// The forms an INGRESS claim over this wire may take.
-
 pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
     SelectorForm::ExactPath,
     SelectorForm::PrefixOneLevel,
@@ -18,5 +17,4 @@ pub(crate) const SELECTOR_FORMS: &[SelectorForm] = &[
 ];
 
 /// The forms an INGRESS claim on the `sse` scheme may take: none. The request that opens an event
-
 pub(crate) const SSE_SELECTOR_FORMS: &[SelectorForm] = &[];
