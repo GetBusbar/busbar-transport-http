@@ -187,7 +187,10 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     let d = Dispatcher::new(DispatchConfig::default());
     let want = (KindCode::Transport, KindCode::Hook);
     match load_linked::<Hook>(&row(), bind(&d)) {
-        Err(LoadError::WrongKind { door, want: asked }) => assert_eq!((door, asked), want),
+        Err(LoadError::ManifestKind {
+            stated,
+            want: asked,
+        }) => assert_eq!((stated, asked), want),
         other => panic!("the linked door loaded as a hook: {:?}", other.err()),
     }
     match load_dropped::<Hook>(&cdylib(), &row().statement, bind(&d)) {

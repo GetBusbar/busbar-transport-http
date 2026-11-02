@@ -246,8 +246,8 @@ fn wrong_kind<K: Kind>(want: KindCode) {
     let d = Dispatcher::new(Default::default());
     assert_eq!(
         load_linked::<K>(&row(), bind(&d)).err(),
-        Some(LoadError::WrongKind {
-            door: KindCode::Transport,
+        Some(LoadError::ManifestKind {
+            stated: KindCode::Transport,
             want
         })
     );
