@@ -46,7 +46,7 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
     );
 }
 
-/// RED: an undeclared key was read past, a zero limit was taken (a zero body cap refuses every
+/// Settings refuse undeclared keys, zero limits, and invalid values with canonical explanations.
 
 #[test]
 fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
@@ -77,7 +77,7 @@ fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_
     );
 }
 
-/// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
+/// `locate` lowercases DNS and IPv6 names as the 1.5.5 URL parser did.
 
 #[test]
 fn locate_offers_a_dns_name_lower_cased() {
@@ -141,7 +141,7 @@ fn a_status_code_maps_to_its_class() {
     }
 }
 
-/// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
+/// Response status codes retain their 1.5.5 breaker fault classifications.
 
 #[test]
 fn a_status_code_maps_to_the_breakers_fault_reading() {
@@ -196,7 +196,7 @@ fn every_classed_claim_has_the_fault_table() {
     }
 }
 
-/// `locate`'s protocol offer is 1.5.5's client's ALPN offer (reqwest 0.12 by its version
+/// `locate` offers the same ALPN protocols as the 1.5.5 reqwest 0.12 client.
 
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
@@ -273,7 +273,7 @@ fn locate_offers_the_address_an_ipv4_spelling_names() {
     assert!(located(b"ftp://127.1/").is_err());
 }
 
-/// RED: the head is the field block — lower-case names, hyper's (1.5.5's) order with a repeated
+/// The field block preserves hyper's 1.5.5 order and duplicates while dropping hop-by-hop fields.
 
 #[test]
 fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
@@ -318,7 +318,7 @@ fn a_field_block_is_cut_only_where_a_continuation_extends_a_value() {
     assert_eq!(field_cut(b"on\r\nx: 1\r\n", 5, true), 4);
 }
 
-/// RED: the request target goes out as 1.5.5's client wrote it. A space is `%20`, an existing
+/// The request target uses the same percent encoding as the 1.5.5 client.
 
 #[test]
 fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
@@ -337,7 +337,7 @@ fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
     }
 }
 
-/// The encoder IS the URL parser 1.5.5's client serialised a path with: the same bytes for every
+/// Target encoding matches the URL parser used by the 1.5.5 client.
 
 #[test]
 fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
@@ -386,7 +386,7 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
     }
 }
 
-/// THE ENTRY CLAIMS `http`, `https` AND `sse` (THE DESIGN §5: "http claims `http`, `https` and
+/// The entry claims `http`, `https`, and `sse`.
 
 #[test]
 fn the_entry_claims_http_https_and_sse() {
@@ -423,7 +423,7 @@ fn the_tail_states_the_ops_the_door_serves() {
     );
 }
 
-/// THE INBOUND CLAIM ROWS ARE WHAT THE ACCEPT SIDE MATCHES (`BUSBAR-1.6.0.md` §6 "Auth points and
+/// Every declared inbound selector form is supported by guest-list routing.
 
 #[test]
 fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
@@ -455,7 +455,7 @@ fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
     assert!(crate::claims::SSE_SELECTOR_FORMS.is_empty());
 }
 
-/// THE `sse` CLAIM IS SERVED, FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584: "http claims
+/// An `sse` target locates like its `http` equivalent.
 
 #[test]
 fn an_sse_target_locates_as_its_http_twin() {

@@ -63,7 +63,7 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
-/// RED: the size is `1*HEXDIG` (RFC 9112 7.1): no sign, no surrounding whitespace.
+/// Chunk sizes follow RFC 9112's `1*HEXDIG` grammar without a sign or surrounding whitespace.
 #[test]
 fn a_signed_or_padded_chunk_size_is_a_framing_error() {
     for line in [
@@ -183,7 +183,7 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
     assert_eq!(decoder.take().as_slice(), b"abc");
 }
 
-/// RED (codeaudit correctness L raw.rs:255): the decoder deleted EVERY CR in a size or trailer
+/// A carriage return that does not terminate a line is malformed.
 
 #[test]
 fn a_cr_that_does_not_end_a_line_is_malformed() {

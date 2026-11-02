@@ -1653,7 +1653,7 @@ fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
     wire
 }
 
-/// The protocol offer the door answers for an ACCEPTING listener: `h2, http/1.1`, the owner's
+/// An accepting listener offers `h2, http/1.1`.
 
 fn accept_offer(ops: &'static Ops) -> Vec<u8> {
     let mut i: OpenIn = z();
@@ -2014,7 +2014,7 @@ extern "C" fn unit_hand_in(ctx: HostCtx, input: *const c_void, out: *mut Service
     ready(out)
 }
 
-/// The kernel's refusal for `cause`: its status and body (1.5.5's no-route and size-gate bodies,
+/// The kernel's refusal status and body, preserving 1.5.5's no-route and size-gate bodies.
 
 fn refusal(cause: u32) -> (u16, &'static str) {
     match cause {
@@ -2525,7 +2525,7 @@ fn refusal_fails(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// A query key the far side percent-encoded is the key it decodes to, as v1.5.5 read every inbound
+/// Query keys are percent-decoded before matching, as in the 1.5.5 inbound query reader.
 
 fn strips_a_decoded_query_key(label: &str, ops: &'static Ops) {
     let h = admitted(
@@ -2678,7 +2678,7 @@ fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// RED (codeaudit concurrency L mod.rs:504): a `cancel` that meets a framing another op holds
+/// Cancellation waits for the operation holding the framing and then releases it.
 
 fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
@@ -2701,7 +2701,7 @@ fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// RED (codeaudit correctness M mod.rs:1153): a request hyper decodes during the host's `refuse`
+/// A request decoded during a host refusal is admitted normally.
 
 fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
     let one = b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello";
@@ -2730,7 +2730,7 @@ fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// RED (codeaudit error-handling M mod.rs:1014, correctness L mod.rs:1014): `detach` took the
+/// A refused detach retains the framing's owed bytes.
 
 fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
     let mut h = admitted(
@@ -2758,7 +2758,7 @@ fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// RED (codeaudit error-handling L mod.rs:940): an `emit` that left its stream's queue at the
+/// A resumed emit reports that its stream queue is full.
 
 fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
@@ -2858,7 +2858,7 @@ fn pipelined_refusals(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// THE ABI'S `refuse` ON AN ACCEPTED STREAM (Q128 reader B finding 2; ruling 22): a stream refused
+/// Refusing an accepted stream before its head keeps other streams usable.
 
 fn refuse_a_stream_before_its_head(label: &str, ops: &'static Ops) {
     let mut h = admitted(
@@ -3011,7 +3011,7 @@ fn parks_on_its_own_ticket(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// THE DOOR OFFERS THE PEER POINT (Q128 reader B r212, coordinator ruling: POINT_PEER is served
+/// The door offers the peer authentication point.
 
 fn offers_the_peer_point(label: &str, door: *const Door) {
     use busbar_contract::abi::auth::AuthPoints;
@@ -3032,7 +3032,7 @@ fn offers_the_peer_point(label: &str, door: *const Door) {
     );
 }
 
-/// THE PEER POINT, once per connection, before any request's head call (THE DESIGN §6 item 7):
+/// The peer point runs once per connection before any request head call.
 
 fn peer_once_per_connection(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
@@ -3130,7 +3130,7 @@ fn h2_requests(requests: &[(u32, &str)]) -> Vec<u8> {
     wire
 }
 
-/// ALPN agreed `h2` (the accept offer's first, Q137): the connection is served as HTTP/2 from its
+/// An accepted connection that negotiated `h2` is served as HTTP/2 from its first byte.
 
 fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_on(
@@ -3158,7 +3158,7 @@ fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// A PENDING `auth.call` PARKS ONLY ITS OWN STREAM (THE DESIGN §6 item 7, l.975-976; Q128 r231
+/// A pending `auth.call` parks only its own stream.
 
 fn a_pending_auth_parks_only_its_stream(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
@@ -3275,7 +3275,7 @@ fn kernel_refusal_keeps_its_fields(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// AN UPGRADE THE LINE HANDS TO ANOTHER FRAMER IS NOT ANSWERED HERE (coordinator ruling, row 192):
+/// An upgrade handed to another framer receives no HTTP answer here.
 
 fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
     let request: &[u8] = b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n";
@@ -3316,7 +3316,7 @@ fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// A `HEAD` request is answered with its head alone, as v1.5.5's server (hyper) answered it: the
+/// A `HEAD` request receives the response head without a body, matching the 1.5.5 hyper server.
 
 fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
@@ -3369,7 +3369,7 @@ fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// THE HEADER READ BOUND (v1.5.5 `hardened_conn_builder`, 30 s on the host's clock): a head the far
+/// Incomplete request heads expire after 30 seconds on the host's clock, matching 1.5.5.
 
 fn header_read_bound(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
@@ -3395,7 +3395,7 @@ fn header_read_bound(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// THE HOST'S OWN REFUSAL ON A STREAM (D3, coordinator ruling, row 192): `RefuseIn` carries bytes
+/// A host-framed stream refusal crosses `RefuseIn` byte for byte.
 
 fn host_framed_refusal_arrives_byte_identical(label: &str, ops: &'static Ops) {
     let mut h = admitted(
@@ -3554,7 +3554,7 @@ fn alpn_names(list: &[u8]) -> Vec<Vec<u8>> {
     names
 }
 
-/// THE ACCEPTED SIDE STATES THE PROTOCOL IT AGREED (`FramerYield::agreed`, busbar #1446): the
+/// The accepted side reports its negotiated protocol through `FramerYield::agreed`.
 
 fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     let offer = alpn_names(&accept_offer(ops));

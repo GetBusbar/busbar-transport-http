@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The accepted side against v1.5.5's data listener: the same request answered the same way must
+//! Accepted HTTP requests are compared with the responses from the 1.5.5 data listener.
 
 use super::*;
 use http_body_util::BodyExt;
@@ -342,7 +342,7 @@ fn answer_whole(wire: &[u8]) -> bool {
     true
 }
 
-/// v1.5.5's data listener answering `request` with `status`, `headers` and `body` (known size when
+/// Render the 1.5.5 data listener's answer to `request`, with a known body size when `sized`.
 
 fn v155(
     request: &[u8],
@@ -724,7 +724,7 @@ fn run_with(a: &mut Accepted, now: u64, k: &mut dyn Kernel) {
     }
 }
 
-/// THE CONNECTION FORGETS EVERY FINISHED REQUEST (Q128 reader B finding 1, HIGH; THE DESIGN §1
+/// Every finished request is removed from the connection's retained state.
 
 #[test]
 fn a_connection_forgets_every_finished_request() {
@@ -923,7 +923,7 @@ fn one_get() -> (Accepted, u64) {
     (a, u.heads[0].0)
 }
 
-/// RED (codeaudit correctness M accept.rs:649, error-handling L accept.rs:649, conformance L
+/// An invalid answer head is refused while retaining the stream for a valid answer.
 
 #[test]
 fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
@@ -952,7 +952,7 @@ fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
     );
 }
 
-/// RED (codeaudit error-handling L accept.rs:659): the answer head's field block was read only up
+/// A malformed field line in an answer head is refused.
 
 #[test]
 fn an_answer_head_with_a_malformed_field_line_is_refused() {
@@ -971,7 +971,7 @@ fn an_answer_head_with_a_malformed_field_line_is_refused() {
     }
 }
 
-/// RED (codeaudit resource M engine.rs:186, its accepted half): hyper's HTTP/2 server spawns each
+/// Dropping an HTTP/2 connection releases its in-flight stream state.
 
 #[test]
 fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
@@ -992,7 +992,7 @@ fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
     );
 }
 
-/// RED (codeaudit correctness/error-handling L accept.rs:853): `detach` took the switched stream's
+/// A detach attempted before the protocol switch completes can be retried.
 
 #[test]
 fn a_detach_before_the_switch_completes_can_be_made_again() {
@@ -1034,7 +1034,7 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
     assert_eq!(rest, b"\x81\x05hello", "the bytes after the request");
 }
 
-/// RED (codeaudit error-handling L accept.rs:720): the accepted connection's own end (hyper's
+/// A connection error reports its cause to the affected streams.
 
 #[test]
 fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
@@ -1055,7 +1055,7 @@ fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
     );
 }
 
-/// RED (codeaudit security accept.rs:362): only HTTP/1's header read was bounded, and only once
+/// A connection sending no request closes on the host's clock.
 
 #[test]
 fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
@@ -1094,7 +1094,7 @@ fn h2_types(wire: &[u8]) -> Vec<u8> {
     out
 }
 
-/// RED: an HTTP/2 connection idle between requests is closed the same way, saying GOAWAY first;
+/// An idle HTTP/2 connection sends GOAWAY before closing; active work prevents idle closure.
 
 #[test]
 fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {

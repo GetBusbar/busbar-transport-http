@@ -710,7 +710,7 @@ fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
     );
 }
 
-/// Over a secured connection that agreed `h2`, the request is 1.5.5's h2c request with ONE byte
+/// Secured HTTP/2 requests use the `https` scheme while preserving the other 1.5.5 request fields.
 
 #[test]
 fn an_h2_request_over_a_secured_connection_says_scheme_https() {
@@ -755,7 +755,7 @@ fn locate_states_the_framers_own_head_lines() {
     );
 }
 
-/// RED (THE DESIGN §6 step 5, ruling (A) 2026-10-19): `locate` asks the host to state the request's
+/// `locate` asks the host to state the request length.
 
 #[test]
 fn locate_asks_the_host_to_state_the_length() {

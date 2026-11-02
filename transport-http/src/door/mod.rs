@@ -521,7 +521,7 @@ impl SafeSlot for Refuse {
 
 pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
-/// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding: the
+/// The 1.5.5 client's ALPN offer in handshake ProtocolNameList encoding.
 
 const OFFER_H2_H1: &[u8] = ACCEPT_OFFER;
 /// The same under the http1-only key.
@@ -529,7 +529,7 @@ const OFFER_H1: &[u8] = b"\x08http/1.1";
 /// The same under the prior-knowledge key: h2 alone.
 const OFFER_H2: &[u8] = b"\x02h2";
 
-/// The protocol offer `locate` answers, 1.5.5's by its keys. 1.5.5's client (reqwest 0.12) offered
+/// Select the same protocol offer as the 1.5.5 reqwest client under these settings.
 
 fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static [u8] {
     match (secure, prior_knowledge, http1_only) {
@@ -588,7 +588,7 @@ fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
-/// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
+/// Normalize the peer name for the handshake and certificate check as the 1.5.5 client did.
 
 fn offered_name(host: &str) -> String {
     if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {

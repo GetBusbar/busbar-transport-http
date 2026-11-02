@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The engine against hand-written far ends: what 1.5.5's client (reqwest 0.12) did with a
+//! Engine behavior against handwritten far ends, compared with the 1.5.5 reqwest 0.12 client.
 
 use super::*;
 
@@ -138,7 +138,7 @@ fn literal(name: &str, value: &str) -> Vec<u8> {
     v
 }
 
-/// 1.5.5 read a response body through reqwest, which yields data frames only: a chunked
+/// Response trailers are excluded from the body, matching the 1.5.5 reqwest data-frame reader.
 
 #[test]
 fn an_h1_trailer_section_is_not_body() {
@@ -237,7 +237,7 @@ fn a_declared_length_is_one_valid_content_length() {
     assert_eq!(head(&["99999999999999999999999"]), None);
 }
 
-/// 1.5.5's `upstream_request_timeout_secs` was reqwest's TOTAL timeout: one clock from the send
+/// The 1.5.5 total timeout runs from send through the end of the response body.
 
 #[test]
 fn a_body_still_arriving_at_the_request_timeout_is_cut_h1() {
@@ -278,7 +278,7 @@ fn a_body_still_arriving_at_the_request_timeout_is_cut_h2() {
     );
 }
 
-/// 1.5.5 put no transport cap on a RESPONSE: a streamed body ran as long as the far end sent it
+/// Streamed responses are not capped by the request-body limit, matching the 1.5.5 client.
 
 #[test]
 fn a_streamed_response_past_the_request_body_cap_passes_through() {
@@ -376,7 +376,7 @@ fn answered(f: &mut Framing) {
     f.pieces().clear();
 }
 
-/// RED (busbar ruling (T), the pooled line's request target): a stated target always wins, `/`
+/// A later request on a pooled connection uses its stated target.
 
 #[test]
 fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialled() {
@@ -429,7 +429,7 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
     }
 }
 
-/// RED: 1.5.5's client lowercased a DNS host, so an h1 request dialled at a mixed-case name
+/// DNS hosts are sent in lowercase, matching the 1.5.5 client.
 
 #[test]
 fn a_dns_host_goes_out_lower_case() {
@@ -466,7 +466,7 @@ fn rendered_and_sent(
     (r, f.take_wire(usize::MAX))
 }
 
-/// RED (THE DESIGN §2 "A port keeps 1.5.5's surface"; `limits.request_body_max_bytes` is a BODY
+/// `limits.request_body_max_bytes` caps the body; a body at the cap still carries its head.
 
 #[test]
 fn a_request_body_at_the_cap_goes_out_with_its_head() {
@@ -484,7 +484,7 @@ fn a_request_body_at_the_cap_goes_out_with_its_head() {
     assert!(r.is_err(), "a body one byte over the cap is refused");
 }
 
-/// RED (THE DESIGN §2 l.393-397; `limits.request_body_max_bytes` is "the largest request body
+/// A chunked request body is held to `limits.request_body_max_bytes`.
 
 #[test]
 fn a_chunked_request_body_is_held_to_the_cap() {
@@ -520,7 +520,7 @@ fn a_chunked_request_body_is_held_to_the_cap() {
     );
 }
 
-/// RED (Q128 transport-http, bytes past the declared length): an emitted message whose bytes run
+/// Bytes beyond the stated request length are refused before transmission.
 
 #[test]
 fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
@@ -559,7 +559,7 @@ fn h2_frame_types(wire: &[u8]) -> Vec<u8> {
     out
 }
 
-/// RED (Q128 transport-http, the refused h2 stream): a stream refused partway through its request
+/// Remaining pieces of a refused HTTP/2 request cannot start a fresh request.
 
 #[test]
 fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
@@ -630,7 +630,7 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     );
 }
 
-/// RED (Q128 transport-http, the refused h1 exchange): on HTTP/1.1, where the connection carries
+/// Refusing an HTTP/1 request drops its exchange and fails the framing.
 
 #[test]
 fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
@@ -649,7 +649,7 @@ fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
     }
 }
 
-/// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
+/// Field values retain their wire bytes, including obs-text, as in hyper's 1.5.5 rendering.
 
 #[test]
 fn an_obs_text_field_value_goes_out_byte_for_byte() {
@@ -671,7 +671,7 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
     );
 }
 
-/// RED (1.5.5 parity, Q128 transport-http LOW): the dial's authority is the one 1.5.5's URL parser
+/// Dial authorities use the same normalization as the 1.5.5 URL parser.
 
 #[test]
 fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
@@ -830,7 +830,7 @@ fn the_head_on_the_wire_is_every_line_the_auth_saw() {
     );
 }
 
-/// RED (audit A1 F3; this method's own contract: a message that cannot be sent fails "the framing
+/// A refused HTTP/1 emit fails the framing and retains no exchange.
 
 #[test]
 fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
@@ -858,7 +858,7 @@ fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
     );
 }
 
-/// RED (audit A1 F4; RFC 9110 §6.5.1: a trailer field is not merged into the header section; THE
+/// Request trailer fields are kept separate from the header section, as RFC 9110 requires.
 
 #[test]
 fn a_request_trailer_never_joins_the_header_section() {
@@ -876,7 +876,7 @@ fn a_request_trailer_never_joins_the_header_section() {
     assert!(lower.ends_with("\r\n\r\nabc"), "{wire:?}");
 }
 
-/// RED (audit A1 F5; THE DESIGN §5 l.722-723: the http door sends "on h1 the host header and
+/// A request target outside origin form is refused rather than rewritten.
 
 #[test]
 fn a_target_not_in_origin_form_is_refused_not_rewritten() {
@@ -916,7 +916,7 @@ fn queued(f: &mut Framing) -> usize {
         .sum()
 }
 
-/// RED (audit A1 F7; THE DESIGN §5 *Proven by*: 2,000 concurrent streams on bounded resources;
+/// HTTP/2 body reads advance only as far as the host has consumed.
 
 #[test]
 fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
@@ -950,7 +950,7 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     assert_eq!(seen, 4 * 16_000, "the whole body arrives");
 }
 
-/// THE `sse` CLAIM IS FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584; Q128 reader B, coordinator
+/// An `sse` dial writes the same wire bytes as its `http` equivalent.
 
 #[test]
 fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
@@ -1031,7 +1031,7 @@ fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
     );
 }
 
-/// RED (codeaudit D1; THE DESIGN: every refusal explained): a refused request message names its
+/// A refused request message names its cause.
 
 #[test]
 fn a_refused_request_message_names_its_cause() {
@@ -1070,7 +1070,7 @@ fn a_refused_request_message_names_its_cause() {
     assert!(!keyed.0.contains("SECRET"), "{keyed:?}");
 }
 
-/// RED: a failure text repeated the target: `Framing::dial` answered `not a target: <dial>` and a
+/// Failure text exposes no byte of the dial target or request path.
 
 #[test]
 fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
@@ -1086,7 +1086,7 @@ fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
     assert!(!path.0.contains("SECRETP"), "{path:?}");
 }
 
-/// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a
+/// A failed first request leaves the dial URI's path available for the next request.
 
 #[test]
 fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
@@ -1121,7 +1121,7 @@ fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
     );
 }
 
-/// RED (codeaudit D3; RFC 9112 6.3: a `Transfer-Encoding` overrides `Content-Length`): an h1
+/// A `Transfer-Encoding` response reports no declared length, as RFC 9112 requires.
 
 #[test]
 fn a_transfer_encoding_answer_states_no_declared_length() {
@@ -1135,7 +1135,7 @@ fn a_transfer_encoding_answer_states_no_declared_length() {
     assert_eq!(declared(&mut f), Some(None), "chunked beats content-length");
 }
 
-/// RED (codeaudit D4): the head allowance bounds the head itself, not only the buffer a body
+/// The head allowance bounds the complete request head.
 
 #[test]
 fn a_request_head_over_its_allowance_is_refused() {
@@ -1173,7 +1173,7 @@ fn asked_with(proto: Proto, method: &str) -> Framing {
     f
 }
 
-/// RED (codeaudit correctness M engine.rs:720): an answer that carries no body (a HEAD answer, a
+/// Responses that carry no body report no declared body length.
 
 #[test]
 fn an_answer_with_no_body_states_no_declared_length() {
@@ -1220,7 +1220,7 @@ fn an_answer_with_no_body_states_no_declared_length() {
     );
 }
 
-/// RED (codeaudit resource M engine.rs:186): hyper's HTTP/2 client task holds a clone of its
+/// Dropping an HTTP/2 framing releases its client connection.
 
 #[test]
 fn a_dropped_h2_framing_frees_its_connection() {
@@ -1233,7 +1233,7 @@ fn a_dropped_h2_framing_frees_its_connection() {
     );
 }
 
-/// RED (codeaudit correctness/error-handling L engine.rs:434): a stream refused partway (its
+/// A connection failure does not report a second failure for an already refused stream.
 
 #[test]
 fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {

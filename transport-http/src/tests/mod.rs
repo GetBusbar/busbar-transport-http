@@ -338,7 +338,7 @@ fn encode_refuses_a_request_line_its_emit_could_not_read() {
     assert!(!refused(b"M-SEARCH", b"/x"), "any token method renders");
 }
 
-/// RED (audit A1 F10; `limits.request_body_max_bytes` is the BODY's cap, held to a `Content-Length`
+/// A chunked request body is held to the configured body cap.
 
 #[test]
 fn a_chunked_request_body_is_held_to_the_body_cap() {
@@ -364,7 +364,7 @@ fn a_chunked_request_body_is_held_to_the_body_cap() {
     );
 }
 
-/// RED (audit A1 F11): bytes an `emit` carries past the end of its message (past the declared
+/// Bytes emitted past the end of a request message are refused.
 
 #[test]
 fn bytes_past_the_end_of_a_request_message_are_refused() {
@@ -397,7 +397,7 @@ fn bytes_past_the_end_of_a_request_message_are_refused() {
         .is_some());
 }
 
-/// RED (audit A1 F12): a head arriving across many `emit` calls is searched for its end once, each
+/// Egress header searches resume where the preceding emit stopped.
 
 #[test]
 fn the_egress_header_search_resumes_where_it_stopped() {
@@ -454,7 +454,7 @@ fn a_transfer_encoding_other_than_chunked_is_refused() {
     }
 }
 
-/// RED (codeaudit correctness L transport.rs:91, conformance NIT transport.rs:95): `encode`
+/// Encoding refuses the same invalid messages as emit.
 
 #[test]
 fn encode_refuses_what_emit_would_refuse() {

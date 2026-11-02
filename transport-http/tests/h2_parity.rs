@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE 1.5.5 BYTE COMPARISON, SECOND OPINION: an HTTP/2 bearer request, as 1.5.5's egress client
+//! HTTP/1 and HTTP/2 bearer requests are compared byte for byte with the 1.5.5 egress client.
 
 mod common;
 
@@ -296,7 +296,7 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
     );
 }
 
-/// The same request under the http1-only key: 1.5.5's HTTP/1.1 bytes (origin-form target, `host`,
+/// The HTTP/1-only setting reproduces the 1.5.5 client's request bytes.
 
 #[test]
 fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
@@ -315,7 +315,7 @@ fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
     );
 }
 
-/// THE ONE LINE ADDED AFTER THE AUTH, PINNED (Q128 transport-http, ruling (D); `meta::TAIL` names
+/// An empty HTTP/2 POST carries `content-length: 0`, matching the 1.5.5 client.
 
 #[test]
 fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
@@ -344,7 +344,7 @@ fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
     println!("PROOF an empty h2 POST carries content-length: 0, byte-identical to 1.5.5's");
 }
 
-/// The same empty POST on HTTP/1.1 (ruling (D)): no length line, as 1.5.5's client sent none, byte
+/// An empty HTTP/1.1 POST carries no length field, matching the 1.5.5 client.
 
 #[test]
 fn an_http1_empty_post_carries_no_length_line_as_1_5_5_sent() {

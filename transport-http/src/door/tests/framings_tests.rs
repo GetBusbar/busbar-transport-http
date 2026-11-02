@@ -72,7 +72,7 @@ fn a_token_that_outlived_its_framing_reaches_nothing() {
     assert_eq!(table.reach(u64::MAX).err(), Some(Reach::Gone));
 }
 
-/// RED (codeaudit concurrency M framings.rs:202): `finish` met a slot another op held (`cancel`'s
+/// Removing a framing waits for the operation holding its slot and then releases it.
 
 #[test]
 fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
@@ -98,7 +98,7 @@ fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
     );
 }
 
-/// RED (codeaudit concurrency/error-handling L framings.rs:173): an op that panicked holding a
+/// Removing a poisoned slot still releases it.
 
 #[test]
 fn a_poisoned_slot_is_still_freed_by_its_removal() {

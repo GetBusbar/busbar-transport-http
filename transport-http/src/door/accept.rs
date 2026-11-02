@@ -32,7 +32,7 @@ use super::hyper_io::{HeadWords, HostIo, HostTimer, Owed, Piece};
 /// v1.5.5's HTTP/1 header-read bound (`hardened_conn_builder`).
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// THE ACCEPTED SIDE'S TIME BOUNDS, on the host's clock: the bounds v1.5.5's data listener (busbar
+/// The accepted-side idle timeout uses the host's clock and matches the 1.5.5 data listener.
 
 pub const IDLE_TIMEOUT: Duration = HEADER_READ_TIMEOUT;
 /// An idle connection is first asked to close gracefully (HTTP/2: GOAWAY); one that has not closed
@@ -41,7 +41,7 @@ pub const CLOSE_GRACE: Duration = Duration::from_secs(10);
 /// A request body the framing reads (carried up, or held for a `HeadBody` auth) that delivers
 
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Past this grace, a request body below [`MIN_BODY_BYTES_PER_SEC`] fails (v1.5.5's throughput
+/// After this grace, a request body below [`MIN_BODY_BYTES_PER_SEC`] fails, matching 1.5.5.
 
 pub const BODY_THROUGHPUT_GRACE: Duration = Duration::from_secs(10);
 /// The throughput floor a request body keeps past its grace.

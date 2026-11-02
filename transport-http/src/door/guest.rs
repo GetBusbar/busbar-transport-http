@@ -236,7 +236,7 @@ pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> 
     (!kept.is_empty()).then_some(kept)
 }
 
-/// A query component percent-decoded as v1.5.5's `pct_decode` did (`auth/token.rs`:1012-1035):
+/// Decode query components with the same percent and plus handling as 1.5.5's `pct_decode`.
 
 fn decoded(s: &str) -> Vec<u8> {
     let b = s.as_bytes();

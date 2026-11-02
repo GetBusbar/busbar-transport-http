@@ -80,7 +80,7 @@ fn the_strip_reads_each_place_by_its_own_rule() {
     );
 }
 
-/// A query key is compared as the key it percent-decodes to, as v1.5.5 read every inbound query
+/// Query keys are compared after percent-decoding, matching the 1.5.5 inbound query reader.
 
 #[test]
 fn a_query_key_is_compared_as_it_decodes() {

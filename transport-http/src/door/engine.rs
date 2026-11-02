@@ -576,7 +576,7 @@ pub(crate) fn held_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
     Bytes::from_owner(Held(bytes))
 }
 
-/// The dial target with its authority as 1.5.5's client sent it (its URL parser normalised the
+/// Normalize the dial authority as the 1.5.5 client's URL parser did.
 
 fn canonical_host(dial: http::Uri) -> http::Uri {
     let dial = super::as_http(dial);

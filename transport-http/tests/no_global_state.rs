@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! RED (`BUSBAR-1.6.0.md` THE DESIGN §2: "A plugin holds no process-global state: what it keeps is
+//! The HTTP transport keeps mutable state in its instances rather than process-global slots.
 
 use std::path::{Path, PathBuf};
 

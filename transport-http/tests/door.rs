@@ -183,7 +183,7 @@ fn locate_lending(
     )
 }
 
-/// RED (sibling review D2, D16): the door answered READY to a release of a lease it never handed
+/// Releasing a lease that was never handed out is refused.
 
 #[test]
 fn a_release_of_a_lease_never_handed_out_is_refused() {
@@ -202,7 +202,7 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
     );
 }
 
-/// RED (sibling review D3): the door's own `refresh` wrapper answered FAILED `refresh: no open
+/// Refresh without an open instance reports the SDK's fault.
 
 #[test]
 fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
@@ -210,7 +210,7 @@ fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
     assert_eq!(r, Outcome::Fault);
 }
 
-/// RED: `refresh` answered READY and kept the settings `open` read, whatever the new blob said.
+/// Refresh reads new settings and retains the old settings when the new blob is invalid.
 
 #[test]
 fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
@@ -262,7 +262,7 @@ fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
     assert_eq!(written, want);
 }
 
-/// RED: `validate` refused a bad blob as `settings: not JSON`, a wrong kind as `<key>: not of its
+/// Validation returns the canonical settings explanations.
 
 #[test]
 fn validate_answers_the_canon_settings_texts() {
@@ -306,7 +306,7 @@ unsafe fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, St
     (r, text(head.error))
 }
 
-/// RED: every op of the role this framer does not play answered a bare REFUSED, with no words.
+/// Carrier-role and unserved framer operations are refused with an explanation.
 
 #[test]
 fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words() {
@@ -374,7 +374,7 @@ fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words(
     );
 }
 
-/// RED: `begin` with no open instance answered a bare FAILED, and `ingest`, `emit`, `timer` and
+/// Framer operations without an open instance fail with an explanation.
 
 #[test]
 fn a_framer_op_with_no_open_instance_is_failed_in_words() {
@@ -428,7 +428,7 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
     );
 }
 
-/// RED: an op on a framing the instance does not hold answered `no such framing`, naming no op.
+/// An operation on an unknown framing names the failed operation.
 
 #[test]
 fn a_framer_op_on_an_unknown_framing_names_its_op() {
@@ -473,7 +473,7 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
     );
 }
 
-/// RED (coordinator ruling 2026-10-29, as transport-tcp #42's): a failure a caller sees carries the
+/// A far end that closes without answering fails in the system's words alone.
 
 #[test]
 fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
@@ -568,7 +568,7 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     );
 }
 
-/// RED: `locate` and `begin` took a target carrying userinfo and dropped it silently (`locate`
+/// Targets carrying userinfo are refused at both locate and begin.
 
 #[test]
 fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
@@ -598,7 +598,7 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
     );
 }
 
-/// RED: the Statement carried no extensions, so the plugin's `declares.json` never reached the
+/// The Statement carries the complete declares document.
 
 #[test]
 fn the_statement_carries_the_declares_document() {
