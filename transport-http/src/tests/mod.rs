@@ -47,6 +47,11 @@ fn retry_after_parses_both_normative_forms() {
     // RED (codeaudit conformance L message.rs:38, tests-A L tests/mod.rs:45): delay-seconds is
     // 1*DIGIT, so a sign is no wait (Rust's integer parse takes a leading `+`).
     assert_eq!(crate::message::parse_retry_after("+7", 0), None);
+    // A delay-seconds that overflows u64 is no wait, not a saturated one.
+    assert_eq!(
+        crate::message::parse_retry_after("99999999999999999999999", 0),
+        None
+    );
     // Right length, wrong month.
     assert_eq!(
         crate::message::parse_retry_after("Sun, 06 Xxx 1994 08:49:37 GMT", 0),
@@ -474,6 +479,7 @@ fn a_content_length_that_names_no_single_length_is_refused() {
         "Content-Length: 3\r\nContent-Length: 4\r\n",
         "Content-Length: +5\r\n",
         "Content-Length: abc\r\n",
+        "Content-Length: 99999999999999999999999\r\n",
     ] {
         // With no body yet and with a body a lenient reader would accept: neither is a message.
         for body in ["", "abc"] {
@@ -579,4 +585,20 @@ fn an_envelope_path_with_a_control_byte_encodes_percent_encoded() {
         "{:?}",
         String::from_utf8_lossy(&head)
     );
+}
+
+/// The header-map reader: a present readable value is its wait; an absent header, a value that is
+/// not text and one that overflows are no wait at all.
+#[test]
+fn retry_after_secs_reads_the_header_map() {
+    use http::{header::RETRY_AFTER, HeaderMap, HeaderValue};
+    let mut h = HeaderMap::new();
+    assert_eq!(crate::message::retry_after_secs(&h, 0), None);
+    h.insert(
+        RETRY_AFTER,
+        HeaderValue::from_bytes(b"\xff").expect("opaque"),
+    );
+    assert_eq!(crate::message::retry_after_secs(&h, 0), None);
+    h.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+    assert_eq!(crate::message::retry_after_secs(&h, 0), Some(7));
 }

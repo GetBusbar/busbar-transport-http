@@ -27,8 +27,8 @@ pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Opti
 /// breaker's own classifier's, and it is duplicated here rather than shared: this crate sits on the
 /// transport axis and may not name a unit crate, and the unit crate's own dependency policy names
 /// the capability crate as the only workspace crate it may see. Neither can reach the other, so
-/// there is no shared home for it. The forms accepted and the flooring rule are pinned by the tests
-/// below against the same values.
+/// there is no shared home for it. The forms accepted and the flooring rule are pinned by the tests in
+/// `src/tests/mod.rs` against the same values.
 ///
 /// (The capability crate is deliberately not spelled here. `tests/no_plane_names.rs` refuses that
 /// name anywhere in this crate's source, and a rule with an exception for prose is a rule with an
