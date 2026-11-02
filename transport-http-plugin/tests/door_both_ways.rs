@@ -1600,8 +1600,8 @@ fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
         .clone();
     assert_eq!(
         String::from_utf8_lossy(&head),
-        "host: busbar.test\r\ncontent-type: application/json\r\n",
-        "{label}: one field block, no content-length"
+        "host: busbar.test\r\ncontent-length: 5\r\ncontent-type: application/json\r\n",
+        "{label}: the exact admitted field block retains content-length"
     );
     let body: Vec<u8> = h
         .got
