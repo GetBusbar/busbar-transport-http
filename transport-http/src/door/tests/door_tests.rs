@@ -420,7 +420,26 @@ fn the_entry_claims_http_https_and_sse() {
     let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
     assert_eq!(names, [4, 3, 5]);
     assert_eq!(CLAIMS.len(), names.len());
-    assert_eq!(FAULT_CLAIMS, names.len());
+    // `https` is the same wire as `http`: its claim row is `http`'s, field by field.
+    let (h, s) = (&CLAIMS[0], &CLAIMS[2]);
+    let strs = |a: &AbiStr| (a.ptr, a.len);
+    assert_eq!(strs(&s.selector_forms), strs(&h.selector_forms));
+    assert!(s.selector_forms.len > 0, "https states selector forms");
+    assert_eq!(
+        strs(&s.egress_selector_forms),
+        strs(&h.egress_selector_forms)
+    );
+    assert_eq!((s.facts, s.facts_len), (h.facts, h.facts_len));
+    assert!(s.facts_len > 0, "https states its facts");
+    assert_eq!(strs(&s.status_namespace), strs(&h.status_namespace));
+    assert!(
+        s.status_namespace.len > 0,
+        "https states a status namespace"
+    );
+    assert_eq!(s.status_at, h.status_at);
+    assert_eq!(s.session, h.session);
+    assert_eq!(s.session_bound, h.session_bound);
+    assert_eq!(s.unit0_trigger, h.unit0_trigger);
     let https: Vec<(u32, u32, u32)> = STATUS_ROWS
         .iter()
         .filter(|r| r.claim == 2)
