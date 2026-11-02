@@ -971,6 +971,7 @@ fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
 fn a_stalled_or_trickled_request_body_fails_its_stream() {
     let post =
         b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 100\r\n\r\nhello";
+    let post0 = post;
     let failed = |a: &mut Accepted| a.pieces().drain(..).any(|p| p.failed);
     let mut a = accepted();
     a.ingest(post, false);
@@ -992,6 +993,39 @@ fn a_stalled_or_trickled_request_body_fails_its_stream() {
     assert!(
         failed(&mut a),
         "a body under 1 KiB/s past 10 s fails its stream"
+    );
+
+    // The stall rule alone: a burst that keeps the rate above the floor for the whole stall, then
+    // silence. Only the 30 s inter-frame bound can fail it (64 KiB over 31 s is 2 KiB/s).
+    let len = 100_000;
+    let post =
+        format!("POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {len}\r\n\r\n");
+    let mut a = accepted();
+    let mut burst = post.into_bytes();
+    burst.extend(vec![b'z'; 64 * 1024]);
+    a.ingest(&burst, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    run(&mut a, SEC + 30 * SEC - 1);
+    assert!(
+        !failed(&mut a),
+        "a body silent for just under 30 s is not failed"
+    );
+    run(&mut a, SEC + 30 * SEC + 1);
+    assert!(
+        failed(&mut a),
+        "a body silent for 30 s fails its stream while above the throughput floor"
+    );
+
+    // The grace: a body below the floor is not judged inside the first 10 s.
+    let mut a = accepted();
+    a.ingest(post0, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    run(&mut a, SEC + 9 * SEC);
+    assert!(
+        !failed(&mut a),
+        "a body under 1 KiB/s is not failed inside the 10 s grace"
     );
 
     // Negative control: a body arriving at 2 KiB/s is above the floor and survives past the grace.
