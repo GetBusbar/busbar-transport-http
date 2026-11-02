@@ -439,7 +439,11 @@ fn cross(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> (C
             }
         });
     if result.1.framing != 0 {
-        sink.scope.as_mut().unwrap().0 = result.1.framing;
+        let (token, scope) = sink.scope.as_mut().unwrap();
+        *token = result.1.framing;
+        scope
+            .confirm(*token)
+            .expect("the actual BEGIN confirms its host framing context");
     }
     result
 }
