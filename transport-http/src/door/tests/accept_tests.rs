@@ -443,7 +443,7 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 /// it": v1.5.5's server served such a connection on).
 #[test]
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
-    const HEAD_LIMIT: usize = 8192 + 4096 * 100;
+    const HEAD_LIMIT: usize = crate::door::engine::HEAD_MAX_BYTES;
     let mut a = accepted();
     a.ingest(
         b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n",
