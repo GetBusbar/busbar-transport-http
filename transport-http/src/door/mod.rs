@@ -1151,8 +1151,8 @@ impl SafeSlot for Encode {
     }
 }
 
-/// A framer op [`with`] runs: its name, which every failure text leads with, and its static
-/// no-instance text (with no instance there is nowhere to keep an owned one).
+/// A framer op [`with`] runs: its name, which only the door's own refusals (no open instance, no
+/// such framing) lead with, and its static no-instance text (with no instance there is nowhere to keep an owned one).
 #[derive(Clone, Copy)]
 struct FramerOp {
     /// The op's name.
@@ -1189,10 +1189,11 @@ framer_op!(
     TIMER, "timer"
 );
 
-/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
-/// name. `f` is told whether the op was re-entered with `FLAG_RESUME` (it answered PENDING on a
-/// parked `auth.call`): such an op took its input whole the first time and takes none again, but
-/// what it answers is read afresh.
+/// Run `f` on framing `token`, then drive it and fill the sink; only the door's own refusals
+/// (no open instance, no such framing) lead with the op's name. A framing's failure is passed
+/// through unchanged, as [`step`] documents. `f` is told whether the op was re-entered with
+/// `FLAG_RESUME` (it answered PENDING on a parked `auth.call`): such an op took its input whole the
+/// first time and takes none again, but what it answers is read afresh.
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,
