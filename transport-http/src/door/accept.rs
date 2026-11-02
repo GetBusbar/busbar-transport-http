@@ -1662,7 +1662,9 @@ impl Accepted {
                     sh.waiting.push(id);
                     continue;
                 }
-                let loans = self.loans.as_mut().expect("checked above");
+                let Some(loans) = self.loans.as_mut() else {
+                    unreachable!("checked above");
+                };
                 a.loan_ticket = Some(k.ticket());
                 match k.open_policy(loans, id) {
                     Ok(Some(loan)) => {
