@@ -384,7 +384,7 @@ fn cross(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> (C
     }
     let scope = sink.scope.as_ref().unwrap().1.clone();
     let raw = sink.raw();
-    let result =
+    let result: (Called, FramerOut) =
         busbar_plugin_loader::dispatch::framing_context::with_context(Some(scope), || match op {
             Op::Begin(side, target) => {
                 let mut i: BeginIn = input();
