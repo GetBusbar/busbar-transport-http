@@ -23,8 +23,7 @@ to be credited once a fix is released.
 
 ## Scope
 
-`busbar-transport-http` is a `kind: transport` busbar plugin. Its README states what it does and
-its documented limitations. See busbar's own
+`busbar-transport-http` is a `kind: transport` busbar plugin. Its README states what it does. See busbar's own
 [threat model](https://github.com/GetBusbar/busbar/blob/main/THREAT_MODEL.md) for the
 trust boundaries every plugin operates inside.
 
