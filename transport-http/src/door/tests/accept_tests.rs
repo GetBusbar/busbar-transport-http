@@ -1088,6 +1088,27 @@ fn a_refusal_with_an_informational_status_is_answered_500() {
     );
 }
 
+/// RED (codeaudit r2-prod0-4): a refusal is never a switch; a 101 refusal of an upgrade request
+/// was handed to hyper as a 101 that switches the connection.
+#[test]
+fn a_101_refusal_of_an_upgrade_request_is_answered_500() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET /ws HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.refuse(Some(stream), b"no", 101, false).expect("refused");
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 500 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
 /// RED (codeaudit r1-prod0-22): a `host` field present but not text was shown to the auth as an
 /// empty authority, the same as a request with none. RFC 9112 3.2: an invalid host is refused;
 /// the request is never handed in.

@@ -722,7 +722,7 @@ impl Accepted {
     ///   the host rendered it (the connector's `unit0_refusal`), written as they are; hyper is let
     ///   go and the connection is over;
     /// * for a stream whose answer head has not gone, with a neutral `status`: `bytes` are its
-    ///   answer's body, at `status` (`100..=599`, else `500`, the status v1.5.5's server gave a
+    ///   answer's body, at `status` (`200..=599`, else `500`; a refusal is never a switch, so `101` is `500`, the status v1.5.5's server gave a
     ///   handler's failure), its length stated, as v1.5.5's server answered a handler's error
     ///   response;
     /// * for such a stream with NO neutral status (`0`, "none stated": the connector's
@@ -812,7 +812,7 @@ impl Accepted {
             self.owed.extend(bytes);
             return Ok(());
         }
-        let status = final_status(status, a.upgrade.is_some()).map_or(500, |s| s.as_u16());
+        let status = final_status(status, false).map_or(500, |s| s.as_u16());
         let framed = frame_refusal(
             a,
             RefusalCopy {
