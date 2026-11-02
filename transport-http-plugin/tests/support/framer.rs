@@ -954,7 +954,7 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             assert_eq!(
                 count(&p) - before,
                 sinkfuls(wire.len(), TIGHT_WIRE),
-                "{label} crossings"
+                "{label} crossings; last collected answer: {value}"
             );
             let answer = value;
             match want {
