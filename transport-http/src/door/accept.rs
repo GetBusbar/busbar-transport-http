@@ -211,9 +211,8 @@ struct Reply(Arc<Mutex<ReplyQ>>, Option<u64>);
 /// mid-answer (an HTTP/2 reset): either way the framing is told ([`ReplyQ::gone`]).
 impl Drop for Reply {
     fn drop(&mut self) {
-        if let Ok(mut q) = self.0.lock() {
-            q.gone = true;
-        }
+        let mut q = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        q.gone = true;
     }
 }
 
@@ -451,10 +450,9 @@ impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
         // A body held for a `HeadBody` auth when the framing is torn down mid-hold.
-        if let Ok(mut sh) = self.shared.lock() {
-            for a in sh.streams.values_mut() {
-                let_held_go(&mut a.held);
-            }
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        for a in sh.streams.values_mut() {
+            let_held_go(&mut a.held);
         }
     }
 }

@@ -975,3 +975,45 @@ fn a_stalled_or_trickled_request_body_fails_its_stream() {
         "a body under 1 KiB/s past 10 s fails its stream"
     );
 }
+
+/// RED (codeaudit r1-prod0-1): `Reply::drop` and `Accepted::drop` did nothing on a poisoned lock,
+/// so a stream the peer gave up was never marked gone and a held body was freed unzeroised.
+#[test]
+fn a_poisoned_lock_does_not_stop_the_drops() {
+    let q = Arc::new(Mutex::new(ReplyQ::default()));
+    let q2 = q.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = q2.lock().expect("lock");
+        panic!("poison");
+    })
+    .join();
+    assert!(q.is_poisoned());
+    drop(Reply(q.clone(), None));
+    assert!(
+        q.lock().unwrap_or_else(PoisonError::into_inner).gone,
+        "the reply is marked gone"
+    );
+
+    let (a, stream) = one_get();
+    let shared = a.shared.clone();
+    shared
+        .lock()
+        .expect("shared")
+        .streams
+        .get_mut(&stream)
+        .expect("stream")
+        .held = vec![7u8; 16];
+    let s2 = shared.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = s2.lock().expect("lock");
+        panic!("poison");
+    })
+    .join();
+    assert!(shared.is_poisoned());
+    drop(a);
+    let sh = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        sh.streams.values().all(|a| a.held.is_empty()),
+        "the held body is let go"
+    );
+}
