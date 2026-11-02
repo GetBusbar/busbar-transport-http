@@ -338,6 +338,9 @@ fn once(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> Yie
 fn pump(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> Yielded {
     let mut y = Yielded::default();
     let (c, o) = cross(p, framing, op, sink);
+    if matches!(op, Op::Refuse(_)) {
+        eprintln!("HTTP refusal crossing: outcome={:?} lease={} wire_len={} frame_len={} pieces_len={} yield_flags={} error={:?}", c.outcome,c.lease,o.yielded.wire_len,o.yielded.frame_len,o.yielded.pieces_len,o.yielded.flags,c.error);
+    }
     y.take(&c, &o, sink);
     let framing = if framing == 0 { y.framing } else { framing };
     let mut n = 0;
@@ -345,6 +348,9 @@ fn pump(p: &Plugin<Transport>, framing: u64, op: Op<'_>, sink: &mut Sink) -> Yie
         n += 1;
         assert!(n < MAX_REDRIVE, "a framer answered YIELD_MORE {n} times");
         let (c, o) = cross(p, framing, op.again(), sink);
+        if matches!(op, Op::Refuse(_)) {
+            eprintln!("HTTP refusal re-drive {n}: outcome={:?} lease={} wire_len={} frame_len={} pieces_len={} yield_flags={} error={:?}", c.outcome,c.lease,o.yielded.wire_len,o.yielded.frame_len,o.yielded.pieces_len,o.yielded.flags,c.error);
+        }
         y.take(&c, &o, sink);
     }
     y
