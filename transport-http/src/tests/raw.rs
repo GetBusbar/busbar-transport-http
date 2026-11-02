@@ -67,6 +67,18 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
+/// A size too large for `usize` is a framing error, never read as zero (the terminal chunk).
+#[test]
+fn a_chunk_size_that_overflows_usize_is_a_framing_error() {
+    for line in [
+        &b"10000000000000000\r\n"[..],
+        b"ffffffffffffffffffffffffffffffff\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(decoder.feed(line), Err(ChunkedMalformed), "{line:?}");
+    }
+}
+
 /// RED: the size is `1*HEXDIG` (RFC 9112 7.1): no sign, no surrounding whitespace.
 #[test]
 fn a_signed_or_padded_chunk_size_is_a_framing_error() {
