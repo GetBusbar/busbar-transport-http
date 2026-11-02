@@ -1349,7 +1349,8 @@ fn hold_body(a: &mut Answer, limit: u64, bounds: &Bounds<'_>, cx: &mut Context<'
 
 /// The request as the auth handle reads it (`HeadView`): the method, the target's path, the
 /// authority (the target's own, else the `host` line, as HTTP/1.1 states it), the query, and the
-/// head's field lines in order, as received. Borrowed from `parts` and `fields`.
+/// head's field lines (names lowercased; a repeated name's lines grouped at its first position,
+/// not in arrival order). Borrowed from `parts` and `fields`.
 fn head_view<'a>(
     parts: &'a http::request::Parts,
     fields: &'a [(&'a str, &'a [u8])],
@@ -1375,7 +1376,8 @@ fn head_view<'a>(
     }
 }
 
-/// The head's field lines as `(name, value)`, in order.
+/// The head's field lines as `(name, value)`: names lowercased, a repeated name's lines grouped at
+/// its first position (the header map's order), not in arrival order.
 fn field_lines(parts: &http::request::Parts) -> Vec<(&str, &[u8])> {
     parts
         .headers
