@@ -42,7 +42,7 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::route::{
-    LineEntry, RouteMatch, METHOD_ANY, METHOD_POST, PATH_EXACT,
+    FieldPredicate, LineEntry, RouteMatch, FIELD_VALUE_PREFIX, METHOD_ANY, METHOD_POST, PATH_EXACT,
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
@@ -3561,7 +3561,6 @@ fn a_cleartext_offer_changes_nothing_else(label: &str, ops: &'static Ops) {
     h.close();
 }
 
-/// Run `cell` through the linked door and the dropped-in one.
 /// A second connection on ONE instance whose listener's list differs from the first's in one
 /// member only is framed under ITS list, not the copy the instance kept for the first: a stale
 /// reuse would admit it under the old auth handle or body limit.
@@ -3625,6 +3624,61 @@ fn a_changed_list_is_not_reused(label: &str, ops: &'static Ops) {
     first.close();
 }
 
+/// [`line`] for `POST /v1/messages` that also needs the header `x-tier` to start with `prefix`.
+fn tiered_line(id: u32, prefix: &'static str) -> LineEntry {
+    let preds: &'static [FieldPredicate] = Box::leak(Box::new([FieldPredicate {
+        op: FIELD_VALUE_PREFIX,
+        _reserved: 0,
+        name: s("x-tier"),
+        value: s(prefix),
+    }]));
+    let mut l = line(id, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    l.route.fields = preds.as_ptr();
+    l.route.fields_len = preds.len();
+    l
+}
+
+/// `POST_HELLO` carrying `x-tier: tier`.
+fn tiered_post(tier: &str) -> Vec<u8> {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\nx-tier: {tier}\r\ncontent-length: 5\r\n\r\nhello"
+    )
+    .into_bytes()
+}
+
+/// A second connection on ONE instance whose list is identical to the first's is admitted under the
+/// same handle (the kept copy serves it), and one whose predicate differs in its value alone is
+/// matched under ITS predicate: a stale reuse would refuse it for want of a route.
+fn an_identical_list_is_reused_and_a_field_change_is_not(label: &str, ops: &'static Ops) {
+    let first = admitted(
+        ops,
+        vec![tiered_line(8, "a-")],
+        Script::default(),
+        &tiered_post("a-1"),
+    );
+    let mut same = AcceptHost::open_again(&first, vec![tiered_line(8, "a-")]);
+    assert_eq!(same.ingest(&tiered_post("a-2")), Outcome::Ready);
+    let mut other = AcceptHost::open_again(&first, vec![tiered_line(8, "b-")]);
+    assert_eq!(other.ingest(&tiered_post("b-1")), Outcome::Ready);
+    let asked = first.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+            ]
+        ),
+        "{label}: each connection matched under its own list: {asked:?}"
+    );
+    first.close();
+}
+
+/// Run `cell` through the linked door and the dropped-in one.
 fn both(cell: fn(&str, &'static Ops)) {
     let (d, _lib) = dropped();
     for (label, ops) in [("linked", linked()), ("dropped", d)] {
@@ -3650,6 +3704,11 @@ fn a_head_auth_stop_is_the_kernels_refusal_with_the_unit() {
 #[test]
 fn a_changed_guest_list_on_one_instance_is_not_served_from_the_kept_copy() {
     both(a_changed_list_is_not_reused);
+}
+
+#[test]
+fn an_identical_guest_list_is_reused_and_a_changed_predicate_is_not() {
+    both(an_identical_list_is_reused_and_a_field_change_is_not);
 }
 
 #[test]
