@@ -61,7 +61,7 @@ use zeroize::Zeroize;
 
 use super::engine::{extend_wiped, Failure, Tasks, HEAD_MAX_BYTES};
 use super::guest::{self, Line, Matched};
-use super::hyper_io::{field_block, HeadWords, HostIo, HostTimer, Owed, Piece};
+use super::hyper_io::{HeadWords, HostIo, HostTimer, Owed, Piece};
 
 /// v1.5.5's HTTP/1 header-read bound (`hardened_conn_builder`).
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2312,9 +2312,10 @@ fn go_up(id: u64, a: &mut Answer, out: &mut VecDeque<Piece>) {
     a.gate = Gate::Admitted;
 }
 
-/// A request head as the frame the layer above reads: ONE field block (no pseudo-field, no
-/// hop-by-hop field, no `content-length`: the pieces carry the body hyper unframed), the method,
-/// target and named authority in its head slots.
+/// The accepted request keeps every decoded field left after the auth's declared stripping.
+/// `unit.hand_in` accepted this exact head, and the host claims that same request before serving
+/// it. The dialled-response field filter would change authenticated headers here, including
+/// `content-length` and fields named by `connection`. Body pieces still carry the unframed body.
 fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
     let target = parts
         .uri
@@ -2324,6 +2325,13 @@ fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
         .uri
         .authority()
         .map_or_else(String::new, |a| a.as_str().to_owned());
+    let mut block = Vec::new();
+    for (name, value) in &parts.headers {
+        block.extend_from_slice(name.as_str().as_bytes());
+        block.extend_from_slice(fields::SEPARATOR);
+        block.extend_from_slice(value.as_bytes());
+        block.extend_from_slice(fields::LINE_END);
+    }
     Piece {
         head: Some(HeadWords {
             method: Bytes::copy_from_slice(parts.method.as_str().as_bytes()),
@@ -2331,7 +2339,7 @@ fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
             authority: Bytes::from(authority),
             reason: Bytes::new(),
         }),
-        ..Piece::fields(stream, Bytes::from(field_block(&parts.headers, &[])))
+        ..Piece::fields(stream, Bytes::from(block))
     }
 }
 

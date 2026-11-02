@@ -471,10 +471,11 @@ fn a_request_goes_up_as_its_head_slots_one_field_block_and_its_body() {
         "an origin-form request names no authority"
     );
     assert!(words.reason.is_empty());
-    // No hop-by-hop field and no `content-length` in the block: the pieces carry the body.
+    // The accepted head is the exact request admitted by the host, including decoded framing
+    // headers. Reusing the dialled-response filter here would invalidate its single-use claim.
     assert_eq!(
         String::from_utf8_lossy(block),
-        "host: busbar.test\r\ncontent-type: application/json\r\n"
+        "host: busbar.test\r\nconnection: keep-alive\r\ncontent-length: 5\r\ncontent-type: application/json\r\n"
     );
     assert_eq!(u.body, b"hello");
     assert!(u.whole, "the request is whole");
@@ -1608,5 +1609,116 @@ fn http1_trailer_negotiation_matches_hypers_comma_and_repeated_te_fields() {
         assert!(a
             .take_wire(usize::MAX)
             .ends_with(b"0\r\nx-check: kept\r\n\r\n"));
+    }
+}
+
+#[derive(Default)]
+struct CapturedAdmission {
+    auth: Vec<(String, Vec<u8>)>,
+    handed: Vec<(String, Vec<u8>)>,
+}
+
+impl Kernel for CapturedAdmission {
+    fn ticket(&self) -> Ticket {
+        OP_TICKET
+    }
+
+    fn auth_call(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        request: &HeadViewArgs<'_>,
+        _: Option<&[u8]>,
+    ) -> Pend<AuthCalled> {
+        self.auth = request
+            .fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
+            .collect();
+        Poll::Ready(Ok((
+            FLOW_CONTINUE,
+            UnitRef { id: 1, mac: 1 },
+            vec![("authorization".into(), Place::Field)],
+        )))
+    }
+
+    fn hand_in(
+        &mut self,
+        _: u32,
+        _: AuthRef,
+        _: UnitRef,
+        _: u32,
+        _: u64,
+        request: &HeadViewArgs<'_>,
+    ) -> Result<(u32, UnitRef), ServiceError> {
+        self.handed = request
+            .fields
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), value.to_vec()))
+            .collect();
+        Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }))
+    }
+
+    fn refuse(
+        &mut self,
+        _: u32,
+        _: UnitRef,
+        _: u32,
+        _: u32,
+        _: u64,
+        _: &HeadViewArgs<'_>,
+    ) -> Result<RefusalCopy, ServiceError> {
+        Err(ServiceError::Unserved)
+    }
+}
+
+/// The actual accepted-side parser, auth call, hand-in and emitted frame must agree. A filter
+/// used for dialled answers used to delete these fields after hand-in, producing an empty 401
+/// when the real data listener tried to claim even an anonymous GET /healthz.
+#[test]
+fn an_accepted_request_preserves_the_exact_head_handed_in_after_auth() {
+    for (wire, body) in [
+        (b"GET /healthz HTTP/1.1\r\nhost: busbar.test\r\nconnection: close\r\ncontent-length: 0\r\nauthorization: signed-credential\r\n\r\n".as_slice(), b"".as_slice()),
+        (b"POST /signed?x=1 HTTP/1.1\r\nhost: busbar.test\r\nconnection: close, x-signed\r\nx-signed: first\r\nx-signed: second\r\ncontent-length: 3\r\nauthorization: signed-credential\r\n\r\nabc".as_slice(), b"abc".as_slice()),
+    ] {
+        for authenticated in [false, true] {
+            let line = if authenticated {
+                Line::any_needing(1, busbar_contract::abi::auth::POINT_HEAD, 0)
+            } else { Line::any(1) };
+            let mut a = Accepted::accept(SEC, vec![line]);
+            let mut kernel = CapturedAdmission::default();
+            a.ingest(wire, false);
+            run_with(&mut a, SEC, &mut kernel);
+            let emitted = up(&mut a);
+            assert_eq!(emitted.heads.len(), 1);
+            let fields: Vec<_> = fields::lines(&emitted.heads[0].2)
+                .map(|(name, value)| (std::str::from_utf8(name).unwrap().to_owned(), value.to_vec()))
+                .collect();
+            assert_eq!(fields, kernel.handed, "the host's strict claim sees the admitted fields");
+            assert!(fields.iter().any(|(name, value)| name == "connection" && value.starts_with(b"close")));
+            assert!(fields.iter().any(|(name, _)| name == "content-length"));
+            assert_eq!(emitted.body, body);
+            assert!(emitted.whole);
+            if authenticated {
+                assert!(kernel.auth.iter().any(|(name, value)| name == "authorization" && value == b"signed-credential"));
+                assert!(kernel.auth.iter().any(|(name, _)| name == "connection"));
+                assert!(kernel.auth.iter().any(|(name, _)| name == "content-length"));
+                assert!(!fields.iter().any(|(name, _)| name == "authorization"));
+                let original_without_credential: Vec<_> = kernel.auth.into_iter()
+                    .filter(|(name, _)| name != "authorization").collect();
+                assert_eq!(fields, original_without_credential);
+            } else {
+                assert!(kernel.auth.is_empty(), "a none line calls no auth");
+            }
+        }
+        let mut refused = Accepted::accept(SEC, vec![Line::any_needing(
+            1, busbar_contract::abi::auth::POINT_HEAD, 0)]);
+        refused.ingest(wire, false);
+        run_with(&mut refused, SEC, &mut Refusing);
+        assert!(up(&mut refused).heads.is_empty(), "rejected auth emits no accepted request");
+        assert!(refused.take_wire(usize::MAX).starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
     }
 }
