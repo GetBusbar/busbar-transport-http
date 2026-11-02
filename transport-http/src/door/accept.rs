@@ -1193,7 +1193,7 @@ fn serve(
     let (parts, body) = req.into_parts();
     let bodiless = body.is_end_stream();
     let (tx, rx) = futures_channel::oneshot::channel();
-    let stream = {
+    {
         let mut s = sh.lock().unwrap_or_else(PoisonError::into_inner);
         let id = s.next;
         s.next += 1;
@@ -1224,9 +1224,7 @@ fn serve(
         if !asks_upgrade || !bodiless {
             s.no_hand_over = true;
         }
-        id
-    };
-    let _ = stream;
+    }
     Box::pin(async move {
         rx.await.map_err(|_| {
             std::io::Error::new(
