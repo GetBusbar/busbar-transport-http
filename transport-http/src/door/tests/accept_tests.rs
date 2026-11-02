@@ -974,6 +974,30 @@ fn a_stalled_or_trickled_request_body_fails_its_stream() {
         failed(&mut a),
         "a body under 1 KiB/s past 10 s fails its stream"
     );
+
+    // Negative control: a body arriving at 2 KiB/s is above the floor and survives past the grace.
+    let len = 5 + 2048 * 15;
+    let post = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {len}\r\n\r\nhello"
+    );
+    let mut a = accepted();
+    a.ingest(post.as_bytes(), false);
+    run(&mut a, SEC);
+    assert!(!failed(&mut a));
+    let chunk = vec![b'y'; 2048];
+    for n in 2..=16u64 {
+        a.ingest(&chunk, false);
+        run(&mut a, n * SEC);
+        assert!(
+            !failed(&mut a),
+            "a body above 1 KiB/s survives at {n} s (past the 10 s grace from 11 s)"
+        );
+    }
+    run(&mut a, 60 * SEC);
+    assert!(
+        !failed(&mut a),
+        "a body that completed is not failed by the idle timer"
+    );
 }
 
 /// RED (codeaudit r1-prod0-1): `Reply::drop` and `Accepted::drop` did nothing on a poisoned lock,
