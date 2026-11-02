@@ -92,6 +92,14 @@ fn a_query_key_is_compared_as_it_decodes() {
         stripped_query("a=1&%6Bey=s&k%65y&Key=k&ke+y=x&%zzkey=y", &names).as_deref(),
         Some("a=1&Key=k&ke+y=x&%zzkey=y")
     );
+    // An escape at the very tail of a key decodes; a truncated one stays as written, with no panic.
+    assert_eq!(
+        stripped_query("a=1&ke%79=s&ke%79", &names).as_deref(),
+        Some("a=1")
+    );
+    assert_eq!(stripped_query("%6", &names).as_deref(), Some("%6"));
+    assert_eq!(stripped_query("key%", &names).as_deref(), Some("key%"));
+    assert_eq!(stripped_query("ke%7", &names).as_deref(), Some("ke%7"));
     let spaced = vec![("a b".to_owned(), Place::Query)];
     assert_eq!(
         stripped_query("a+b=1&a%20b=2&c=3", &spaced).as_deref(),
