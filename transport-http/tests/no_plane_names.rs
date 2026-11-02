@@ -154,6 +154,50 @@ fn the_source_names_no_plane() {
     );
 }
 
+/// The dependency KEYS (never comment text) in `[dependencies]`, `[dev-dependencies]` and
+/// `[build-dependencies]` (including target-specific tables) that name a busbar crate a transport
+/// may not depend on: anything `busbar-`/`busbar_` except the two contract crates and sibling
+/// transports.
+fn disallowed_busbar_dependency_keys(manifest: &str) -> Vec<String> {
+    // Whether `key` is a busbar crate a transport may not depend on.
+    fn disallowed(key: &str) -> bool {
+        (key.starts_with("busbar-") || key.starts_with("busbar_"))
+            && !(key == "busbar-contract"
+                || key == "busbar-contract-transport"
+                || key.starts_with("busbar-transport-"))
+    }
+    let mut in_deps = false;
+    let mut out = Vec::new();
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            let header = line.trim_matches(|c| c == '[' || c == ']');
+            in_deps = header.ends_with("dependencies");
+            // The dotted-table form: `[dependencies.<key>]`, `[dev-dependencies.<key>]`,
+            // `[target.'cfg'.build-dependencies.<key>]`.
+            if let Some((_, key)) = header.rsplit_once("dependencies.") {
+                let key = key.trim().trim_matches('"');
+                if disallowed(key) {
+                    out.push(key.to_string());
+                }
+            }
+            continue;
+        }
+        if !in_deps || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        let key = key.split('.').next().unwrap_or(key);
+        if disallowed(key) {
+            out.push(key.to_string());
+        }
+    }
+    out
+}
+
 /// No dependency of this crate — including a dev-dependency — is a plane crate or a core crate.
 #[test]
 fn the_manifest_names_neither_a_plane_nor_core() {
@@ -171,6 +215,7 @@ fn the_manifest_names_neither_a_plane_nor_core() {
             found.push((*core).to_string());
         }
     }
+    found.extend(disallowed_busbar_dependency_keys(&manifest));
     assert!(
         found.is_empty(),
         "a transport may name the two contract crates and its sibling transports and nothing else \
@@ -220,7 +265,16 @@ fn the_scan_would_catch_a_planted_name() {
         .any(|c| planted.contains(c.as_str())));
     let planted_core = "busbar-kernel = { path = \"../busbar-kernel\" }";
     assert!(CORE_NAMES.iter().any(|c| planted_core.contains(c)));
-
+    // And the manifest allow-list: a foreign busbar key is found, the permitted ones are not.
+    let planted_manifest = "[dependencies]\n# busbar-store-sqlite in a comment\nbusbar-contract = { workspace = true }\nbusbar-transport-tcp = { workspace = true }\n[dev-dependencies]\nbusbar-auth-oidc = { workspace = true }\n[dev-dependencies.busbar-auth-oidc]\nworkspace = true\n";
+    assert_eq!(
+        disallowed_busbar_dependency_keys(planted_manifest),
+        vec![
+            "busbar-auth-oidc".to_string(),
+            "busbar-auth-oidc".to_string()
+        ]
+    );
+    // And the one call a transport would make if it reached past the driver seam at all.
     let planted_call = "busbar_kernel::teller::run_unit(&kernel, units, &ctx, run)";
     assert!(CORE_NAMES.iter().any(|c| planted_call.contains(c)));
 }

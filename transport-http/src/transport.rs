@@ -52,6 +52,9 @@ pub(crate) fn render_head(
     }
     let mut size = method.len() + path.len() + 64;
     for (name, value) in fields {
+        if name.eq_ignore_ascii_case("method") || name.eq_ignore_ascii_case("path") {
+            continue;
+        }
         if !is_token(name.as_bytes())
             || !clean(value)
             || http::HeaderValue::from_bytes(value).is_err()

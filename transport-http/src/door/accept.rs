@@ -435,17 +435,10 @@ pub struct Accepted {
 impl Drop for Accepted {
     fn drop(&mut self) {
         self.let_raw_go();
-        if let Some(rest) = self.leftover.as_mut() {
-            rest.resize(rest.capacity(), 0);
-            let (front, back) = rest.as_mut_slices();
-            front.zeroize();
-            back.zeroize();
-        }
-
-        if let Ok(mut sh) = self.shared.lock() {
-            for a in sh.streams.values_mut() {
-                let_held_go(&mut a.held);
-            }
+        self.let_leftover_go();
+        let mut sh = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        for a in sh.streams.values_mut() {
+            let_held_go(&mut a.held);
         }
     }
 }
@@ -585,6 +578,17 @@ impl Accepted {
     fn let_raw_go(&mut self) {
         if let Some(mut raw) = self.raw.take() {
             raw.zeroize();
+        }
+    }
+
+    /// Wipe what a detach left waiting (it may be the connection as sent, credential lines
+    /// included).
+    fn let_leftover_go(&mut self) {
+        if let Some(left) = self.leftover.as_mut() {
+            left.resize(left.capacity(), 0);
+            let (x, y) = left.as_mut_slices();
+            x.zeroize();
+            y.zeroize();
         }
     }
 
@@ -737,6 +741,27 @@ impl Accepted {
     }
 
     /// THE HOST'S REFUSAL (`refuse`, the transport ABI's `RefuseIn`):
+    ///
+    /// * for the WHOLE connection (`stream` `None`): `bytes` are the transport's whole envelope, as
+    ///   the host rendered it (the connector's `unit0_refusal`), written as they are; hyper is let
+    ///   go and the connection is over;
+    /// * for a stream whose answer head has not gone, with a neutral `status`: `bytes` are its
+    ///   answer's body, at `status` (`200..=599`, else `500`; a refusal is never a switch, so `101` is `500`, the status v1.5.5's server gave a
+    ///   handler's failure), its length stated, as v1.5.5's server answered a handler's error
+    ///   response;
+    /// * for such a stream with NO neutral status (`0`, "none stated": the connector's
+    ///   `unit0_refusal`, whose bytes are the transport's whole envelope, D3): the host framed the
+    ///   refusal whole, its status line and fields included, so `bytes` are written as they are and
+    ///   the connection is over, as for the whole connection. An HTTP/2 connection carries no such
+    ///   envelope on a stream: refused;
+    /// * for a stream whose head went (`head_sent`): the answer ends failed (HTTP/1.1 closes the
+    ///   connection with no terminating chunk, HTTP/2 resets the stream); `bytes` are not written.
+    ///
+    /// A re-call after `YIELD_MORE` carries no bytes and only drains what the first owed.
+    ///
+    /// # Errors
+    ///
+    /// No request the host was handed on `stream`, or one whose answer already went.
     pub fn refuse(
         &mut self,
         stream: Option<u64>,
@@ -805,10 +830,7 @@ impl Accepted {
             self.owed.extend(bytes);
             return Ok(());
         }
-        let status = u16::try_from(status)
-            .ok()
-            .filter(|s| (100..=599).contains(s))
-            .unwrap_or(500);
+        let status = final_status(status, false).map_or(500, |s| s.as_u16());
         let framed = frame_refusal(
             a,
             RefusalCopy {
@@ -867,10 +889,7 @@ impl Accepted {
             return Err(Failure(format!("emit: no request on stream {stream}")));
         };
         if a.respond.is_some() {
-            let code = u16::try_from(status)
-                .ok()
-                .filter(|s| (100..=599).contains(s))
-                .and_then(|s| http::StatusCode::from_u16(s).ok())
+            let code = final_status(status, a.upgrade.is_some())
                 .ok_or_else(|| Failure(format!("emit: {status} is not an HTTP status")))?;
             let mut b = http::Response::builder().status(code);
 
@@ -1314,7 +1333,7 @@ fn serve(
     let (parts, body) = req.into_parts();
     let bodiless = body.is_end_stream();
     let (tx, rx) = futures_channel::oneshot::channel();
-    let stream = {
+    {
         let mut s = sh.lock().unwrap_or_else(PoisonError::into_inner);
         let id = s.next;
         s.next += 1;
@@ -1349,9 +1368,7 @@ fn serve(
         if !asks_upgrade || !bodiless {
             s.no_hand_over = true;
         }
-        id
-    };
-    let _ = stream;
+    }
     Box::pin(async move {
         rx.await.map_err(|_| {
             std::io::Error::new(
@@ -1460,6 +1477,9 @@ fn hold_body(a: &mut Answer, limit: u64, bounds: &Bounds<'_>, cx: &mut Context<'
 }
 
 /// The request as the auth handle reads it (`HeadView`): the method, the target's path, the
+/// authority (the target's own, else the `host` line, as HTTP/1.1 states it), the query, and the
+/// head's field lines (names lowercased; a repeated name's lines grouped at its first position,
+/// not in arrival order). Borrowed from `parts` and `fields`.
 fn head_view<'a>(
     parts: &'a http::request::Parts,
     fields: &'a [(&'a str, &'a [u8])],
@@ -1485,7 +1505,8 @@ fn head_view<'a>(
     }
 }
 
-/// The head's field lines as `(name, value)`, in order.
+/// The head's field lines as `(name, value)`: names lowercased, a repeated name's lines grouped at
+/// its first position (the header map's order), not in arrival order.
 fn field_lines(parts: &http::request::Parts) -> Vec<(&str, &[u8])> {
     parts
         .headers
@@ -1762,6 +1783,22 @@ impl Accepted {
             };
             match a.gate {
                 Gate::Arrived => {
+                    // A `host` field that is not text names no authority (RFC 9112 3.2 refuses
+                    // it): the request is left unanswered rather than shown as one with none.
+                    if parts
+                        .headers
+                        .get_all(http::header::HOST)
+                        .iter()
+                        .any(|h| h.to_str().is_err())
+                    {
+                        return fail(a, did);
+                    }
+                    // An absolute-form target's userinfo is a credential riding the URL (RFC 9110
+                    // 4.2.4: an error): never shown to the auth nor sent up, as the dialled side
+                    // refuses it too.
+                    if super::carries_userinfo(&parts.uri) {
+                        return fail(a, did);
+                    }
                     let fields = field_lines(parts);
                     let to = match guest::matched(
                         lines,
@@ -2001,6 +2038,15 @@ fn offer_position(protocol: &[u8]) -> u32 {
         at += 1 + n;
     }
     0
+}
+
+/// The status a final answer head can carry: 200 to 599, or 101 on a request that asked to
+/// upgrade. hyper's HTTP/1 server will not send any other informational status as the final
+/// response (it rewrites it to a 500 and errors the connection), so none is accepted here.
+fn final_status(status: u32, upgrade_asked: bool) -> Option<http::StatusCode> {
+    let code = u16::try_from(status).ok()?;
+    let ok = (200..=599).contains(&code) || (code == SWITCHING_PROTOCOLS && upgrade_asked);
+    ok.then(|| http::StatusCode::from_u16(code).ok()).flatten()
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive

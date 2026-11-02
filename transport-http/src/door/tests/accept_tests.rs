@@ -581,6 +581,25 @@ fn an_unanswered_connection_detaches_as_sent_for_the_upgrade_framer_to_answer() 
 }
 
 #[test]
+fn a_detached_connection_as_sent_is_wiped_when_the_framing_goes() {
+    let request: &[u8] = b"GET /ws HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nauthorization: Bearer s3cret-token\r\n\r\n";
+    let mut a = accepted();
+    a.ingest(request, false);
+    run(&mut a, SEC);
+    a.detach().expect("handed over").expect("nothing answered");
+    a.let_leftover_go();
+    let (x, y) = a.leftover.as_ref().expect("still held").as_slices();
+    assert!(
+        x.len() + y.len() >= request.len(),
+        "the leftover is wiped in place, not dropped early"
+    );
+    assert!(
+        x.iter().chain(y).all(|b| *b == 0),
+        "the credential line is still in the leftover"
+    );
+}
+
+#[test]
 fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
     let mut a = accepted();
     a.ingest(GET, false);
@@ -630,7 +649,7 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 /// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
 #[test]
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
-    const HEAD_LIMIT: usize = 8192 + 4096 * 100;
+    const HEAD_LIMIT: usize = crate::door::engine::HEAD_MAX_BYTES;
     let mut a = accepted();
     a.ingest(
         b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n",
@@ -1105,6 +1124,7 @@ fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
 fn a_stalled_or_trickled_request_body_fails_its_stream() {
     let post =
         b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 100\r\n\r\nhello";
+    let post0 = post;
     let failed = |a: &mut Accepted| a.pieces().drain(..).any(|p| p.failed);
     let mut a = accepted();
     a.ingest(post, false);
@@ -1127,6 +1147,183 @@ fn a_stalled_or_trickled_request_body_fails_its_stream() {
         failed(&mut a),
         "a body under 1 KiB/s past 10 s fails its stream"
     );
+
+    // The stall rule alone: a burst that keeps the rate above the floor for the whole stall, then
+    // silence. Only the 30 s inter-frame bound can fail it (64 KiB over 31 s is 2 KiB/s).
+    let len = 100_000;
+    let post =
+        format!("POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {len}\r\n\r\n");
+    let mut a = accepted();
+    let mut burst = post.into_bytes();
+    burst.extend(vec![b'z'; 64 * 1024]);
+    a.ingest(&burst, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    run(&mut a, SEC + 30 * SEC - 1);
+    assert!(
+        !failed(&mut a),
+        "a body silent for just under 30 s is not failed"
+    );
+    run(&mut a, SEC + 30 * SEC + 1);
+    assert!(
+        failed(&mut a),
+        "a body silent for 30 s fails its stream while above the throughput floor"
+    );
+
+    // The grace: a body below the floor is not judged inside the first 10 s.
+    let mut a = accepted();
+    a.ingest(post0, false);
+    run(&mut a, SEC);
+    let _ = failed(&mut a);
+    run(&mut a, SEC + 9 * SEC);
+    assert!(
+        !failed(&mut a),
+        "a body under 1 KiB/s is not failed inside the 10 s grace"
+    );
+
+    // Negative control: a body arriving at 2 KiB/s is above the floor and survives past the grace.
+    let len = 5 + 2048 * 15;
+    let post = format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: {len}\r\n\r\nhello"
+    );
+    let mut a = accepted();
+    a.ingest(post.as_bytes(), false);
+    run(&mut a, SEC);
+    assert!(!failed(&mut a));
+    let chunk = vec![b'y'; 2048];
+    for n in 2..=16u64 {
+        a.ingest(&chunk, false);
+        run(&mut a, n * SEC);
+        assert!(
+            !failed(&mut a),
+            "a body above 1 KiB/s survives at {n} s (past the 10 s grace from 11 s)"
+        );
+    }
+    run(&mut a, 60 * SEC);
+    assert!(
+        !failed(&mut a),
+        "a body that completed is not failed by the idle timer"
+    );
+}
+
+/// RED (codeaudit r1-prod0-1): `Reply::drop` and `Accepted::drop` did nothing on a poisoned lock,
+/// so a stream the peer gave up was never marked gone and a held body was freed unzeroised.
+#[test]
+fn a_poisoned_lock_does_not_stop_the_drops() {
+    let q = Arc::new(Mutex::new(ReplyQ::default()));
+    let q2 = q.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = q2.lock().expect("lock");
+        panic!("poison");
+    })
+    .join();
+    assert!(q.is_poisoned());
+    drop(Reply(q.clone(), None));
+    assert!(
+        q.lock().unwrap_or_else(PoisonError::into_inner).gone,
+        "the reply is marked gone"
+    );
+
+    let (a, stream) = one_get();
+    let shared = a.shared.clone();
+    shared
+        .lock()
+        .expect("shared")
+        .streams
+        .get_mut(&stream)
+        .expect("stream")
+        .held = vec![7u8; 16];
+    let s2 = shared.clone();
+    let _ = std::thread::spawn(move || {
+        let _g = s2.lock().expect("lock");
+        panic!("poison");
+    })
+    .join();
+    assert!(shared.is_poisoned());
+    drop(a);
+    let sh = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(
+        sh.streams.values().all(|a| a.held.is_empty()),
+        "the held body is let go"
+    );
+}
+
+/// RED (codeaudit r1-prod0-2): a 1xx status was accepted as the final answer head (hyper then
+/// rewrites it to a 500 and errors the connection); 101 is an answer only to an upgrade request.
+#[test]
+fn an_informational_final_head_is_refused_and_the_stream_kept() {
+    let (mut a, stream) = one_get();
+    for status in [100, 101, 102, 103] {
+        let r = a.emit(stream, b"", true, status);
+        assert!(r.is_err(), "status {status}: refused: {r:?}");
+        assert!(a.answers_head(stream), "status {status}: still answerable");
+    }
+    assert!(a.emit(stream, b"", true, 200).is_ok());
+}
+
+/// r1-prod0-2: a host refusal of status 1xx is answered 500, as any out-of-range one is.
+#[test]
+fn a_refusal_with_an_informational_status_is_answered_500() {
+    let (mut a, stream) = one_get();
+    a.refuse(Some(stream), b"no", 103, false).expect("refused");
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 500 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
+/// RED (codeaudit r2-prod0-4): a refusal is never a switch; a 101 refusal of an upgrade request
+/// was handed to hyper as a 101 that switches the connection.
+#[test]
+fn a_101_refusal_of_an_upgrade_request_is_answered_500() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET /ws HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.refuse(Some(stream), b"no", 101, false).expect("refused");
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 500 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}
+
+/// RED (codeaudit r1-prod0-22): a `host` field present but not text was shown to the auth as an
+/// empty authority, the same as a request with none. RFC 9112 3.2: an invalid host is refused;
+/// the request is never handed in.
+#[test]
+fn a_request_with_a_non_text_host_is_never_handed_in() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET /v1/models HTTP/1.1\r\nhost: \xff\xfe\r\nuser-agent: t\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert!(u.heads.is_empty(), "nothing went up: {u:?}");
+}
+
+/// RED (codeaudit r2-prod0-2): an absolute-form target carrying userinfo (`user:pass@`) was
+/// admitted and the credential bytes went up in the head's authority slot. RFC 9110 4.2.4: treat
+/// it as an error; the request is never handed in and nothing carrying the credential goes up.
+#[test]
+fn an_absolute_form_target_with_userinfo_is_never_handed_in() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET http://alice:s3cret@api.example.com/v1/models HTTP/1.1\r\nhost: api.example.com\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert!(u.heads.is_empty(), "nothing went up: {u:?}");
 }
 
 #[test]

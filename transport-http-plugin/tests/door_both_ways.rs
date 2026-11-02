@@ -34,7 +34,8 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::route::{
-    LineEntry, RouteMatch, METHOD_ANY, METHOD_POST, PATH_EXACT,
+    FieldPredicate, LineEntry, RouteMatch, FIELD_PRESENT, FIELD_VALUE_PREFIX, METHOD_ANY,
+    METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
@@ -1271,38 +1272,73 @@ impl AcceptHost {
         scheme: u8,
         policy: &[u8],
     ) -> (Self, Outcome) {
-        let state = facts;
-        let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
-        scripts().insert(ctx, script);
-        let tables = HostTables {
-            size: size_of::<HostTables>() as u32,
-            _reserved: 0,
-            ctx: HostCtx { handle: ctx },
-            wake: None,
-            conns: std::ptr::null(),
-            services: &*SLOTS,
-            io: std::ptr::null(),
-        };
-        let mut i: OpenIn = z();
-        i.host = &tables;
-        let mut o: OpenOut = z();
-        assert_eq!(
-            // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
-            // and the door instance for this synchronous call; the selected slot and index agree.
-            unsafe {
-                call(
-                    ops.head.open,
-                    std::ptr::null_mut(),
-                    &mut i,
-                    &mut o,
-                    life::OPEN,
-                )
-            },
-            Outcome::Ready
+        Self::open_in(ops, None, lines, script, facts, scheme, policy)
+    }
+
+    /// A second accepted connection on the SAME open instance as `first` (and so the same script),
+    /// under guest list `lines`: the instance's kept lists are met again.
+    fn open_again(first: &Self, lines: Vec<LineEntry>) -> Self {
+        let (host, result) = Self::open_in(
+            first.ops,
+            Some((first.inst, first.ctx)),
+            lines,
+            Script::default(),
+            |_| {},
+            SCHEME_PLAIN,
+            &[],
         );
+        assert_eq!(result, Outcome::Ready, "begin again on the same instance");
+        host
+    }
+
+    /// [`AcceptHost::open_on`] on `existing` (an open instance and its context) when given, else on
+    /// a fresh instance.
+    fn open_in(
+        ops: &'static Ops,
+        existing: Option<(*mut c_void, u64)>,
+        lines: Vec<LineEntry>,
+        script: Script,
+        facts: fn(&mut ConnFacts),
+        scheme: u8,
+        policy: &[u8],
+    ) -> (Self, Outcome) {
+        let state = facts;
+        let (instance, ctx) = match existing {
+            Some(on) => on,
+            None => {
+                let ctx = NEXT_CTX.fetch_add(1, Ordering::SeqCst);
+                scripts().insert(ctx, script);
+                let tables = HostTables {
+                    size: size_of::<HostTables>() as u32,
+                    _reserved: 0,
+                    ctx: HostCtx { handle: ctx },
+                    wake: None,
+                    conns: std::ptr::null(),
+                    services: &*SLOTS,
+                    io: std::ptr::null(),
+                };
+                let mut i: OpenIn = z();
+                i.host = &tables;
+                let mut o: OpenOut = z();
+                assert_eq!(
+                    // SAFETY: the host owns matching ABI frames, nested buffers and table.
+                    unsafe {
+                        call(
+                            ops.head.open,
+                            std::ptr::null_mut(),
+                            &mut i,
+                            &mut o,
+                            life::OPEN,
+                        )
+                    },
+                    Outcome::Ready
+                );
+                (o.instance, ctx)
+            }
+        };
         let mut h = Self {
             ops,
-            inst: o.instance,
+            inst: instance,
             framing: 0,
             wire: vec![0; 64 * 1024],
             frame: vec![0; 64 * 1024],
@@ -2561,7 +2597,11 @@ fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
         "{label}: the auth call pends"
     );
     assert_eq!(h.asked().len(), 1, "{label}");
-    assert_ne!(h.timer(), Outcome::Pending, "{label}: a timer never pends");
+    assert_eq!(
+        h.timer(),
+        Outcome::Ready,
+        "{label}: a timer with no deadline passed is Ready"
+    );
     assert_eq!(
         h.asked().len(),
         1,
@@ -3431,8 +3471,12 @@ fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
     );
     let before = h.got.len();
     let _ = h.ingest(b"world");
+    let late: Vec<u8> = h.got[before..]
+        .iter()
+        .flat_map(|g| g.1.iter().copied())
+        .collect();
     assert!(
-        h.got[before..].iter().all(|g| g.1 != b"world"),
+        !late.windows(5).any(|w| w == b"world"),
         "{label}: h1: no body byte goes up after the answer ended"
     );
     h.close();
@@ -3634,6 +3678,292 @@ fn a_cleartext_offer_changes_nothing_else(label: &str, ops: &'static Ops) {
         "{label}: plain HTTP/1.1, as v1.5.5's listener answered"
     );
     h.close();
+}
+
+/// A second connection on ONE instance whose listener's list differs from the first's in one
+/// member only is framed under ITS list, not the copy the instance kept for the first: a stale
+/// reuse would admit it under the old auth handle or body limit.
+fn a_changed_list_is_not_reused(label: &str, ops: &'static Ops) {
+    // The auth handle alone differs.
+    let first = admitted(
+        ops,
+        vec![line(8, POINT_HEAD, METHOD_POST, "/v1/messages", 0)],
+        Script::default(),
+        POST_HELLO,
+    );
+    let mut other = line(8, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    other.auth = AuthRef { id: 555, mac: 7 };
+    let mut second = AcceptHost::open_again(&first, vec![other]);
+    assert_eq!(second.ingest(POST_HELLO), Outcome::Ready);
+    let asked = first.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 555, .. },
+                Asked::HandIn { auth: 555, .. },
+            ]
+        ),
+        "{label}: the second connection is called under its own handle: {asked:?}"
+    );
+    first.close();
+
+    // The body limit alone differs: within it, then over it.
+    let first = admitted(
+        ops,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 16)],
+        Script::default(),
+        POST_HELLO,
+    );
+    assert_eq!(first.heads_up(), 1, "{label}: within its limit it goes up");
+    let mut second = AcceptHost::open_again(
+        &first,
+        vec![line(8, POINT_HEAD_BODY, METHOD_POST, "/v1/messages", 4)],
+    );
+    assert_eq!(second.ingest(POST_HELLO), Outcome::Ready);
+    assert_eq!(
+        second.heads_up(),
+        0,
+        "{label}: over the second list's limit, nothing goes up"
+    );
+    let asked = first.asked();
+    assert!(
+        matches!(
+            asked.last(),
+            Some(Asked::Refuse {
+                cause: REFUSE_OVER_GATE,
+                line: 8,
+                ..
+            })
+        ),
+        "{label}: refused at the second list's gate: {asked:?}"
+    );
+    first.close();
+
+    // Every other compared member, one at a time: the first connection's list is kept by the
+    // instance, the second's differs in that member only, and `POST /v1/messages` on the second is
+    // framed under the SECOND list (what a stale reuse of the first's copy would not do).
+    let no_route = |asked: &[Asked]| {
+        matches!(
+            asked,
+            [Asked::Refuse {
+                cause: REFUSE_NO_ROUTE,
+                ..
+            }]
+        )
+    };
+    let post = |id: u32| line(id, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    let mut other_path = post(8);
+    other_path.route.path = s("/v1/other");
+    let mut other_methods = post(8);
+    other_methods.route.methods = METHOD_GET;
+    let mut base_form = post(8);
+    base_form.route.path_form = PATH_PREFIX;
+    base_form.route.path = s("/v1");
+    let mut other_form = post(8);
+    other_form.route.path = s("/v1");
+    let mut base_points = post(8);
+    base_points.points = 0;
+    // Line 9 with line 8's auth handle: only the id differs.
+    let mut renumbered = post(9);
+    renumbered.auth = post(8).auth;
+    let mut late = post(9);
+    late.route.path = s("/v1/other");
+    type Case = (
+        &'static str,
+        Vec<LineEntry>,
+        Vec<LineEntry>,
+        Box<dyn Fn(&[Asked]) -> bool>,
+    );
+    let cases: Vec<Case> = vec![
+        ("path", vec![post(8)], vec![other_path], Box::new(no_route)),
+        (
+            "methods",
+            vec![post(8)],
+            vec![other_methods],
+            Box::new(|a: &[Asked]| {
+                matches!(
+                    a,
+                    [Asked::Refuse {
+                        cause: REFUSE_METHOD_MISS,
+                        ..
+                    }]
+                )
+            }),
+        ),
+        (
+            "path form",
+            vec![base_form],
+            vec![other_form],
+            Box::new(no_route),
+        ),
+        (
+            "line id",
+            vec![post(8)],
+            vec![renumbered],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { .. }, Asked::HandIn { line: 9, .. }])
+            }),
+        ),
+        (
+            "points",
+            vec![base_points],
+            vec![post(8)],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { auth: 108, .. }, Asked::HandIn { .. }])
+            }),
+        ),
+        (
+            "list length",
+            vec![late],
+            vec![late, post(9)],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { .. }, Asked::HandIn { line: 9, .. }])
+            }),
+        ),
+    ];
+    // Predicate members, observed through whether the request matches. `rung` is not pinned here:
+    // the door matches in table order and only carries the rung through, so no request can tell it.
+    let pred = |id: u32, op: u32, name: &'static str, value: &'static str| {
+        let preds: &'static [FieldPredicate] = Box::leak(Box::new([FieldPredicate {
+            op,
+            _reserved: 0,
+            name: s(name),
+            value: s(value),
+        }]));
+        let mut l = post(id);
+        l.route.fields = preds.as_ptr();
+        l.route.fields_len = preds.len();
+        l
+    };
+    let tiered_pro = tiered_post("pro-1");
+    let extra = [
+        // The base requires `x-tier` to start `pro`, the alt has no predicate: a stale copy
+        // would refuse a non-matching tier.
+        (
+            "predicate count",
+            vec![tiered_line(8, "pro")],
+            vec![post(8)],
+            tiered_post("free"),
+            true,
+        ),
+        (
+            "predicate count (reverse)",
+            vec![post(8)],
+            vec![tiered_line(8, "pro")],
+            tiered_post("free"),
+            false,
+        ),
+        // Same value, other header name: the request carries `x-tier` only.
+        (
+            "predicate name",
+            vec![tiered_line(8, "pro")],
+            vec![pred(8, FIELD_VALUE_PREFIX, "x-other", "pro")],
+            tiered_pro.clone(),
+            false,
+        ),
+        // Same name: prefix needs `zzz`, presence needs only the header.
+        (
+            "predicate op",
+            vec![pred(8, FIELD_VALUE_PREFIX, "x-tier", "zzz")],
+            vec![pred(8, FIELD_PRESENT, "x-tier", "zzz")],
+            tiered_pro.clone(),
+            true,
+        ),
+    ];
+    for (member, base, alt, req, alt_matches) in extra {
+        let first = AcceptHost::open_with(ops, base, Script::default());
+        let mut second = AcceptHost::open_again(&first, alt);
+        let _ = second.ingest(&req);
+        let asked = first.asked();
+        let ok = if alt_matches {
+            matches!(
+                &asked[..],
+                [Asked::Auth { .. }, Asked::HandIn { line: 8, .. }]
+            )
+        } else {
+            matches!(
+                &asked[..],
+                [Asked::Refuse {
+                    cause: REFUSE_NO_ROUTE,
+                    ..
+                }]
+            )
+        };
+        assert!(
+            ok,
+            "{label}: a list differing in its {member} only is framed under its own list: {asked:?}"
+        );
+        first.close();
+    }
+
+    for (member, base, alt, expect) in cases {
+        let first = AcceptHost::open_with(ops, base, Script::default());
+        let mut second = AcceptHost::open_again(&first, alt);
+        let _ = second.ingest(POST_HELLO);
+        let asked = first.asked();
+        assert!(
+            expect(&asked),
+            "{label}: a list differing in its {member} only is framed under its own list: {asked:?}"
+        );
+        first.close();
+    }
+}
+
+/// [`line`] for `POST /v1/messages` that also needs the header `x-tier` to start with `prefix`.
+fn tiered_line(id: u32, prefix: &'static str) -> LineEntry {
+    let preds: &'static [FieldPredicate] = Box::leak(Box::new([FieldPredicate {
+        op: FIELD_VALUE_PREFIX,
+        _reserved: 0,
+        name: s("x-tier"),
+        value: s(prefix),
+    }]));
+    let mut l = line(id, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    l.route.fields = preds.as_ptr();
+    l.route.fields_len = preds.len();
+    l
+}
+
+/// `POST_HELLO` carrying `x-tier: tier`.
+fn tiered_post(tier: &str) -> Vec<u8> {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\nx-tier: {tier}\r\ncontent-length: 5\r\n\r\nhello"
+    )
+    .into_bytes()
+}
+
+/// A second connection on ONE instance whose list is identical to the first's is admitted under the
+/// same handle (the kept copy serves it), and one whose predicate differs in its value alone is
+/// matched under ITS predicate: a stale reuse would refuse it for want of a route.
+fn an_identical_list_is_reused_and_a_field_change_is_not(label: &str, ops: &'static Ops) {
+    let first = admitted(
+        ops,
+        vec![tiered_line(8, "a-")],
+        Script::default(),
+        &tiered_post("a-1"),
+    );
+    let mut same = AcceptHost::open_again(&first, vec![tiered_line(8, "a-")]);
+    assert_eq!(same.ingest(&tiered_post("a-2")), Outcome::Ready);
+    let mut other = AcceptHost::open_again(&first, vec![tiered_line(8, "b-")]);
+    assert_eq!(other.ingest(&tiered_post("b-1")), Outcome::Ready);
+    let asked = first.asked();
+    assert!(
+        matches!(
+            &asked[..],
+            [
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+                Asked::Auth { auth: 108, .. },
+                Asked::HandIn { auth: 108, .. },
+            ]
+        ),
+        "{label}: each connection matched under its own list: {asked:?}"
+    );
+    first.close();
 }
 
 /// Run `cell` through the linked door and the dropped-in one.
@@ -4103,6 +4433,16 @@ fn a_path_no_line_admits_the_method_of_is_the_kernels_method_miss() {
 #[test]
 fn a_head_auth_stop_is_the_kernels_refusal_with_the_unit() {
     both(head_stop);
+}
+
+#[test]
+fn a_changed_guest_list_on_one_instance_is_not_served_from_the_kept_copy() {
+    both(a_changed_list_is_not_reused);
+}
+
+#[test]
+fn an_identical_guest_list_is_reused_and_a_changed_predicate_is_not() {
+    both(an_identical_list_is_reused_and_a_field_change_is_not);
 }
 
 #[test]

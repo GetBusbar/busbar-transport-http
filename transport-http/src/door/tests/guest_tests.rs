@@ -3,10 +3,22 @@
 
 use super::*;
 use busbar_contract::abi::transport::route::{
-    FIELD_PRESENT, METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
+    FIELD_PRESENT, FIELD_VALUE_PREFIX, METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
 };
 
 fn line(id: u32, methods: u32, form: u32, path: &str, fields: &[(u32, &str)]) -> Line {
+    let valued: Vec<(u32, &str, &[u8])> = fields.iter().map(|(op, n)| (*op, *n, &[][..])).collect();
+    valued_line(id, methods, form, path, &valued)
+}
+
+/// [`line`] whose predicates carry a value (the prefix of a `FIELD_VALUE_PREFIX`).
+fn valued_line(
+    id: u32,
+    methods: u32,
+    form: u32,
+    path: &str,
+    fields: &[(u32, &str, &[u8])],
+) -> Line {
     Line {
         line: id,
         points: 0,
@@ -17,7 +29,7 @@ fn line(id: u32, methods: u32, form: u32, path: &str, fields: &[(u32, &str)]) ->
         path: path.to_owned(),
         fields: fields
             .iter()
-            .map(|(op, n)| (*op, (*n).to_owned(), Vec::new()))
+            .map(|(op, n, v)| (*op, (*n).to_owned(), v.to_vec()))
             .collect(),
         rung: 0,
     }
@@ -58,6 +70,35 @@ fn the_guest_list_matches_in_order() {
     assert_eq!(matched(&[], "GET", "/", &[]), Matched::NoRoute);
 }
 
+/// A line whose predicate carries a value prefix holds only for a request whose field starts with
+/// it; one that lacks it falls through to the later line.
+#[test]
+fn a_value_prefix_line_needs_its_prefix() {
+    let lines = [
+        valued_line(
+            1,
+            METHOD_POST,
+            PATH_EXACT,
+            "/v1/messages",
+            &[(FIELD_VALUE_PREFIX, "authorization", b"Bearer ")],
+        ),
+        line(2, METHOD_POST, PATH_EXACT, "/v1/messages", &[]),
+    ];
+    let with = |v: &'static [u8]| -> [(&'static str, &'static [u8]); 1] { [("Authorization", v)] };
+    assert_eq!(
+        matched(&lines, "POST", "/v1/messages", &with(b"Bearer x")),
+        Matched::Line(0)
+    );
+    assert_eq!(
+        matched(&lines, "POST", "/v1/messages", &with(b"Basic x")),
+        Matched::Line(1)
+    );
+    assert_eq!(
+        matched(&lines[..1], "POST", "/v1/messages", &with(b"Basic x")),
+        Matched::NoRoute
+    );
+}
+
 /// A query key is stripped case-sensitively, as spelled, with or without a value; a field name
 #[test]
 fn the_strip_reads_each_place_by_its_own_rule() {
@@ -86,9 +127,64 @@ fn a_query_key_is_compared_as_it_decodes() {
         stripped_query("a=1&%6Bey=s&k%65y&Key=k&ke+y=x&%zzkey=y", &names).as_deref(),
         Some("a=1&Key=k&ke+y=x&%zzkey=y")
     );
+    // An escape at the very tail of a key decodes; a truncated one stays as written, with no panic.
+    assert_eq!(
+        stripped_query("a=1&ke%79=s&ke%79", &names).as_deref(),
+        Some("a=1")
+    );
+    assert_eq!(stripped_query("%6", &names).as_deref(), Some("%6"));
+    assert_eq!(stripped_query("key%", &names).as_deref(), Some("key%"));
+    assert_eq!(stripped_query("ke%7", &names).as_deref(), Some("ke%7"));
     let spaced = vec![("a b".to_owned(), Place::Query)];
     assert_eq!(
         stripped_query("a+b=1&a%20b=2&c=3", &spaced).as_deref(),
         Some("c=3")
     );
+}
+
+/// The kept lists: a list `same` recognises is the kept `Arc` and `copy` never runs; a new one is
+/// copied and kept; the oldest of `LISTS_KEPT` goes first, and a reused one counts as just used.
+#[test]
+fn the_kept_lists_are_reused_and_the_oldest_evicted() {
+    let list = |id: u32| vec![line(id, METHOD_GET, PATH_EXACT, "/", &[])];
+    let by_id = |id: u32| move |kept: &[Line]| kept.first().is_some_and(|l| l.line == id);
+    let lists = Lists::default();
+
+    let first = lists.shared(by_id(0), || Some(list(0))).expect("copied");
+    let again = lists
+        .shared(by_id(0), || panic!("a kept list is not copied again"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &again), "the kept copy is shared");
+
+    // A changed list is copied.
+    let changed = lists.shared(by_id(1), || Some(list(1))).expect("copied");
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert!(
+        lists.shared(by_id(2), || None).is_none(),
+        "copy answered none"
+    );
+
+    // Fill to the bound; list 0 is used again so list 1 is now the oldest.
+    for id in 2..LISTS_KEPT as u32 {
+        lists.shared(by_id(id), || Some(list(id))).expect("copied");
+    }
+    let reused = lists
+        .shared(by_id(0), || panic!("still kept"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &reused));
+    lists
+        .shared(by_id(100), || Some(list(100)))
+        .expect("copied");
+    let mut copies = 0;
+    lists
+        .shared(by_id(1), || {
+            copies += 1;
+            Some(list(1))
+        })
+        .expect("recopied");
+    assert_eq!(copies, 1, "the oldest was evicted");
+    let still = lists
+        .shared(by_id(0), || panic!("the reused list survived"))
+        .expect("kept");
+    assert!(Arc::ptr_eq(&first, &still));
 }

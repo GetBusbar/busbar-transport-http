@@ -1076,7 +1076,11 @@ fn take_detached(
     rest: &mut std::collections::VecDeque<u8>,
     n: usize,
 ) -> zeroize::Zeroizing<Vec<u8>> {
-    let taken = zeroize::Zeroizing::new(rest.drain(..n).collect::<Vec<_>>());
+    let taken = zeroize::Zeroizing::new(rest.range(..n).copied().collect::<Vec<_>>());
+    for byte in rest.range_mut(..n) {
+        zeroize::Zeroize::zeroize(byte);
+    }
+    rest.drain(..n);
     #[cfg(test)]
     crate::wipe_probe::watch("detach taken", &taken);
     taken
@@ -1170,8 +1174,8 @@ impl SafeSlot for Encode {
     }
 }
 
-/// A framer op [`with`] runs: its name, which every failure text leads with, and its static
-/// no-instance text (with no instance there is nowhere to keep an owned one).
+/// A framer op [`with`] runs: its name, which only the door's own refusals (no open instance, no
+/// such framing) lead with, and its static no-instance text (with no instance there is nowhere to keep an owned one).
 #[derive(Clone, Copy)]
 struct FramerOp {
     /// The op's name.
@@ -1208,7 +1212,11 @@ framer_op!(
     TIMER, "timer"
 );
 
-/// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
+/// Run `f` on framing `token`, then drive it and fill the sink; only the door's own refusals
+/// (no open instance, no such framing) lead with the op's name. A framing's failure is passed
+/// through unchanged, as [`step`] documents. `f` is told whether the op was re-entered with
+/// `FLAG_RESUME` (it answered PENDING on a parked `auth.call`): such an op took its input whole the
+/// first time and takes none again, but what it answers is read afresh.
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,

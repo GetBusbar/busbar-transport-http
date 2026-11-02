@@ -11,6 +11,8 @@ pub(crate) struct Head<'a> {
     pub(crate) path: Option<&'a str>,
     /// The header block, its request line included.
     block: &'a [u8],
+    /// Whether the request line named `HTTP/1.0`.
+    http10: bool,
 }
 
 /// How a request's body is framed, as its head declares it.
@@ -48,6 +50,14 @@ impl<'a> Head<'a> {
     pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
         const UNPARSABLE: &str = "unparsable request head";
         let block = memchr::memmem::find(bytes, b"\r\n\r\n").map_or(bytes, |p| &bytes[..p + 2]);
+        // `lines` drops empty elements, so a blank line partway through the block would otherwise
+        // be skipped and the fields after it read as head fields. The block ends in its last
+        // field's CRLF, so any empty line inside it is a malformed head (RFC 9112 2.2).
+        if memchr::memmem::find(block, b"\n\n").is_some()
+            || memchr::memmem::find(block, b"\n\r\n").is_some()
+        {
+            return Err(UNPARSABLE);
+        }
         let mut all = lines(block);
         let first = std::str::from_utf8(all.next().ok_or(UNPARSABLE)?).map_err(|_| UNPARSABLE)?;
 
@@ -77,6 +87,7 @@ impl<'a> Head<'a> {
             method: a,
             path: (!b.is_empty()).then_some(b),
             block,
+            http10: c == "HTTP/1.0",
         })
     }
 
@@ -85,12 +96,23 @@ impl<'a> Head<'a> {
         lines(self.block).skip(1).filter_map(split_field)
     }
 
-    /// Every member of the list field `name`, across every line carrying it, each trimmed (`None`
+    /// Every member of the list field `name`, across every line carrying it, each trimmed of SP and HTAB only, as `split_field` does (`None`
+    /// for a member that is not text, which no coding or length matches).
+    ///
+    /// RFC 9110 5.3 makes this the definition of a repeated field: a sender may split a
+    /// comma-separated list across several lines, and the meaning is the one line those values
+    /// would have made. Reading only the first line reads a different field than the one that was
+    /// sent — and for the framing fields that is a body length: `Transfer-Encoding: chunked`
+    /// followed by `Transfer-Encoding: gzip` is the list `chunked, gzip`.
     fn members(&self, name: &'static str) -> impl Iterator<Item = Option<&'a str>> {
         self.fields()
             .filter(move |(k, _)| k.eq_ignore_ascii_case(name.as_bytes()))
             .flat_map(|(_, v)| v.split(|b| *b == b','))
-            .map(|m| std::str::from_utf8(m).ok().map(str::trim))
+            .map(|m| {
+                std::str::from_utf8(m)
+                    .ok()
+                    .map(|m| m.trim_matches([' ', '\t']))
+            })
     }
 
     /// How the body is framed.
@@ -101,6 +123,10 @@ impl<'a> Head<'a> {
             chunked += usize::from(coding.is_some_and(|c| c.eq_ignore_ascii_case("chunked")));
         }
         if codings != 0 {
+            // RFC 9112 6.1: a Transfer-Encoding on an HTTP/1.0 request is faulty framing.
+            if self.http10 {
+                return Err("transfer-encoding on HTTP/1.0");
+            }
             if codings != 1 || chunked != 1 {
                 return Err("unsupported transfer coding");
             }

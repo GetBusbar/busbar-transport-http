@@ -63,6 +63,18 @@ fn a_size_line_that_is_not_hexadecimal_is_a_framing_error() {
     assert_eq!(decoder.feed(b"zz\r\n"), Err(ChunkedMalformed));
 }
 
+/// A size too large for `usize` is a framing error, never read as zero (the terminal chunk).
+#[test]
+fn a_chunk_size_that_overflows_usize_is_a_framing_error() {
+    for line in [
+        &b"10000000000000000\r\n"[..],
+        b"ffffffffffffffffffffffffffffffff\r\n",
+    ] {
+        let mut decoder = ChunkedDecoder::default();
+        assert_eq!(decoder.feed(line), Err(ChunkedMalformed), "{line:?}");
+    }
+}
+
 /// Chunk sizes follow RFC 9112's `1*HEXDIG` grammar without a sign or surrounding whitespace.
 #[test]
 fn a_signed_or_padded_chunk_size_is_a_framing_error() {
@@ -106,7 +118,10 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
 fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert!(Head::parse(b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n").is_err());
     assert!(Head::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n").is_err());
-
+    // A line with no colon, and a folded continuation line, are refused too.
+    assert!(Head::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding chunked\r\n\r\n").is_err());
+    assert!(Head::parse(b"GET / HTTP/1.1\r\nA: b\r\n folded: x\r\n\r\n").is_err());
+    // The legal shape still parses, value whitespace and all.
     let ok = Head::parse(b"GET / HTTP/1.1\r\nContent-Length:  5 \r\n\r\n").unwrap();
     assert_eq!(ok.fields().next().unwrap().1, b"5");
 }
@@ -207,5 +222,45 @@ fn a_cr_that_does_not_end_a_line_is_malformed() {
     }
     let mut decoder = ChunkedDecoder::default();
     decoder.feed(b"5\nhello\n0\n\n").expect("bare LFs");
+    assert!(decoder.is_done(), "bare LFs end the message");
     assert_eq!(decoder.take().as_slice(), b"hello");
+}
+
+#[test]
+fn a_content_length_with_unicode_whitespace_is_refused() {
+    // NBSP is obs-text, not OWS (RFC 9112 5.1): it is not trimmed, so the length is not digits.
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nContent-Length: 5\u{a0}\r\n\r\n"),
+        Err("invalid content-length")
+    );
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nContent-Length: 5 \t\r\n\r\n"),
+        Ok(BodyFraming::Length(5))
+    );
+}
+
+#[test]
+fn a_transfer_encoding_on_http_1_0_is_refused() {
+    assert_eq!(
+        framing("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Err("transfer-encoding on HTTP/1.0")
+    );
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Ok(BodyFraming::Chunked)
+    );
+}
+
+#[test]
+fn a_blank_line_inside_the_header_block_is_refused() {
+    for head in [
+        "POST / HTTP/1.1\r\nA: b\r\n\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST / HTTP/1.1\r\nA: b\n\nTransfer-Encoding: chunked\r\n\r\n",
+    ] {
+        assert_eq!(
+            Head::parse(head.as_bytes()).err(),
+            Some("unparsable request head"),
+            "{head:?}"
+        );
+    }
 }

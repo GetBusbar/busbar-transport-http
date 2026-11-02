@@ -12,6 +12,21 @@ pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Opti
 }
 
 /// Parse an RFC 9110 `Retry-After` header VALUE against `now` (a Unix timestamp in seconds). Both
+/// normative forms are accepted: `delay-seconds` (an integer, which ignores `now`) and an
+/// HTTP-date in any of the three forms RFC 9110 5.6.7 requires a recipient to accept (IMF-fixdate,
+/// obsolete RFC 850, asctime), converted to the seconds remaining until that instant and floored
+/// at 0 when it is already in the past. A date with an out-of-range field is absent.
+///
+/// The date is read by `httpdate`, the parser 1.5.5's breaker used. The arithmetic after it is the
+/// breaker's own classifier's, and it is duplicated here rather than shared: this crate sits on the
+/// transport axis and may not name a unit crate, and the unit crate's own dependency policy names
+/// the capability crate as the only workspace crate it may see. Neither can reach the other, so
+/// there is no shared home for it. The forms accepted and the flooring rule are pinned by the tests in
+/// `src/tests/mod.rs` against the same values.
+///
+/// (The capability crate is deliberately not spelled here. `tests/no_plane_names.rs` refuses that
+/// name anywhere in this crate's source, and a rule with an exception for prose is a rule with an
+/// exception — the sentence says the same thing without one.)
 pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
     let s = value.trim();
 
@@ -62,10 +77,11 @@ pub(crate) fn complete_message(
     let (head_end, framing) = match cache.head {
         Some(head) => head,
         None => {
-            let found = find_header_end_from(buffered, cache.searched);
+            let from = cache.searched.min(buffered.len());
+            let found = find_header_end_from(buffered, from);
             #[cfg(test)]
             {
-                cache.scanned += buffered.len() - cache.searched.min(buffered.len());
+                cache.scanned += buffered.len() - from;
             }
             cache.searched = buffered.len();
             let Some(header_end) = found else {
@@ -163,7 +179,7 @@ pub(crate) struct EgressHead {
 }
 
 /// The offset just past the blank line that ends a header block, searching from `start`.
-fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start.min(buf.len());
     loop {
         let at = i + memchr::memchr(b'\n', &buf[i..])?;
