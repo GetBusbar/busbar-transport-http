@@ -802,12 +802,19 @@ fn dropped() -> (&'static Ops, &'static libloading::Library) {
         .and_then(|d| d.parent())
         .expect("target/<profile>");
     let file = busbar_plugin_loader::plugin_library_filename("busbar_transport_http_plugin");
-    let path = [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the dropped-in image ({file}) is not built"));
+    let path = match std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        Some(path) => {
+            let path = std::path::PathBuf::from(path);
+            assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+            path
+        }
+        None => profile.join(file),
+    };
+    assert!(
+        path.is_file(),
+        "build this product's actual cdylib before testing: {}",
+        path.display()
+    );
     // SAFETY: our own cdylib, built by this `cargo test`.
     let lib: &'static libloading::Library = Box::leak(Box::new(
         unsafe { libloading::Library::new(path) }.expect("load"),
