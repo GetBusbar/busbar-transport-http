@@ -107,10 +107,11 @@ pub(crate) fn complete_message(
         None => {
             // Resumed where the last call stopped: the bytes before it hold no terminator, and the
             // search looks back from each line feed it finds, so nothing is missed.
-            let found = find_header_end_from(buffered, cache.searched);
+            let from = cache.searched.min(buffered.len());
+            let found = find_header_end_from(buffered, from);
             #[cfg(test)]
             {
-                cache.scanned += buffered.len() - cache.searched.min(buffered.len());
+                cache.scanned += buffered.len() - from;
             }
             cache.searched = buffered.len();
             let Some(header_end) = found else {
@@ -224,7 +225,7 @@ pub(crate) struct EgressHead {
 /// the terminator's last byte is one, so no candidate is skipped. `start` may sit anywhere in the
 /// buffer: the match looks BACKWARD from the line feed it found, so a caller resuming a scan never
 /// has to have kept the three bytes before it in view.
-fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start.min(buf.len());
     loop {
         let at = i + memchr::memchr(b'\n', &buf[i..])?;

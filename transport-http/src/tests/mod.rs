@@ -305,7 +305,9 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
         ("x-note", b"ok\0more".as_slice()),
         ("bad\r\nname", b"ok".as_slice()),
         ("method", b"GET / HTTP/1.1\r\nHost: elsewhere".as_slice()),
-        ("path", b"/a\r\nHost: elsewhere".as_slice()),
+        ("path", b"/a\rb".as_slice()),
+        ("path", b"/a\0b".as_slice()),
+        ("path", b"/a\nb".as_slice()),
     ];
     for field in poisoned {
         let err = crate::transport::render_envelope(std::slice::from_ref(field), b"")
@@ -469,6 +471,15 @@ fn the_egress_header_search_resumes_where_it_stopped() {
     );
 }
 
+/// `find_header_end_from` honours `start`: a terminator wholly before it is not found again, so a
+/// search that ignored `start` (rescanning from 0) cannot pass.
+#[test]
+fn the_header_end_search_honours_its_start() {
+    use crate::message::find_header_end_from;
+    assert_eq!(find_header_end_from(b"\r\n\r\nab", 0), Some(4));
+    assert_eq!(find_header_end_from(b"\r\n\r\nab", 4), None);
+}
+
 /// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a list
 /// whose members disagree, two lines that disagree, a sign, non-digits. Each is refused, never read
 /// as a body-less message.
@@ -491,6 +502,31 @@ fn a_content_length_that_names_no_single_length_is_refused() {
             );
         }
     }
+}
+
+/// A well-formed `Content-Length` above the body cap is refused (`declared body over the body
+/// cap`) whether or not its bytes have arrived; at the cap it is accepted.
+#[test]
+fn a_declared_length_over_the_body_cap_is_refused() {
+    let head = b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n";
+    let whole = [&head[..], b"hello"].concat();
+    for msg in [&head[..], &whole[..]] {
+        let mut cache = EgressHead::default();
+        assert_eq!(
+            complete_message(msg, &mut cache, 4, usize::MAX).unwrap_err(),
+            "declared body over the body cap",
+            "{} bytes buffered",
+            msg.len()
+        );
+    }
+    let mut cache = EgressHead::default();
+    assert!(complete_message(head, &mut cache, 5, usize::MAX)
+        .unwrap()
+        .is_none());
+    let mut cache = EgressHead::default();
+    assert!(complete_message(&whole, &mut cache, 5, usize::MAX)
+        .unwrap()
+        .is_some());
 }
 
 /// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame; the
