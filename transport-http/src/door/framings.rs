@@ -16,16 +16,16 @@ const SEGMENTS: usize = 16;
 /// One framing the instance holds: a dialled connection's client, or an accepted connection's
 pub(super) enum Held {
     /// A dialled connection (`SIDE_DIAL`).
-    Dial(Framing),
+    Dial(Box<Framing>),
     /// An accepted connection (`SIDE_ACCEPT`).
-    Accept(Accepted),
+    Accept(Box<Accepted>),
 }
 
 /// A slot's state: the generation of the token that last named it, and the framing it holds.
 #[derive(Default)]
 pub(super) struct SlotState {
     generation: u32,
-    held: Option<Box<Held>>,
+    held: Option<Held>,
 }
 
 impl SlotState {
@@ -104,11 +104,11 @@ impl Framings {
     /// Hold the dialled `framing`, answering its token, or `None` when every slot is in use.
     #[cfg(test)]
     pub(super) fn insert(&self, framing: Framing) -> Option<u64> {
-        self.insert_held(Held::Dial(framing))
+        self.insert_with(|| Held::Dial(Box::new(framing)))
     }
 
-    /// Hold `held`, answering its token, or `None` when every slot is in use.
-    pub(super) fn insert_held(&self, held: Held) -> Option<u64> {
+    /// Construct the owned framing only after its slot and generation are reserved.
+    pub(super) fn insert_with(&self, make: impl FnOnce() -> Held) -> Option<u64> {
         let index = {
             let mut free = self
                 .free
@@ -134,7 +134,7 @@ impl Framings {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.generation = slot.generation.checked_add(1)?;
-        slot.held = Some(Box::new(held));
+        slot.held = Some(make());
         Some(token(index, slot.generation))
     }
 

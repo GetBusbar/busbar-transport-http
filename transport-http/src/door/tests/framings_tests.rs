@@ -140,3 +140,124 @@ fn an_exhausted_slot_never_mints_a_generation_zero_alias() {
     );
     assert_ne!(reused, next);
 }
+
+struct CaptureDrop<'a> {
+    table: &'a Framings,
+    index: Option<u32>,
+    dropped: &'a std::cell::Cell<bool>,
+}
+
+impl Drop for CaptureDrop<'_> {
+    fn drop(&mut self) {
+        assert!(
+            self.table.free.try_lock().is_ok(),
+            "reservation lock is released before prepared-state cleanup"
+        );
+        if let Some(index) = self.index {
+            let (segment, at) = place(index as usize);
+            assert!(
+                self.table.segments[segment].get().unwrap()[at]
+                    .0
+                    .try_lock()
+                    .is_ok(),
+                "slot lock is released before prepared-state cleanup"
+            );
+        }
+        self.dropped.set(true);
+    }
+}
+
+#[test]
+fn a_full_table_never_calls_the_boxing_factory_and_drops_its_capture_unlocked() {
+    let table = Framings::default();
+    table.free.lock().unwrap().next = (BASE * ((1 << SEGMENTS) - 1)) as u32;
+    let dropped = std::cell::Cell::new(false);
+    let capture = CaptureDrop {
+        table: &table,
+        index: None,
+        dropped: &dropped,
+    };
+    let prepared = framing();
+    assert!(table
+        .insert_with(move || {
+            let _capture = capture;
+            drop(prepared);
+            panic!("a full table must not invoke the owning-allocation factory")
+        })
+        .is_none());
+    assert!(
+        dropped.get(),
+        "the rejected factory releases its prepared state"
+    );
+    assert!(
+        table.segments.iter().all(|segment| segment.get().is_none()),
+        "NoRoom creates no segment"
+    );
+}
+
+#[test]
+fn a_generation_failure_never_calls_the_boxing_factory_and_cleans_up_after_unlock() {
+    let table = Framings::default();
+    let original = table.insert(framing()).unwrap();
+    let (index, _) = untoken(original).unwrap();
+    table.remove(original).unwrap();
+    let (segment, at) = place(index as usize);
+    table.segments[segment].get().unwrap()[at]
+        .0
+        .lock()
+        .unwrap()
+        .generation = u32::MAX;
+    let dropped = std::cell::Cell::new(false);
+    let capture = CaptureDrop {
+        table: &table,
+        index: Some(index),
+        dropped: &dropped,
+    };
+    let prepared = framing();
+    assert!(table
+        .insert_with(move || {
+            let _capture = capture;
+            drop(prepared);
+            panic!("an exhausted generation must not invoke the owning-allocation factory")
+        })
+        .is_none());
+    assert!(
+        dropped.get(),
+        "generation failure releases the captured prepared state"
+    );
+    assert_eq!(table.reach(token(index, 0)).err(), Some(Reach::Gone));
+    let next = table.insert(framing()).unwrap();
+    assert_ne!(
+        untoken(next).unwrap().0,
+        index,
+        "the exhausted reservation stays retired"
+    );
+    assert!(table.reach(next).is_ok());
+}
+
+#[test]
+fn the_boxing_factory_runs_under_the_reserved_slot_after_releasing_the_free_list() {
+    let table = Framings::default();
+    let prepared = framing();
+    let held = table
+        .insert_with(|| {
+            assert!(table.free.try_lock().is_ok());
+            let segment = table.segments[0]
+                .get()
+                .expect("the reserved slot's segment exists");
+            assert!(matches!(
+                segment[0].0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            Held::Dial(Box::new(prepared))
+        })
+        .unwrap();
+    assert!(matches!(table.reach(held).unwrap().held(), Held::Dial(_)));
+    table.remove(held).unwrap();
+    let accepted = Accepted::accept(0, std::sync::Arc::from([]));
+    let held = table
+        .insert_with(|| Held::Accept(Box::new(accepted)))
+        .unwrap();
+    assert!(matches!(table.reach(held).unwrap().held(), Held::Accept(_)));
+    table.remove(held).unwrap();
+}

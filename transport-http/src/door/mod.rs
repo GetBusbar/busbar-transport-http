@@ -749,15 +749,16 @@ impl SafeSlot for Begin {
             let alpn = i
                 .facts()
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
-            let mut h = Held::Accept(
-                Accepted::accept(i.sink.now_monotonic_ns, lines)
-                    .with_policies(loans)
-                    .with_body_max(settings.posture.max_body_bytes)
-                    .with_scheme(scheme)
-                    .with_alpn(alpn),
-            );
+            let mut accepting = Accepted::accept(i.sink.now_monotonic_ns, lines)
+                .with_policies(loans)
+                .with_body_max(settings.posture.max_body_bytes)
+                .with_scheme(scheme)
+                .with_alpn(alpn);
             if selected {
-                let Some(token) = inst.framings.insert_held(h) else {
+                let Some(token) = inst
+                    .framings
+                    .insert_with(|| Held::Accept(Box::new(accepting)))
+                else {
                     return failed(&mut o, "begin: every framing slot is in use".into());
                 };
                 inst.opening
@@ -772,11 +773,19 @@ impl SafeSlot for Begin {
                     &mut o,
                 );
             }
-            let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
+            let r = step_prepared(
+                Prepared::Accept(&mut accepting),
+                i.field(|x| &x.sink),
+                &mut o,
+                None,
+            );
             if r != Outcome::Ready {
                 return r;
             }
-            let Some(token) = inst.framings.insert_held(h) else {
+            let Some(token) = inst
+                .framings
+                .insert_with(|| Held::Accept(Box::new(accepting)))
+            else {
                 o.error("begin: every framing slot is in use");
                 return Outcome::Failed;
             };
@@ -811,18 +820,23 @@ impl SafeSlot for Begin {
             o.error("begin: the target carries userinfo; credentials never ride a URL");
             return Outcome::Failed;
         }
-        let Ok(framing) = Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
+        let Ok(mut framing) =
+            Framing::dial(target, proto, settings.posture, i.sink.now_monotonic_ns)
         else {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
 
-        let mut h = Held::Dial(framing);
-        let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
+        let r = step_prepared(
+            Prepared::Dial(&mut framing),
+            i.field(|x| &x.sink),
+            &mut o,
+            None,
+        );
         if r != Outcome::Ready {
             return r;
         }
-        let Some(token) = inst.framings.insert_held(h) else {
+        let Some(token) = inst.framings.insert_with(|| Held::Dial(Box::new(framing))) else {
             o.error("begin: every framing slot is in use");
             return Outcome::Failed;
         };
@@ -866,7 +880,7 @@ fn begin_peer(
     let ready = a.peer_ready();
     if ready {
         a.drive(sink.now_monotonic_ns);
-        fill(a, sink, o, class_of, fault_of);
+        fill(a.as_mut(), sink, o, class_of, fault_of);
         o.set(|x| &x.yielded.agreed, a.agreed());
         o.set(|x| &x.framing, token);
     }
@@ -1252,7 +1266,15 @@ fn with(
     step(h, sink, o, kernel, |h| f(h, resumed))
 }
 
-/// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
+/// A mutable payload view usable before and after the table owns its allocation.
+enum Prepared<'a> {
+    Dial(&'a mut Framing),
+    Accept(&'a mut Accepted),
+}
+
+/// Run the operation, then drive and fill the same framing without changing its ownership.
+/// A failed operation returns its failure before driving or filling; successful operations
+/// share the same borrowed step as an initial payload that the table does not yet own.
 fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
@@ -1263,8 +1285,21 @@ fn step(
     if let Err(e) = f(h) {
         return failed(o, e.0);
     }
-    match h {
-        Held::Dial(framing) => {
+    let prepared = match h {
+        Held::Dial(framing) => Prepared::Dial(framing),
+        Held::Accept(accepting) => Prepared::Accept(accepting),
+    };
+    step_prepared(prepared, sink, o, kernel)
+}
+
+fn step_prepared(
+    prepared: Prepared<'_>,
+    sink: Lent<'_, FramerSink>,
+    o: &mut Out<'_, FramerOut>,
+    kernel: Option<KernelContext<'_>>,
+) -> Outcome {
+    match prepared {
+        Prepared::Dial(framing) => {
             framing.drive(sink.now_monotonic_ns, sink.now_unix_ns);
             let pending = framing.wire_pending() || !framing.pieces().is_empty();
             if let Some(e) = framing.failure().cloned() {
@@ -1274,7 +1309,7 @@ fn step(
             }
             fill(framing, sink, o, class_of, fault_of);
         }
-        Held::Accept(a) => {
+        Prepared::Accept(a) => {
             a.drive(sink.now_monotonic_ns);
             let mut more = false;
             if let Some(context) = kernel {
