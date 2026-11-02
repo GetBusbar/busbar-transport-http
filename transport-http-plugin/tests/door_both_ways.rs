@@ -42,7 +42,8 @@ use busbar_contract::abi::mechanism::ticket::{HostCtx, HostTables, Ticket};
 use busbar_contract::abi::mechanism::DOOR_SYMBOL;
 use busbar_contract::abi::transport::check::{check_framer, check_framer_fields, check_head_slots};
 use busbar_contract::abi::transport::route::{
-    FieldPredicate, LineEntry, RouteMatch, FIELD_VALUE_PREFIX, METHOD_ANY, METHOD_POST, PATH_EXACT,
+    FieldPredicate, LineEntry, RouteMatch, FIELD_VALUE_PREFIX, METHOD_ANY, METHOD_GET, METHOD_POST,
+    PATH_EXACT, PATH_PREFIX,
 };
 use busbar_contract::abi::transport::{
     slot, BeginIn, ConnFacts, EmitIn, EncodeIn, FramePiece, FramerOut, FramerSink, FramingIn,
@@ -485,8 +486,8 @@ impl Host {
                 std::time::Instant::now() < deadline,
                 "the far end did not get there in {PUMP_DEADLINE:?}"
             );
-            if self.pump_once(got) == Some(Outcome::Ready) {
-                break;
+            if let Some(r) = self.pump_once(got) {
+                return r;
             }
         }
         Outcome::Ready
@@ -876,12 +877,12 @@ fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::R
         .iter()
         .filter(|g| g.flags & PIECE_STREAM_FAILED != 0)
         .collect();
+    assert_eq!(failed.len(), 1, "one stream failed");
     println!(
         "PROOF {label}: stream {} failed alone: {:?}",
         failed[0].stream,
         String::from_utf8_lossy(&failed[0].bytes)
     );
-    assert_eq!(failed.len(), 1, "one stream failed");
     assert_eq!(failed[0].stream, 1);
     assert_eq!(
         failed[0].bytes,
@@ -2416,7 +2417,11 @@ fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
         "{label}: the auth call pends"
     );
     assert_eq!(h.asked().len(), 1, "{label}");
-    assert_ne!(h.timer(), Outcome::Pending, "{label}: a timer never pends");
+    assert_eq!(
+        h.timer(),
+        Outcome::Ready,
+        "{label}: a timer with no deadline passed is Ready"
+    );
     assert_eq!(
         h.asked().len(),
         1,
@@ -3343,8 +3348,12 @@ fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
     );
     let before = h.got.len();
     let _ = h.ingest(b"world");
+    let late: Vec<u8> = h.got[before..]
+        .iter()
+        .flat_map(|g| g.1.iter().copied())
+        .collect();
     assert!(
-        h.got[before..].iter().all(|g| g.1 != b"world"),
+        !late.windows(5).any(|w| w == b"world"),
         "{label}: h1: no body byte goes up after the answer ended"
     );
     h.close();
@@ -3622,6 +3631,100 @@ fn a_changed_list_is_not_reused(label: &str, ops: &'static Ops) {
         "{label}: refused at the second list's gate: {asked:?}"
     );
     first.close();
+
+    // Every other compared member, one at a time: the first connection's list is kept by the
+    // instance, the second's differs in that member only, and `POST /v1/messages` on the second is
+    // framed under the SECOND list (what a stale reuse of the first's copy would not do).
+    let no_route = |asked: &[Asked]| {
+        matches!(
+            asked,
+            [Asked::Refuse {
+                cause: REFUSE_NO_ROUTE,
+                ..
+            }]
+        )
+    };
+    let post = |id: u32| line(id, POINT_HEAD, METHOD_POST, "/v1/messages", 0);
+    let mut other_path = post(8);
+    other_path.route.path = s("/v1/other");
+    let mut other_methods = post(8);
+    other_methods.route.methods = METHOD_GET;
+    let mut base_form = post(8);
+    base_form.route.path_form = PATH_PREFIX;
+    base_form.route.path = s("/v1");
+    let mut other_form = post(8);
+    other_form.route.path = s("/v1");
+    let mut base_points = post(8);
+    base_points.points = 0;
+    // Line 9 with line 8's auth handle: only the id differs.
+    let mut renumbered = post(9);
+    renumbered.auth = post(8).auth;
+    let mut late = post(9);
+    late.route.path = s("/v1/other");
+    type Case = (
+        &'static str,
+        Vec<LineEntry>,
+        Vec<LineEntry>,
+        Box<dyn Fn(&[Asked]) -> bool>,
+    );
+    let cases: Vec<Case> = vec![
+        ("path", vec![post(8)], vec![other_path], Box::new(no_route)),
+        (
+            "methods",
+            vec![post(8)],
+            vec![other_methods],
+            Box::new(|a: &[Asked]| {
+                matches!(
+                    a,
+                    [Asked::Refuse {
+                        cause: REFUSE_METHOD_MISS,
+                        ..
+                    }]
+                )
+            }),
+        ),
+        (
+            "path form",
+            vec![base_form],
+            vec![other_form],
+            Box::new(no_route),
+        ),
+        (
+            "line id",
+            vec![post(8)],
+            vec![renumbered],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { .. }, Asked::HandIn { line: 9, .. }])
+            }),
+        ),
+        (
+            "points",
+            vec![base_points],
+            vec![post(8)],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { auth: 108, .. }, Asked::HandIn { .. }])
+            }),
+        ),
+        (
+            "list length",
+            vec![late],
+            vec![late, post(9)],
+            Box::new(|a: &[Asked]| {
+                matches!(a, [Asked::Auth { .. }, Asked::HandIn { line: 9, .. }])
+            }),
+        ),
+    ];
+    for (member, base, alt, expect) in cases {
+        let first = AcceptHost::open_with(ops, base, Script::default());
+        let mut second = AcceptHost::open_again(&first, alt);
+        let _ = second.ingest(POST_HELLO);
+        let asked = first.asked();
+        assert!(
+            expect(&asked),
+            "{label}: a list differing in its {member} only is framed under its own list: {asked:?}"
+        );
+        first.close();
+    }
 }
 
 /// [`line`] for `POST /v1/messages` that also needs the header `x-tier` to start with `prefix`.
