@@ -1044,3 +1044,18 @@ fn a_refusal_with_an_informational_status_is_answered_500() {
         String::from_utf8_lossy(&wire)
     );
 }
+
+/// RED (codeaudit r1-prod0-22): a `host` field present but not text was shown to the auth as an
+/// empty authority, the same as a request with none. RFC 9112 3.2: an invalid host is refused;
+/// the request is never handed in.
+#[test]
+fn a_request_with_a_non_text_host_is_never_handed_in() {
+    let mut a = accepted();
+    a.ingest(
+        b"GET /v1/models HTTP/1.1\r\nhost: \xff\xfe\r\nuser-agent: t\r\n\r\n",
+        false,
+    );
+    run(&mut a, SEC);
+    let u = up(&mut a);
+    assert!(u.heads.is_empty(), "nothing went up: {u:?}");
+}

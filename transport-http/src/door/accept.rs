@@ -1536,6 +1536,16 @@ impl Accepted {
             };
             match a.gate {
                 Gate::Arrived => {
+                    // A `host` field that is not text names no authority (RFC 9112 3.2 refuses
+                    // it): the request is left unanswered rather than shown as one with none.
+                    if parts
+                        .headers
+                        .get_all(http::header::HOST)
+                        .iter()
+                        .any(|h| h.to_str().is_err())
+                    {
+                        return fail(a, did);
+                    }
                     let fields = field_lines(parts);
                     let to = match guest::matched(
                         &self.lines,
