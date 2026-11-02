@@ -126,6 +126,9 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
 fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert!(Head::parse(b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n").is_err());
     assert!(Head::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n").is_err());
+    // A line with no colon, and a folded continuation line, are refused too.
+    assert!(Head::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding chunked\r\n\r\n").is_err());
+    assert!(Head::parse(b"GET / HTTP/1.1\r\nA: b\r\n folded: x\r\n\r\n").is_err());
     // The legal shape still parses, value whitespace and all.
     let ok = Head::parse(b"GET / HTTP/1.1\r\nContent-Length:  5 \r\n\r\n").unwrap();
     assert_eq!(ok.fields().next().unwrap().1, b"5");
@@ -244,6 +247,7 @@ fn a_cr_that_does_not_end_a_line_is_malformed() {
     }
     let mut decoder = ChunkedDecoder::default();
     decoder.feed(b"5\nhello\n0\n\n").expect("bare LFs");
+    assert!(decoder.is_done(), "bare LFs end the message");
     assert_eq!(decoder.take(), b"hello");
 }
 
