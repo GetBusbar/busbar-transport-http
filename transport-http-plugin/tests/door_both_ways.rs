@@ -1806,6 +1806,8 @@ struct Script {
     pend: usize,
     /// One selected stream's next auth call pends, after its siblings may have handed in.
     pend_stream: Option<u64>,
+    /// One auth callback's 1-based ordinal pends, independent of stream scheduling order.
+    pend_call: Option<usize>,
     /// Each `auth.call`'s completion sequence number.
     seqs: Vec<u32>,
     /// Each `auth.call`'s ticket.
@@ -1982,6 +1984,10 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
         }
         if script.pend_stream == Some(i.stream) {
             script.pend_stream = None;
+            return outcome(out, Outcome::Pending);
+        }
+        if script.pend_call == Some(script.seqs.len()) {
+            script.pend_call = None;
             return outcome(out, Outcome::Pending);
         }
         let (flow, names) = script
@@ -4064,7 +4070,9 @@ fn cancel_unpublished_heads(label: &str, ops: &'static Ops) {
         ops,
         vec![line(9, POINT_HEAD_BODY, METHOD_ANY, "/v1/messages", 8)],
         Script {
-            pend_stream: Some(2),
+            // Admission may prioritize either stream after its policy loan. Park the second
+            // auth callback so the first sibling's admitted head is already queued on this op.
+            pend_call: Some(2),
             ..Script::default()
         },
         |_| {},
@@ -4105,10 +4113,22 @@ fn cancel_unpublished_heads(label: &str, ops: &'static Ops) {
         0,
         "{label}: PENDING did not publish the earlier sibling's queued head"
     );
-    assert!(matches!(
-        &h.asked()[..],
-        [Asked::Auth { .. }, Asked::HandIn { .. }, Asked::Auth { .. }]
-    ));
+    let asked = h.asked();
+    let tags: Vec<_> = asked
+        .iter()
+        .map(|asked| match asked {
+            Asked::Auth { .. } => "Auth",
+            Asked::HandIn { .. } => "HandIn",
+            Asked::Refuse { .. } => "Refuse",
+        })
+        .collect();
+    assert!(
+        matches!(
+            &asked[..],
+            [Asked::Auth { .. }, Asked::HandIn { .. }, Asked::Auth { .. }]
+        ),
+        "{label}: operation tags {tags:?}"
+    );
     assert_eq!(h.cancel(h.ticket), CANCEL_PARTIAL);
     assert_eq!(h.ingest_policy(&[], &[], 0).0, Outcome::Ready);
     assert_eq!(
