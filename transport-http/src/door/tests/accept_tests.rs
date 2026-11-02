@@ -1017,3 +1017,30 @@ fn a_poisoned_lock_does_not_stop_the_drops() {
         "the held body is let go"
     );
 }
+
+/// RED (codeaudit r1-prod0-2): a 1xx status was accepted as the final answer head (hyper then
+/// rewrites it to a 500 and errors the connection); 101 is an answer only to an upgrade request.
+#[test]
+fn an_informational_final_head_is_refused_and_the_stream_kept() {
+    let (mut a, stream) = one_get();
+    for status in [100, 101, 102, 103] {
+        let r = a.emit(stream, b"", true, status);
+        assert!(r.is_err(), "status {status}: refused: {r:?}");
+        assert!(a.answers_head(stream), "status {status}: still answerable");
+    }
+    assert!(a.emit(stream, b"", true, 200).is_ok());
+}
+
+/// r1-prod0-2: a host refusal of status 1xx is answered 500, as any out-of-range one is.
+#[test]
+fn a_refusal_with_an_informational_status_is_answered_500() {
+    let (mut a, stream) = one_get();
+    a.refuse(Some(stream), b"no", 103, false).expect("refused");
+    run(&mut a, 2 * SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(
+        wire.starts_with(b"HTTP/1.1 500 "),
+        "{}",
+        String::from_utf8_lossy(&wire)
+    );
+}

@@ -801,10 +801,7 @@ impl Accepted {
             self.owed.extend(bytes);
             return Ok(());
         }
-        let status = u16::try_from(status)
-            .ok()
-            .filter(|s| (100..=599).contains(s))
-            .unwrap_or(500);
+        let status = final_status(status, a.upgrade.is_some()).map_or(500, |s| s.as_u16());
         let framed = frame_refusal(
             a,
             RefusalCopy {
@@ -867,12 +864,10 @@ impl Accepted {
         };
         if a.respond.is_some() {
             // The head is judged whole BEFORE the answer is given: one no answer can carry is
-            // refused with the stream still answerable. A status is RFC 9110's three digits from
-            // 100 to 599 (15), as the host's own refusal is clamped (`refuse`).
-            let code = u16::try_from(status)
-                .ok()
-                .filter(|s| (100..=599).contains(s))
-                .and_then(|s| http::StatusCode::from_u16(s).ok())
+            // refused with the stream still answerable. A final status is RFC 9110's 200 to 599
+            // (15), or 101 on a request that asked to upgrade; hyper will not send any other
+            // informational status as the answer (see [`final_status`]).
+            let code = final_status(status, a.upgrade.is_some())
                 .ok_or_else(|| Failure(format!("emit: {status} is not an HTTP status")))?;
             let mut b = http::Response::builder().status(code);
             // Every byte of the block is a line `fields::lines` reads: it stops at the first that
@@ -1730,6 +1725,15 @@ fn offer_position(protocol: &[u8]) -> u32 {
         at += 1 + n;
     }
     0
+}
+
+/// The status a final answer head can carry: 200 to 599, or 101 on a request that asked to
+/// upgrade. hyper's HTTP/1 server will not send any other informational status as the final
+/// response (it rewrites it to a 500 and errors the connection), so none is accepted here.
+fn final_status(status: u32, upgrade_asked: bool) -> Option<http::StatusCode> {
+    let code = u16::try_from(status).ok()?;
+    let ok = (200..=599).contains(&code) || (code == SWITCHING_PROTOCOLS && upgrade_asked);
+    ok.then(|| http::StatusCode::from_u16(code).ok()).flatten()
 }
 
 /// Let a held body go: zeroised, and its allocation freed, not kept for a record that may outlive
