@@ -138,7 +138,7 @@ impl Client {
         );
         client.framing = output.framing;
         client.take(&output);
-        // A real HTTP/2 server's empty SETTINGS, using the existing hand-written peer pattern.
+
         client.ingest(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
         client
     }
@@ -369,7 +369,7 @@ fn credentials_are_never_indexed_after_reparse_while_public_sibling_requests_sta
         client.emit(1, &private[..7], false, &metadata),
         Outcome::Ready
     );
-    metadata.fill(0); // The input extension loan ended; the partial request retains its own copy.
+    metadata.fill(0);
     assert_eq!(client.emit(2, &public, true, &[]), Outcome::Ready);
     assert_eq!(client.emit(1, &private[7..], true, &[]), Outcome::Ready);
     assert_eq!(
@@ -424,7 +424,7 @@ fn a_previously_public_exact_value_becomes_never_indexed_when_classified_sensiti
 #[test]
 fn a_sensitive_exact_static_table_value_is_a_never_indexed_literal() {
     let mut client = Client::new();
-    // RFC 7541 Appendix A entry16 is this exact name and value.
+
     let request = client.encode_fields(&[
         ("accept-encoding", "gzip, deflate"),
         ("x-public", "visible"),

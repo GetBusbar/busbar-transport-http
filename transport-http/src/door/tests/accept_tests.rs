@@ -2,8 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The accepted side against v1.5.5's data listener: the same request answered the same way must
-//! put the same bytes on the wire as v1.5.5's server builder (`crates/busbar/src/tls.rs`:560-566,
-//! hyper-util's auto builder, HTTP/1 header read bounded at 30 s) put there.
 
 use super::*;
 use http_body_util::BodyExt;
@@ -12,7 +10,7 @@ use std::convert::Infallible;
 const SEC: u64 = 1_000_000_000;
 
 /// The kernel a `none` line meets: every hand-in CONTINUE; no auth is called on it and nothing is
-/// refused.
+
 struct Open;
 
 /// The ticket a test kernel's op runs on: a ticketed one, where `auth.call` may be made.
@@ -324,7 +322,7 @@ fn undated(mut wire: Vec<u8>) -> Vec<u8> {
 }
 
 /// Whether `wire` holds one whole HTTP/1.1 answer: its head, then the body its `content-length`
-/// states, or its chunked body through the last chunk (a head stating neither has no body here).
+
 fn answer_whole(wire: &[u8]) -> bool {
     let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
@@ -345,7 +343,7 @@ fn answer_whole(wire: &[u8]) -> bool {
 }
 
 /// v1.5.5's data listener answering `request` with `status`, `headers` and `body` (known size when
-/// `sized`, else streamed): its wire bytes, over an in-memory socket.
+
 fn v155(
     request: &[u8],
     status: u16,
@@ -394,11 +392,7 @@ fn v155(
                 .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(srv), svc)
                 .await;
         });
-        // The request, and NO half-close: v1.5.5's builder leaves `half_close` off, so a read end
-        // before the answer is written closes the connection with nothing written (both sides of
-        // this comparison then read as empty and agree vacuously). The answer is read until it is
-        // WHOLE by its own framing (its `content-length`, or its last chunk), however late the
-        // server is scheduled, under a generous bound that fails in words.
+
         cli.write_all(request).await.expect("request");
         let mut wire = Vec::new();
         let mut buf = [0_u8; 4096];
@@ -418,8 +412,7 @@ fn v155(
 }
 
 /// The door's accepted side answering `request` the same way, as a host drives it: the head emit
-/// (status, field block), then the body emits. A `sized` answer states its `content-length` as the
-/// head's last field, as the host renders an answer whose size it knows.
+
 fn door(
     request: &[u8],
     status: u16,
@@ -445,7 +438,7 @@ fn door(
         .expect("head");
     assert!(!a.answers_head(stream), "the head went");
     a.emit(stream, body, true, 0).expect("body");
-    // The answer goes out before any read end, as on the v1.5.5 side.
+
     run(&mut a, 2 * SEC);
     a.take_wire(usize::MAX)
 }
@@ -471,8 +464,7 @@ fn a_request_goes_up_as_its_head_slots_one_field_block_and_its_body() {
         "an origin-form request names no authority"
     );
     assert!(words.reason.is_empty());
-    // The accepted head is the exact request admitted by the host, including decoded framing
-    // headers. Reusing the dialled-response filter here would invalidate its single-use claim.
+
     assert_eq!(
         String::from_utf8_lossy(block),
         "host: busbar.test\r\nconnection: keep-alive\r\ncontent-length: 5\r\ncontent-type: application/json\r\n"
@@ -616,13 +608,12 @@ fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
 }
 
 /// THE COPY KEPT FOR A HAND-OVER AS SENT is bounded and kept only while a hand-over is possible
-/// (Q128 reader A finding 1; THE DESIGN §1 l.199-201, a bound on live work is a refusal at
-/// admission): an HTTP/2 connection is never handed over, so it keeps none.
+
 #[test]
 fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
     let mut a = accepted();
     a.ingest(H2_PREFACE, false);
-    // An empty SETTINGS frame, then PINGs: frames that are answered by hyper, never by the host.
+
     a.ingest(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00", false);
     for _ in 0..64 {
         a.ingest(b"\x00\x00\x08\x06\x00\x00\x00\x00\x00pingping", false);
@@ -642,9 +633,7 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 }
 
 /// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
-/// request's head is read under): past it no hand-over as sent is possible, so the copy goes, and
-/// the connection is NOT cut (Q128 reader B finding 2, overriding reader A's earlier "refuse over
-/// it": v1.5.5's server served such a connection on).
+
 #[test]
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     const HEAD_LIMIT: usize = 8192 + 4096 * 100;
@@ -736,8 +725,7 @@ fn run_with(a: &mut Accepted, now: u64, k: &mut dyn Kernel) {
 }
 
 /// THE CONNECTION FORGETS EVERY FINISHED REQUEST (Q128 reader B finding 1, HIGH; THE DESIGN §1
-/// l.199-203): N requests refused before any verdict could hold their bodies, and N answered, leave
-/// a record count bounded by the live requests, and no held body's allocation.
+
 #[test]
 fn a_connection_forgets_every_finished_request() {
     const N: usize = 50;
@@ -786,8 +774,7 @@ fn a_connection_forgets_every_finished_request() {
 }
 
 /// A request that carries an `Upgrade` line AND a body is served as any other: its body never fills
-/// the hand-over copy, so the connection is not cut, and it gets its normal answer (Q128 reader B
-/// finding 2: the copy holds an upgrade request's HEAD only).
+
 #[test]
 fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let mut a = accepted();
@@ -826,13 +813,12 @@ fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// An HTTP/2 connection with one whole `GET /` request on stream 1, admitted and gone up: the
-/// accepted side and the request's stream.
+
 fn h2_request() -> (Accepted, u64) {
     let mut a = accepted();
     a.ingest(H2_PREFACE, false);
     a.ingest(&frame(4, 0, 0, &[]), false);
-    // HPACK: `:method GET`, `:scheme http`, `:path /` (static indices 2, 6, 4), `:authority`
-    // (static name 1, literal value, no indexing).
+
     let mut block = vec![0x82, 0x86, 0x84, 0x01, 11];
     block.extend_from_slice(b"busbar.test");
     a.ingest(&frame(1, 0x5, 1, &block), false);
@@ -850,8 +836,7 @@ fn reset(a: &mut Accepted) {
 }
 
 /// THE FAR SIDE ABANDONS AN ANSWER (Q128 reader A, MEDIUM; THE DESIGN §1 l.199-201, §6 item 6
-/// l.971-973): the host is told the stream ended (its failure piece), the stream's record goes at
-/// once, and a later emit on it is refused, never queued where nobody drains it.
+
 #[test]
 fn a_stream_the_far_side_resets_mid_answer_ends_failed_and_is_let_go() {
     let (mut a, stream) = h2_request();
@@ -896,7 +881,7 @@ fn a_stream_the_far_side_resets_before_its_head_ends_failed_and_is_let_go() {
 }
 
 /// A streaming answer held at its high-water mark, its stream reset: the host is woken (the
-/// stream's failure piece ends its hold), not left waiting for a writable piece that never comes.
+
 #[test]
 fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
     let (mut a, stream) = h2_request();
@@ -941,11 +926,7 @@ fn one_get() -> (Accepted, u64) {
 }
 
 /// RED (codeaudit correctness M accept.rs:649, error-handling L accept.rs:649, conformance L
-/// accept.rs:656): an answer head was judged only after its stream's answer sender was taken, so a
-/// head no answer can carry lost the stream (hyper ended it unanswered, and a corrected head found
-/// no answer to give); and a status of 600 to 999 was written as an answer (`http` takes any three
-/// digits, RFC 9110 15 names 100 to 599). A head that cannot be an answer is refused and the stream
-/// is still answerable.
+
 #[test]
 fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
     let (mut a, stream) = one_get();
@@ -974,9 +955,7 @@ fn an_answer_head_that_cannot_be_one_is_refused_and_the_stream_kept() {
 }
 
 /// RED (codeaudit error-handling L accept.rs:659): the answer head's field block was read only up
-/// to its first line that is not `name: value` CRLF, so every line from there on (a security
-/// header, a cache rule) was dropped and the emit answered READY. A block that is not whole lines
-/// is refused, and the stream is still answerable.
+
 #[test]
 fn an_answer_head_with_a_malformed_field_line_is_refused() {
     let (mut a, stream) = one_get();
@@ -995,10 +974,7 @@ fn an_answer_head_with_a_malformed_field_line_is_refused() {
 }
 
 /// RED (codeaudit resource M engine.rs:186, its accepted half): hyper's HTTP/2 server spawns each
-/// stream's task with a clone of its executor, and the executor's task list held that task: a
-/// cycle, so an accepted connection dropped with a stream in flight never freed the stream's task
-/// (its service future, hyper's and h2's stream state). Dropping the framing frees it: the
-/// stream's answer channel then has no one waiting on it.
+
 #[test]
 fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
     let (a, stream) = h2_request();
@@ -1019,10 +995,7 @@ fn a_dropped_h2_connection_with_a_stream_in_flight_frees_its_state() {
 }
 
 /// RED (codeaudit correctness/error-handling L accept.rs:853): `detach` took the switched stream's
-/// upgrade handle out before it knew the switch had completed, and on "the switch has not
-/// completed" dropped it: every later detach found nothing switched and was REFUSED, though the
-/// `101` was owed. The handle stays until the switch completes, so a detach once it has hands the
-/// connection over.
+
 #[test]
 fn a_detach_before_the_switch_completes_can_be_made_again() {
     let mut a = accepted();
@@ -1033,8 +1006,7 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
     a.ingest(&sent, false);
     run(&mut a, SEC);
     let first = up(&mut a).heads[0].0;
-    // An answer the host has not taken from the wire yet, past the pipe's high-water mark: hyper
-    // cannot write the `101` that follows until it is taken.
+
     let body = vec![b'x'; 300_000];
     a.emit(first, b"content-length: 300000\r\n", false, 200)
         .expect("head");
@@ -1065,13 +1037,11 @@ fn a_detach_before_the_switch_completes_can_be_made_again() {
 }
 
 /// RED (codeaudit error-handling L accept.rs:720): the accepted connection's own end (hyper's
-/// error: a header-read timeout, an HTTP/2 protocol violation, a malformed request) was dropped, so
-/// every stream it ended was told the same words as a far side that merely went away. The cause
-/// rides the stream's failure words (hyper's text, which repeats no request byte).
+
 #[test]
 fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
     let (mut a, stream) = h2_request();
-    // DATA on stream 0: a connection error (RFC 9113 6.1).
+
     a.ingest(&frame(0, 0, 0, b"x"), false);
     run(&mut a, SEC);
     let told: Vec<String> = a
@@ -1087,13 +1057,8 @@ fn a_connection_ended_by_an_error_tells_its_streams_the_cause() {
     );
 }
 
-// ── the accepted side's time bounds (codeaudit security L→M accept.rs:362) ──────────────────────
-
 /// RED (codeaudit security accept.rs:362): only HTTP/1's header read was bounded, and only once
-/// hyper had chosen HTTP/1. A connection that sends part of the HTTP/2 preface, or the preface and
-/// then no request, asked the host for no wake-up at all and held its framing for
-/// good. A connection with no request in flight and nothing owed is closed 30 s on (the bound
-/// v1.5.5's listener put on a header read), on the host's clock.
+
 #[test]
 fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
     for (what, sent) in [
@@ -1106,7 +1071,7 @@ fn a_connection_that_sends_no_request_is_closed_on_the_hosts_clock() {
         let mut a = accepted();
         a.ingest(sent, false);
         run(&mut a, SEC);
-        // The host takes what the framing owes the far side (its SETTINGS, on HTTP/2).
+
         let _ = a.take_wire(usize::MAX);
         let at = a
             .next_deadline()
@@ -1132,7 +1097,7 @@ fn h2_types(wire: &[u8]) -> Vec<u8> {
 }
 
 /// RED: an HTTP/2 connection idle between requests is closed the same way, saying GOAWAY first;
-/// one answering a request is not.
+
 #[test]
 fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
     let (mut a, stream) = h2_request();
@@ -1155,7 +1120,7 @@ fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
 }
 
 /// An admitted request whose body has stalled (nothing for 30 s), or trickles below 1 KiB/s once
-/// 10 s have passed, fails its stream, as v1.5.5's listener failed such a body (`TimeoutBody`).
+
 #[test]
 fn a_stalled_or_trickled_request_body_fails_its_stream() {
     let post =
@@ -1241,7 +1206,7 @@ fn switched_read_ahead_and_each_owned_detach_copy_are_wiped() {
     )
     .unwrap();
     run(&mut a, SEC);
-    // Exceed the actual detach read buffer so growth destroys an earlier credential allocation.
+
     let payload = b"switched-credential-canary".repeat(2000);
     a.ingest(&payload, false);
     let probe = Probe::start();
@@ -1297,7 +1262,7 @@ fn a_host_refusal_is_not_reported_again_as_an_abandoned_request() {
             .unwrap();
         }
         run(&mut a, SEC);
-        // Finish the carrier too: this must not create a second host-visible end.
+
         a.ingest(b"", true);
         run(&mut a, SEC);
         assert!(a.ended());
@@ -1546,8 +1511,7 @@ fn an_http2_client_decodes_the_actual_trailer_wire_as_fields_after_the_body() {
                     .body(())
                     .unwrap();
                 let (response, _) = sender.send_request(request, true).unwrap();
-                // The client must have opened its request on the wire before its response
-                // arrives; send_request queues it until the connection task is polled.
+
                 let mut preface = [0; 24];
                 peer.read_exact(&mut preface).await.unwrap();
                 assert_eq!(&preface, H2_PREFACE);
@@ -1676,8 +1640,7 @@ impl Kernel for CapturedAdmission {
 }
 
 /// The actual accepted-side parser, auth call, hand-in and emitted frame must agree. A filter
-/// used for dialled answers used to delete these fields after hand-in, producing an empty 401
-/// when the real data listener tried to claim even an anonymous GET /healthz.
+
 #[test]
 fn an_accepted_request_preserves_the_exact_head_handed_in_after_auth() {
     for (wire, body) in [

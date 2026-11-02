@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The engine against hand-written far ends: what 1.5.5's client (reqwest 0.12) did with a
-//! response's trailers and with its one request timeout.
 
 use super::*;
 
@@ -89,7 +88,7 @@ fn posture(timeout_secs: u64) -> Posture {
 /// A framing with one GET sent on stream 1, the far end not yet heard from.
 fn asked(proto: Proto, timeout_secs: u64) -> Framing {
     let mut f = Framing::dial("http://127.0.0.1:9", proto, posture(timeout_secs), 0).expect("dial");
-    // `begin` drives the handshake in its own op, before any request exists (as the door does).
+
     f.drive(0, 0);
     f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
         .expect("emit");
@@ -100,7 +99,7 @@ fn asked(proto: Proto, timeout_secs: u64) -> Framing {
 }
 
 /// Every body byte handed up on stream 1 (the head piece and failure pieces excluded), and whether
-/// the stream ended whole.
+
 fn body(f: &mut Framing) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut whole = false;
@@ -108,7 +107,7 @@ fn body(f: &mut Framing) -> (Vec<u8>, bool) {
         if p.stream != 1 || p.status.is_some() || p.failed {
             continue;
         }
-        // The end the host reads is the piece's flag (`PIECE_END`), never an empty piece.
+
         if p.end {
             whole = true;
         }
@@ -140,7 +139,7 @@ fn literal(name: &str, value: &str) -> Vec<u8> {
 }
 
 /// 1.5.5 read a response body through reqwest, which yields data frames only: a chunked
-/// response's trailer section never reached the body.
+
 #[test]
 fn an_h1_trailer_section_is_not_body() {
     let mut f = asked(Proto::H1, 300);
@@ -187,8 +186,7 @@ fn declared(f: &mut Framing) -> Option<Option<u64>> {
 }
 
 /// The head piece states the body length the answer's head declared (`Content-Length`, busbar
-/// #1032's `PIECE_HAS_DECLARED_LEN`), on HTTP/1.1 and on HTTP/2, so the host's pre-body download
-/// cap reads it before a body byte; a head that declares none (a chunked answer) states none.
+
 #[test]
 fn the_head_piece_states_the_body_length_the_head_declared() {
     let mut f = asked(Proto::H1, 300);
@@ -216,7 +214,7 @@ fn the_head_piece_states_the_body_length_the_head_declared() {
 }
 
 /// The length a head declares is read whole or not at all: identical duplicates are one length,
-/// and a disagreeing or malformed value declares none.
+
 #[test]
 fn a_declared_length_is_one_valid_content_length() {
     let head = |values: &[&str]| {
@@ -240,8 +238,7 @@ fn a_declared_length_is_one_valid_content_length() {
 }
 
 /// 1.5.5's `upstream_request_timeout_secs` was reqwest's TOTAL timeout: one clock from the send
-/// to the body's end (reqwest 0.12 wraps the response body in the same sleep). A response still
-/// arriving at the deadline is cut there, on HTTP/1.1 ...
+
 #[test]
 fn a_body_still_arriving_at_the_request_timeout_is_cut_h1() {
     let mut f = asked(Proto::H1, 5);
@@ -282,8 +279,7 @@ fn a_body_still_arriving_at_the_request_timeout_is_cut_h2() {
 }
 
 /// 1.5.5 put no transport cap on a RESPONSE: a streamed body ran as long as the far end sent it
-/// (the plane's own buffered reads were capped, the incremental path was not). One larger than
-/// `limits.request_body_max_bytes` (32 MiB) passes through whole.
+
 #[test]
 fn a_streamed_response_past_the_request_body_cap_passes_through() {
     let mut f = asked(Proto::H1, 300);
@@ -312,8 +308,7 @@ fn a_streamed_response_past_the_request_body_cap_passes_through() {
 }
 
 /// The clock is the ATTEMPT's, stamped before the dial: a connect that took 200s leaves the
-/// exchange 100s of a 300s timeout, so a body still arriving at 300s from the attempt's start is
-/// cut there, not 300s after the request went out.
+
 #[test]
 fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
     let connected = 200 * SEC;
@@ -349,9 +344,7 @@ fn h1_wire(message: &[u8]) -> String {
 }
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "Nothing is added to the head after the auth has
-/// run"): the framer writes the head it is handed and adds no field line of its own at `encode`;
-/// its own lines (`accept`, `host`) are stated at `locate` and added by the host before the auth.
-/// RED on the framer that added them after the auth.
+
 #[test]
 fn the_door_adds_no_line_to_the_head_it_is_handed() {
     let bare = h1_wire(b"GET /x HTTP/1.1\r\nx-a: 1\r\n\r\n");
@@ -386,11 +379,7 @@ fn answered(f: &mut Framing) {
 }
 
 /// RED (busbar ruling (T), the pooled line's request target): a stated target always wins, `/`
-/// included; only a request naming NO target inherits the dial's path, and only as the
-/// connection's first. A line dialled to `http://h/card` by one exchange is lent, pooled by
-/// authority, to the next exchange to the same place: that exchange's stated `POST /` goes to `/`,
-/// never to `/card` (at 9e0d6fee15 it went to `/card`, the far end answered 405, and the breaker
-/// counted a fault the far end never had). A later request naming no target goes to `/`.
+
 #[test]
 fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialled() {
     let mut f = Framing::dial("http://127.0.0.1:9/card", Proto::H1, posture(30), 0).expect("dial");
@@ -425,11 +414,7 @@ fn a_pooled_lines_later_request_goes_where_it_says_not_where_the_line_was_dialle
 }
 
 /// RED (busbar ARCHITECT ruling on busbar#780 (2), 1.5.5 parity): a target whose host is an IPv4
-/// spelling goes out naming the address it spells, as 1.5.5's client sent it (its URL parser
-/// canonicalized the host before the request was built): `host: 127.0.0.1:9` for `127.1`,
-/// `2130706433` and `0x7f000001`, `host: 1.2.3.4:9` for `16909060`. A name and a dotted quad go out
-/// as written. RED on the framing that wrote the spelling into the `host` field. The `host` line is
-/// the one the framer states at `locate` ([`client_defaults`]).
+
 #[test]
 fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
     for (dial, host) in [
@@ -440,7 +425,6 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
         ("http://localhost:9", "localhost:9"),
         ("http://127.0.0.1:9", "127.0.0.1:9"),
     ] {
-        // The `host` line is the framer's own, stated at `locate` (THE DESIGN §6 step 5).
         let stated = client_defaults(&dial.parse().expect("a URL"));
         assert!(
             stated.contains(&format!("host: {host}\r\n")),
@@ -450,7 +434,7 @@ fn an_ipv4_spelling_goes_out_as_the_address_it_names() {
 }
 
 /// RED: 1.5.5's client lowercased a DNS host, so an h1 request dialled at a mixed-case name
-/// carries the lower-case `host`: the line the framer states at `locate` for the host to add.
+
 #[test]
 fn a_dns_host_goes_out_lower_case() {
     let target: http::Uri = "http://API.Example.com:8080/x".parse().expect("uri");
@@ -462,7 +446,7 @@ fn a_dns_host_goes_out_lower_case() {
 }
 
 /// What one emit of an envelope rendered by `encode` does on a fresh HTTP/1.1 framing whose body
-/// cap is `cap`: the emit's answer and the bytes the connection wrote.
+
 fn rendered_and_sent(
     cap: usize,
     fields: &[(&str, &[u8])],
@@ -474,7 +458,7 @@ fn rendered_and_sent(
     };
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, capped, 0).expect("dial");
     f.drive(0, 0);
-    // The length line the host states before the auth.
+
     let len = body.len().to_string();
     let mut stated = fields.to_vec();
     if !body.is_empty() {
@@ -487,9 +471,7 @@ fn rendered_and_sent(
 }
 
 /// RED (THE DESIGN §2 "A port keeps 1.5.5's surface"; `limits.request_body_max_bytes` is a BODY
-/// size): the cap bounds the request's body, never its rendered head. A body exactly at the cap
-/// leaves whole with its head; one byte over is refused. RED on the framing that counted the
-/// request line and every field against the body's cap.
+
 #[test]
 fn a_request_body_at_the_cap_goes_out_with_its_head() {
     let fields: &[(&str, &[u8])] = &[
@@ -507,12 +489,7 @@ fn a_request_body_at_the_cap_goes_out_with_its_head() {
 }
 
 /// RED (THE DESIGN §2 l.393-397; `limits.request_body_max_bytes` is "the largest request body
-/// carried"): a CHUNKED request body is held to the cap as a declared one is. Its decoded body at
-/// the cap is carried; one byte over is refused, never carried for being inside the head allowance.
-/// RED on the framing that compared only a Content-Length against the cap. The decoded body leaves
-/// as 1.5.5's client sent one: framed by its length, with no transfer coding (1.5.5's handlers took
-/// the decoded body as `Bytes`, `crates/busbar/src/proxy/engine/mod.rs:600`, and its client sent
-/// it with `.body(payload)`, `proxy/engine/walk.rs:592`).
+
 #[test]
 fn a_chunked_request_body_is_held_to_the_cap() {
     let chunked = |n: usize| {
@@ -548,8 +525,7 @@ fn a_chunked_request_body_is_held_to_the_cap() {
 }
 
 /// RED (Q128 transport-http, bytes past the declared length): an emitted message whose bytes run
-/// past its stated `content-length` is refused at emit and nothing of it reaches the wire. RED on
-/// the framing that sent the declared prefix and dropped the rest.
+
 #[test]
 fn bytes_past_the_stated_length_are_refused_and_nothing_goes_out() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
@@ -588,19 +564,16 @@ fn h2_frame_types(wire: &[u8]) -> Vec<u8> {
 }
 
 /// RED (Q128 transport-http, the refused h2 stream): a stream refused partway through its request
-/// message stays refused until the host's end of that message. The rest of the message, arriving
-/// in later emits, is never read as a fresh request on the same stream: a fresh request there
-/// would go upstream with a head the auth never saw. RED on the framing that forgot the refused
-/// stream and parsed its remaining bytes as a new message.
+
 #[test]
 fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
     f.drive(0, 0);
-    // The far end's SETTINGS: the connection is up, so a request handed to it goes out.
+
     f.ingest(&h2(4, 0, 0, &[]), false);
     f.drive(0, 0);
     let _preface = f.take_wire(usize::MAX);
-    // Refused partway: bytes past the stated length.
+
     let r = f.emit(
         1,
         b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
@@ -618,7 +591,7 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
         "stream 1 is refused"
     );
     f.pieces().clear();
-    // The rest of the same message, shaped like a request of its own.
+
     let _ = f.emit(
         1,
         b"GET /never-authed HTTP/1.1\r\nx-injected: 1\r\n\r\n",
@@ -633,7 +606,7 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
         "no HEADERS frame goes out for the rest of a refused message: {:?}",
         String::from_utf8_lossy(&wire)
     );
-    // The host's end of a message still short of its stated length refuses it.
+
     let r = f.emit(
         5,
         b"POST /x HTTP/1.1\r\ncontent-length: 9\r\n\r\nhi",
@@ -651,7 +624,7 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
         !h2_frame_types(&f.take_wire(usize::MAX)).contains(&1),
         "and nothing of it goes out"
     );
-    // The control: a request on a fresh stream does go out, as a HEADERS frame this reading sees.
+
     f.emit(3, b"GET /ok HTTP/1.1\r\n\r\n", true, 0, 0)
         .expect("emit");
     f.drive(0, 0);
@@ -662,14 +635,9 @@ fn a_refused_h2_stream_reads_no_fresh_request_from_the_rest_of_its_message() {
 }
 
 /// RED (Q128 transport-http, the refused h1 exchange): on HTTP/1.1, where the connection carries
-/// one exchange, a request refused at emit drops its exchange and its buffered bytes and fails the
-/// framing, as `emit`'s doc states. RED on the framing that answered the refusal but kept the
-/// half-written exchange and a live connection.
+
 #[test]
 fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
-    // A chunked body alone is decoded and carried, as 1.5.5 carried one (rule 1, row 192:
-    // `a_chunked_request_body_is_held_to_the_cap`); beside a `content-length` it is the smuggling
-    // shape, refused.
     for message in [
         &b"POST /x HTTP/1.1\r\ncontent-length: 7\r\ntransfer-encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"[..],
         b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiEXTRA",
@@ -686,9 +654,7 @@ fn a_refused_h1_request_drops_its_exchange_and_fails_the_framing() {
 }
 
 /// RED (THE DESIGN §2 and §5: the wire bytes are hyper's, as 1.5.5's were): a field value is
-/// carried byte for byte. 1.5.5's client took a value as `http::HeaderValue`, which holds obs-text
-/// (0x80-0xFF), and sent it as given; the door's re-read of its own rendered message required UTF-8
-/// and refused the whole request for it.
+
 #[test]
 fn an_obs_text_field_value_goes_out_byte_for_byte() {
     let (r, wire) = rendered_and_sent(
@@ -710,9 +676,7 @@ fn an_obs_text_field_value_goes_out_byte_for_byte() {
 }
 
 /// RED (1.5.5 parity, Q128 transport-http LOW): the dial's authority is the one 1.5.5's URL parser
-/// (WHATWG, reqwest 0.12) sent: the host lower-cased and the scheme's own port dropped, so
-/// `:authority` on HTTP/2 and the stated `host` line on HTTP/1.1 are one string. RED on the
-/// normalisation that only rewrote IPv4 spellings.
+
 #[test]
 fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
     for (dial, authority) in [
@@ -737,11 +701,7 @@ fn the_dial_authority_is_normalised_as_1_5_5_normalised_it() {
 }
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED, length among the transport's own lines; ruling (A)
-/// 2026-10-19): the head the auth saw is the head on the wire. The host states the length before
-/// the auth (last, after the framer's own lines, as 1.5.5's goldens order it); the framer renders
-/// exactly that head, one length line and no other, and the connection sends it unchanged. A
-/// non-empty body with no stated length cannot be framed without a line the auth never saw, so it
-/// is refused. RED on the framer that appended its own length line to every request.
+
 #[test]
 fn the_wire_head_is_the_head_the_auth_saw() {
     let seen: &[(&str, &[u8])] = &[
@@ -777,7 +737,7 @@ fn the_wire_head_is_the_head_the_auth_saw() {
         crate::transport::render_envelope(&seen[..5], b"hi").is_err(),
         "a body with no stated length is refused"
     );
-    // An empty body states no length, and none goes out (1.5.5's client sent none).
+
     let get: &[(&str, &[u8])] = &[
         ("method", b"GET"),
         ("path", b"/x"),
@@ -791,7 +751,7 @@ fn the_wire_head_is_the_head_the_auth_saw() {
 }
 
 /// What an HTTP/2 far end reads off `wire`, a client connection's bytes: its first request's
-/// field lines in order, pseudo-fields aside, and its `:authority`.
+
 fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
     use tokio::io::AsyncWriteExt;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -824,11 +784,7 @@ fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
 }
 
 /// RED (ruling 23; BUSBAR-1.6.0.md l.3779, §4 item 5: NOTHING IS ADDED TO THE HEAD AFTER THE AUTH
-/// HAS RUN): an auth that signs the whole head sees every line on the wire. The head the auth saw
-/// (its own line, the plane's fields, the framer's stated lines, the host's length line) is the
-/// head a far end reads, line for line and in order, on HTTP/1.1 and on HTTP/2 (where the `host`
-/// line is the `:authority`). The one exception, an empty payload-method body on HTTP/2, is
-/// `meta::TAIL`'s and pinned in `tests/h2_parity.rs`; this cell's body is not empty.
+
 #[test]
 fn the_head_on_the_wire_is_every_line_the_auth_saw() {
     let seen: &[(&str, &[u8])] = &[
@@ -847,7 +803,6 @@ fn the_head_on_the_wire_is_every_line_the_auth_saw() {
         .collect();
     let message = crate::transport::render_envelope(seen, b"hi").expect("render");
 
-    // HTTP/1.1: the head, line for line.
     let wire = h1_wire(&message);
     let head: Vec<(String, String)> = wire
         .split("\r\n\r\n")
@@ -863,7 +818,6 @@ fn the_head_on_the_wire_is_every_line_the_auth_saw() {
         "h1: the wire head is every line the auth saw, and no other"
     );
 
-    // HTTP/2: the far end's reading of the door's own frames.
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
     f.drive(0, 0);
     let mut wire = f.take_wire(usize::MAX);
@@ -885,10 +839,7 @@ fn the_head_on_the_wire_is_every_line_the_auth_saw() {
 }
 
 /// RED (audit A1 F3; this method's own contract: a message that cannot be sent fails "the framing
-/// on HTTP/1.1, where the connection carries one exchange"): an HTTP/1.1 `emit` that is refused
-/// (here, a body over the cap) fails the FRAMING, so the next op answers FAILED, and keeps nothing
-/// of the refused message. RED on the framing that answered the error but kept the line usable
-/// with the dead buffer held for the connection's life.
+
 #[test]
 fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
     let capped = Posture {
@@ -916,11 +867,7 @@ fn a_refused_h1_emit_fails_the_framing_and_keeps_nothing() {
 }
 
 /// RED (audit A1 F4; RFC 9110 §6.5.1: a trailer field is not merged into the header section; THE
-/// DESIGN §5 refuses a trailer piece on the transport ABI): the trailer section of a chunked
-/// request never leaves as header fields. A trailer `host` would be a second `Host` (a 400 on
-/// HTTP/1.1), a trailer `connection` would change the line's semantics. They are discarded, as RFC
-/// 9110 §6.5.1 lets a recipient that removes the chunked coding do. RED on the reader that appended
-/// every trailer to the head.
+
 #[test]
 fn a_request_trailer_never_joins_the_header_section() {
     let wire = h1_wire(
@@ -938,11 +885,7 @@ fn a_request_trailer_never_joins_the_header_section() {
 }
 
 /// RED (audit A1 F5; THE DESIGN §5 l.722-723: the http door sends "on h1 the host header and
-/// origin-form target"): a stated target that is not origin form (`/...`) is refused, never
-/// rewritten. `?a=1` (a query with no path, which `http`'s path parser takes) went out as `/` on
-/// HTTP/1.1, the query dropped, and as `:path: ?a=1` on HTTP/2. A relative `v1/chat`, an
-/// absolute-form `http://other/x` and the asterisk form fail too, the HTTP/1.1 framing or the
-/// HTTP/2 stream, and put no request on the wire; an origin-form target still goes out as stated.
+
 #[test]
 fn a_target_not_in_origin_form_is_refused_not_rewritten() {
     for target in ["?a=1", "#f", "v1/chat", "http://other/x", "*"] {
@@ -982,11 +925,7 @@ fn queued(f: &mut Framing) -> usize {
 }
 
 /// RED (audit A1 F7; THE DESIGN §5 *Proven by*: 2,000 concurrent streams on bounded resources;
-/// 1.5.5's hyper body released a stream's HTTP/2 credit only as its consumer read): a stream's
-/// body is pulled from the connection only as far as the host has taken what was already handed
-/// up. The far end may send a whole window; the framer queues about one sink's worth, asks to be
-/// called again once the host has taken it, and the whole body still arrives. RED on the round
-/// that pulled every frame into an unbounded queue (and returned the window as it did).
+
 #[test]
 fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     let mut f = asked(Proto::H2, 300);
@@ -999,7 +938,7 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
     f.ingest(&far, false);
     f.drive(SEC, 0);
     let held = queued(&mut f);
-    // The hold (32 KiB) plus the one frame polled to reach it.
+
     assert!(
         held <= 48 * 1024,
         "{held} body bytes queued for a host that has taken none"
@@ -1020,10 +959,7 @@ fn an_h2_body_is_pulled_only_as_far_as_the_host_has_taken() {
 }
 
 /// THE `sse` CLAIM IS FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584; Q128 reader B, coordinator
-/// ruling): a dial to an `sse` target puts on the wire, HTTP/1.1 and HTTP/2 alike, the bytes the
-/// same dial to its `http` twin puts there (the scheme's own port 80 dropped from the authority, an
-/// `http` `:scheme`). RED before the fix: the HTTP/2 request went out as `:scheme: sse` with the
-/// port kept.
+
 #[test]
 fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
     let message =
@@ -1052,8 +988,7 @@ fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
 }
 
 /// A framing that fails in the same drive that queued output (a body shorter than its declared
-/// length, the far end closing) states the failure on the stream after what was handed up: the
-/// host never calls a connection again once it ended, so the failure text rides a piece.
+
 #[test]
 fn a_framing_failing_with_output_owed_fails_each_live_stream_after_it() {
     let mut f = asked(Proto::H1, 300);
@@ -1105,8 +1040,7 @@ fn a_framing_failing_with_nothing_owed_pushes_no_failure_piece() {
 }
 
 /// RED (codeaudit D1; THE DESIGN: every refusal explained): a refused request message names its
-/// cause. A `Content-Length` over `limits.request_body_max_bytes` and a target not in origin form
-/// each fail with text an operator can act on, not the bare word "Framing".
+
 #[test]
 fn a_refused_request_message_names_its_cause() {
     let capped = Posture {
@@ -1132,10 +1066,9 @@ fn a_refused_request_message_names_its_cause() {
         .emit(1, b"GET v1/chat HTTP/1.1\r\n\r\n", false, 0, 0)
         .expect_err("a target not in origin form is refused");
     assert!(target.0.contains("origin form"), "{target:?}");
-    // The path is not repeated either: a path may carry a token.
+
     assert!(!target.0.contains("v1/chat"), "{target:?}");
 
-    // The query is not repeated: it may carry a credential (an `?api_key=`).
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(30), 0).expect("dial");
     f.drive(0, 0);
     let keyed = f
@@ -1146,8 +1079,7 @@ fn a_refused_request_message_names_its_cause() {
 }
 
 /// RED: a failure text repeated the target: `Framing::dial` answered `not a target: <dial>` and a
-/// target not in origin form was named, path and all (a path may carry a token). No failure text
-/// repeats a byte of a dial or a path now.
+
 #[test]
 fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
     let Err(dial) = Framing::dial("http://SECRETD host/", Proto::H1, posture(30), 0) else {
@@ -1163,11 +1095,7 @@ fn a_failure_text_repeats_no_byte_of_the_dial_or_the_path() {
 }
 
 /// RED (codeaudit D2): the first-request inheritance of the dial URI's path is spent only by a
-/// request that was built. On HTTP/2 a first request whose builder refuses (a field value carrying
-/// byte 0x01, which the raw reader takes and `http` does not) fails its own stream; the next
-/// request naming no target is still the connection's first sent, so it goes to the dial's path,
-/// not `/`. The wire of that request equals the wire of the same request sent first on a fresh
-/// connection (same HPACK state, same frames), so no header block need be decoded.
+
 #[test]
 fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
     let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
@@ -1202,9 +1130,7 @@ fn a_first_request_that_fails_to_build_keeps_the_dial_path_for_the_next() {
 }
 
 /// RED (codeaudit D3; RFC 9112 6.3: a `Transfer-Encoding` overrides `Content-Length`): an h1
-/// answer carrying both is framed chunked by hyper, so its `Content-Length` states a length the
-/// body does not have. The head piece states none, as 1.5.5's `content_length()` was `None` for a
-/// chunked body; the host's pre-body download cap must not read a length the body is not.
+
 #[test]
 fn a_transfer_encoding_answer_states_no_declared_length() {
     let mut f = asked(Proto::H1, 300);
@@ -1218,8 +1144,7 @@ fn a_transfer_encoding_answer_states_no_declared_length() {
 }
 
 /// RED (codeaudit D4): the head allowance bounds the head itself, not only the buffer a body
-/// shares with it. A message whose header block runs past `HEAD_MAX_BYTES` is refused, whether its
-/// terminator has arrived or not, rather than parsed into millions of fields and handed to hyper.
+
 #[test]
 fn a_request_head_over_its_allowance_is_refused() {
     let mut head = b"GET /x HTTP/1.1\r\n".to_vec();
@@ -1257,9 +1182,7 @@ fn asked_with(proto: Proto, method: &str) -> Framing {
 }
 
 /// RED (codeaudit correctness M engine.rs:720): an answer that carries no body (a HEAD answer, a
-/// `204`, a `304`) may state the length the body WOULD have had (RFC 9110 8.6, 15.4.5), and the
-/// head piece stated it as the body's, so the host's pre-body download cap read 5 GiB for an answer
-/// of zero bytes. Such an answer states no declared length; a body that is there still does.
+
 #[test]
 fn an_answer_with_no_body_states_no_declared_length() {
     for (method, head) in [
@@ -1306,9 +1229,7 @@ fn an_answer_with_no_body_states_no_declared_length() {
 }
 
 /// RED (codeaudit resource M engine.rs:186): hyper's HTTP/2 client task holds a clone of its
-/// executor, and the executor's task list held that task: a cycle, so a dialled HTTP/2 framing
-/// the host finished before its connection task ended never freed it (hyper's connection state,
-/// the pipe, any request not yet sent). Dropping the framing frees all of it.
+
 #[test]
 fn a_dropped_h2_framing_frees_its_connection() {
     let f = asked(Proto::H2, 300);
@@ -1321,9 +1242,7 @@ fn a_dropped_h2_framing_frees_its_connection() {
 }
 
 /// RED (codeaudit correctness/error-handling L engine.rs:434): a stream refused partway (its
-/// failure piece out, the rest of its message still arriving) was failed AGAIN when the connection
-/// failed with output owed: two terminal pieces for one stream. A connection's failure is stated
-/// once on each stream the host was not already told failed.
+
 #[test]
 fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
     let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(30), 0).expect("dial");
@@ -1333,7 +1252,7 @@ fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
     f.emit(1, b"GET /x HTTP/1.1\r\n\r\n", true, 0, 0)
         .expect("emit");
     f.drive(0, 0);
-    // Refused partway: bytes past the stated length, the host's end of it not yet come.
+
     f.emit(
         3,
         b"POST /x HTTP/1.1\r\ncontent-length: 2\r\n\r\nhiX",
@@ -1342,7 +1261,7 @@ fn a_connection_failure_states_no_second_failure_on_a_refused_stream() {
         0,
     )
     .expect("an h2 stream's refusal is a failure piece");
-    // The far end breaks the connection (DATA on stream 0: a connection error), output owed.
+
     f.ingest(&h2(0, 0, 0, b"x"), false);
     f.drive(SEC, 0);
     let failed_on = |s: u64, f: &mut Framing| {
@@ -1421,8 +1340,7 @@ fn queued_request_body_ownership_is_wiped_when_the_framing_is_dropped() {
         framing.emit(1, request, true, 0, 0).unwrap();
         assert!(matches!(framing.exchanges[0].1, Stage::Queued(..)));
         drop(framing);
-        // The chunk decoder's allocation moves into the queued body. Preserve its original
-        // registration and require one actual wipe/free receipt, not a second stage label.
+
         probe.finish().assert_wiped_on_linux(&[if chunked {
             "chunk decoded"
         } else {

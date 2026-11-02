@@ -2,20 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The request target as the URL parser serialises it: a space in a model name goes out as `%20`,
-//! never refused. [`encode_target`] writes a target that way, byte for byte, for an `http(s)` URL
-//! (the WHATWG URL rules the parser follows for a special scheme):
-//!
-//! * the path: a `\` is a `/`; `.` and `..` segments (and their `%2e` spellings) are resolved; C0
-//!   controls, space, `"`, `<`, `>`, `` ` ``, `{`, `}`, DEL and every non-ASCII byte are
-//!   percent-encoded; an existing `%` is left as it is (no double encoding); an empty path is `/`;
-//! * the query, after the first `?`: C0 controls, space, `"`, `#`, `<`, `>`, `'`, DEL and every
-//!   non-ASCII byte are percent-encoded;
-//! * a fragment, from the first `#`, is not part of a request and is dropped;
-//! * leading and trailing C0 controls and spaces, and every tab, are removed first, as the parser
-//!   removes them.
-//!
-//! CR, LF and NUL are REFUSED rather than stripped or encoded: a byte that ends a line on this wire
-//! is the request-line injection shape, and the envelope renderer refuses it too.
 
 /// Why a target cannot be written.
 pub const REFUSED: &str = "a request target holds CR, LF or NUL";
@@ -45,16 +31,12 @@ fn is_dot_dot(seg: &[u8]) -> bool {
 }
 
 /// `target` as written on the request line.
-///
-/// # Errors
-///
-/// [`REFUSED`]: the target holds CR, LF or NUL.
+
 pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     if target.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         return Err(REFUSED);
     }
-    // As the parser reads its input: leading and trailing C0 controls and spaces go, and so does
-    // every tab.
+
     let start = target
         .iter()
         .position(|b| *b > 0x20)
@@ -76,7 +58,7 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
         Some(at) => (&target[..at], Some(&target[at + 1..])),
         None => (target, None),
     };
-    // A path is absolute on the request line.
+
     let mut absolute = zeroize::Zeroizing::new(Vec::with_capacity(path.len().saturating_add(1)));
     if path.first().is_none_or(|b| *b != b'/' && *b != b'\\') {
         absolute.push(b'/');
@@ -102,8 +84,7 @@ pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
             segments.push(seg);
         }
     }
-    // A byte expands to at most three encoded bytes, plus one leading slash. Reserving that
-    // extent prevents any ordinary Vec growth from freeing an unwiped target prefix.
+
     let mut out = zeroize::Zeroizing::new(Vec::with_capacity(
         target.len().saturating_mul(3).saturating_add(1),
     ));

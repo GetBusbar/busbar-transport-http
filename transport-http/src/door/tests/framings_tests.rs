@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The framings table: reached by token alone, never waited on, and a token that outlived its
-//! framing reaches nothing.
 
 use super::*;
 use crate::door::engine::{Posture, Proto};
@@ -36,7 +35,7 @@ fn every_index_has_one_place() {
 }
 
 /// A framing another op holds is answered at once (`Busy`), never waited for; once it is let go
-/// the next op reaches it. Another framing is reached meanwhile: no lock is shared.
+
 #[test]
 fn a_held_framing_answers_busy_at_once() {
     let table = Framings::default();
@@ -74,8 +73,7 @@ fn a_token_that_outlived_its_framing_reaches_nothing() {
 }
 
 /// RED (codeaudit concurrency M framings.rs:202): `finish` met a slot another op held (`cancel`'s
-/// visit, say) and answered `Busy`, and nothing ever freed the slot. A removal waits for the op
-/// holding it (ops answer in bounded CPU), then frees the framing and gives the slot back.
+
 #[test]
 fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
     let table = Framings::default();
@@ -101,9 +99,7 @@ fn a_removal_waits_for_the_op_holding_the_slot_and_frees_it() {
 }
 
 /// RED (codeaudit concurrency/error-handling L framings.rs:173): an op that panicked holding a
-/// slot poisoned it, and `finish` answered `no such framing` with the framing and the slot kept
-/// for the instance's life. The framing is still not reached by any other op, but its removal frees
-/// it, and the slot serves the next framing.
+
 #[test]
 fn a_poisoned_slot_is_still_freed_by_its_removal() {
     let table = Framings::default();
@@ -123,7 +119,7 @@ fn a_poisoned_slot_is_still_freed_by_its_removal() {
 }
 
 /// Accelerate only the private table's generation to its final representable value. This does
-/// not claim billions of real connection cycles; it proves the boundary where wrapping aliases.
+
 #[test]
 fn an_exhausted_slot_never_mints_a_generation_zero_alias() {
     let table = Framings::default();

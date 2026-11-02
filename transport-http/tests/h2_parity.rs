@@ -2,18 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE 1.5.5 BYTE COMPARISON, SECOND OPINION: an HTTP/2 bearer request, as 1.5.5's egress client
-//! put it on the wire and as this door puts it on the wire, byte for byte.
-//!
-//! The exit test is `tests/wire_golden.rs`, which reads what the PUBLISHED 1.5.5 binary sent (the
-//! recorded capture cells). This file rebuilds 1.5.5's client from its source instead, so a drift
-//! between the recording and a fresh reqwest 0.12 build shows up as a disagreement between the two.
-//!
-//! 1.5.5's client is reqwest 0.12 with its `http2` feature, built with exactly the calls 1.5.5 made
-//! (`crates/busbar/src/main.rs` at v1.5.5, the shared upstream client: keep-alive 30s/10s, adaptive
-//! window, no redirects, and the cleartext prior-knowledge key so the bytes can be read). It sends to
-//! a listener that only records. The door is driven through its table with the same request, and
-//! the two captures are compared frame by frame: the connection preface, SETTINGS, WINDOW_UPDATE,
-//! then the request's HEADERS (the HPACK block, byte for byte) and DATA.
 
 mod common;
 
@@ -84,8 +72,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .await
             .expect("bind");
         let port = l.local_addr().expect("addr").port();
-        // Recorded until the request is WHOLE by its own framing (its END_STREAM, or the body its
-        // length states), however late the client is scheduled, under a bound that fails in words.
+
         let rec = tokio::spawn(async move {
             let (mut sock, _) = l.accept().await.expect("accept");
             let mut got = Vec::new();
@@ -102,7 +89,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             }
             got
         });
-        // 1.5.5's shared upstream client, call for call (v1.5.5 crates/busbar/src/main.rs).
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .connect_timeout(Duration::from_secs(10))
@@ -114,10 +101,8 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .pool_max_idle_per_host(32)
             .pool_idle_timeout(Duration::from_secs(4))
             .redirect(reqwest::redirect::Policy::none())
-            // Hermetic: never the environment's proxy (`HTTP_PROXY`, `ALL_PROXY`), whose capture
-            // would be the proxy's, not the recording listener's.
             .no_proxy();
-        // The two keys, as 1.5.5 applied them: prior knowledge, or HTTP/1.1 only.
+
         let client = if h2 {
             client.http2_prior_knowledge()
         } else {
@@ -130,8 +115,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
             .header("authorization", BEARER)
             .header("content-type", "application/json")
             .body(body);
-        // The send is never cut mid-write: it runs until the recording is whole, then goes (the
-        // listener answers nothing).
+
         let send = tokio::spawn(req.send());
         let got = rec.await.expect("record");
         send.abort();
@@ -140,8 +124,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
 }
 
 /// What the door wrote for the same request. `state_len` is whether the host states the length line
-/// before the auth; the host states one for a non-empty body and none for an empty one
-/// (busbar-kernel `plane_driver/far_end.rs`, the length the head defaults ask for).
+
 fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     let d = busbar_transport_http::door::door();
     // SAFETY: the door's `'static` table.
@@ -202,8 +185,7 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
     unsafe { call(ops.begin, inst, &mut b, &mut fo, slot::BEGIN) };
     let framing = fo.framing;
     out.extend_from_slice(&wire[..fo.yielded.wire_len as usize]);
-    // THE HOST'S MERGE (THE DESIGN §6 step 5): the lines the framer's `locate` states for the
-    // target, added after the caller's fields, before the auth.
+
     let mut defaults = vec![0_u8; 512];
     let (mut a, mut n, mut l) = (vec![0_u8; 256], vec![0_u8; 256], vec![0_u8; 64]);
     let mut li: LocateIn = z();
@@ -243,7 +225,7 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
         name: s(n),
         value: s(v),
     }));
-    // Then the length line the host states, last.
+
     let len = body.len().to_string();
     if state_len {
         fields.push(Field {
@@ -290,7 +272,7 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
         .build()
         .expect("runtime");
     let (old, port) = capture_155(&rt, true, BODY);
-    // The port is part of `:authority`; the door dials the one the capture listened on.
+
     let (old_preface, old_frames) = h2_frames(&old);
     let (new_preface, new_frames) = h2_frames(&capture_door(port, true, BODY, true));
     for (label, f) in [("1.5.5", &old_frames), ("door", &new_frames)] {
@@ -315,7 +297,7 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
 }
 
 /// The same request under the http1-only key: 1.5.5's HTTP/1.1 bytes (origin-form target, `host`,
-/// reqwest's `accept`) and the door's, byte for byte.
+
 #[test]
 fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -334,12 +316,7 @@ fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
 }
 
 /// THE ONE LINE ADDED AFTER THE AUTH, PINNED (Q128 transport-http, ruling (D); `meta::TAIL` names
-/// it): HTTP/2, a payload method, an EMPTY body. The host states no length for an empty body, and
-/// the h2 framing adds `content-length: 0` at send, exactly as 1.5.5's client did. The door's
-/// frames are 1.5.5's client's byte for byte; and they are the very bytes the door sends when the
-/// head STATES `content-length: 0` before the auth, so the line on the wire is that one and no
-/// other. (1.5.5's recorded goldens carry no empty-body payload request, so the comparison is
-/// against 1.5.5's client rebuilt from its source, as this file's other cells are.)
+
 #[test]
 fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -368,7 +345,7 @@ fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
 }
 
 /// The same empty POST on HTTP/1.1 (ruling (D)): no length line, as 1.5.5's client sent none, byte
-/// for byte.
+
 #[test]
 fn an_http1_empty_post_carries_no_length_line_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()

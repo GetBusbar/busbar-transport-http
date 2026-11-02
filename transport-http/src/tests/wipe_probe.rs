@@ -148,8 +148,7 @@ fn observe(address: usize, len: usize, allocation_size: usize) -> Observation {
 }
 
 /// Register only an initialized Vec/String/OsString byte payload, at its allocation's start.
-/// The caller retains ordinary ownership and must not retype or make the registered prefix
-/// uninitialized. A later registration of the same live allocation extends its known prefix.
+
 pub(super) fn watch(label: &'static str, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -183,7 +182,6 @@ pub(super) struct Probe;
 
 impl Probe {
     pub(super) fn start() -> Self {
-        // Open before entering the allocator observer; the hook only uses FileExt::read_at.
         #[cfg(target_os = "linux")]
         MEMORY
             .get_or_init(|| File::open("/proc/self/mem").expect("open the Linux memory observer"));
@@ -215,7 +213,6 @@ impl Probe {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        // Also disarm on a test panic; no stale record may match a later reused address.
         let _ = STATE.try_with(|state| {
             let mut state = state.borrow_mut();
             state.active = false;
@@ -269,7 +266,7 @@ fn an_unwiped_payload_is_detected_without_reading_its_spare_capacity() {
     payload.resize(8193, 0);
     payload[8192] = b'!';
     watch("control", &payload);
-    // Unregistered buffers with spare capacity must be ignored altogether.
+
     drop(Vec::<u8>::with_capacity(8192));
     drop(payload);
     let report = probe.finish();
@@ -311,7 +308,7 @@ fn a_live_payload_has_no_deallocation_receipt() {
 }
 
 /// The actual Encode slot must release its normalized target on both success and every later
-/// refusal path. Caller-owned input/output are deliberately outside the registered payloads.
+
 #[test]
 fn encode_keeps_target_wiping_custody_on_success_short_sink_and_invalid_fields() {
     use busbar_contract::abi::mechanism::call::{AbiStr, Field, Outcome};

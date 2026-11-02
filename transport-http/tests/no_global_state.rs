@@ -2,9 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! RED (`BUSBAR-1.6.0.md` THE DESIGN §2: "A plugin holds no process-global state: what it keeps is
-//! per-instance"): the crate's production source declares no `static` item and no `thread_local!`.
-//! What a framer keeps lives in its door's instance; a linked copy and a dropped-in copy, or two
-//! instances, never share a slot.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +25,7 @@ fn production_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The lines of `text` that declare process-global state: a `static` item (any visibility,
-/// `static mut` included) or a `thread_local!` block. A `&'static` lifetime is not one.
+
 fn global_state(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim_start)
@@ -48,7 +45,7 @@ fn global_state(text: &str) -> Vec<String> {
 }
 
 /// The scan's positive control: it sees a static in every visibility and a thread-local, and
-/// passes a `const` and a `&'static` lifetime.
+
 #[test]
 fn the_scan_sees_a_static_where_one_is_written() {
     assert_eq!(global_state("static A: u8 = 0;").len(), 1);

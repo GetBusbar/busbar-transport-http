@@ -2,19 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE FRAMINGS AN INSTANCE HOLDS, by token, with no lock shared between them.
-//!
-//! No contended atomic per chunk, and request-path ops answer in bounded CPU, never blocking. So
-//! the per-chunk ops (`ingest`, `emit`, `timer`) reach a framing through its token alone: the token
-//! names a slot, the slot's segment is found with one read of a set-once cell, and the slot's own
-//! lock is the only one taken. Each slot sits on its own cache lines, so two framings never share
-//! one. The host calls one op at a time on a connection's framing, so that lock is never contended;
-//! should it ever be held, the op is answered at once ([`Reach::Busy`]), never waited for. The one
-//! exception is the framing's removal (`finish`), which must always free it ([`Framings::remove`]).
-//!
-//! Only `begin` and `finish` (once per connection, never per chunk) take the free list's lock, to
-//! mint a slot and to give one back. Segments are allocated on first use and grow geometrically, so
-//! an instance that frames a handful of connections holds a handful of slots. A token carries its
-//! slot's generation: one that outlived its framing never reaches the framing that reused the slot.
 
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
@@ -27,7 +14,7 @@ const BASE: usize = 64;
 const SEGMENTS: usize = 16;
 
 /// One framing the instance holds: a dialled connection's client, or an accepted connection's
-/// server.
+
 pub(super) enum Held {
     /// A dialled connection (`SIDE_DIAL`).
     Dial(Framing),
@@ -142,8 +129,7 @@ impl Framings {
         let (k, at) = place(index as usize);
         let segment =
             self.segments[k].get_or_init(|| (0..BASE << k).map(|_| Slot::default()).collect());
-        // A free slot is held by nobody, save an op still holding a token it outlived, which
-        // finds the generation moved on and lets go.
+
         let mut slot = segment[at]
             .0
             .lock()
@@ -154,10 +140,7 @@ impl Framings {
     }
 
     /// The framing `token` names, held for one op.
-    ///
-    /// # Errors
-    ///
-    /// [`Reach::Gone`]: no framing holds the token; [`Reach::Busy`]: another op holds it.
+
     pub(super) fn reach(&self, token: u64) -> Result<MutexGuard<'_, SlotState>, Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);
@@ -170,7 +153,7 @@ impl Framings {
         let state = match slot.0.try_lock() {
             Ok(s) => s,
             Err(TryLockError::WouldBlock) => return Err(Reach::Busy),
-            // An op that panicked left this framing mid-step: it is not reached again.
+
             Err(TryLockError::Poisoned(_)) => return Err(Reach::Gone),
         };
         if state.generation != generation || state.held.is_none() {
@@ -180,10 +163,7 @@ impl Framings {
     }
 
     /// Visit every framing no op holds right now, `f` on each. Never waits (the op holding a
-    /// framing may be the very one whose host call crossed here): a framing another op holds is
-    /// skipped, and the answer says one was (`true`), so the caller never reads a skipped framing
-    /// as one with nothing on it. Once per call over every minted slot, for the rare op that names
-    /// no framing (`cancel` names only a ticket).
+
     pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) -> bool {
         let mut skipped = false;
         for segment in self.segments.iter().filter_map(OnceLock::get) {
@@ -195,7 +175,7 @@ impl Framings {
                         }
                     }
                     Err(TryLockError::WouldBlock) => skipped = true,
-                    // A poisoned framing is reached by no op: nothing parks on it.
+
                     Err(TryLockError::Poisoned(_)) => {}
                 }
             }
@@ -204,14 +184,7 @@ impl Framings {
     }
 
     /// Drop the framing `token` names and give its slot back. The one op that WAITS for its slot:
-    /// a framing's last op must always free it, so a removal that meets an op holding the slot
-    /// (`cancel`'s visit, or an op another thread runs) waits for it to let go (every op answers in
-    /// bounded CPU), and one that meets a slot a panicking op poisoned frees it too, and clears the
-    /// poison, so the slot serves the next framing.
-    ///
-    /// # Errors
-    ///
-    /// [`Reach::Gone`]: no framing holds the token.
+
     pub(super) fn remove(&self, token: u64) -> Result<(), Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);
@@ -231,10 +204,9 @@ impl Framings {
         let held = state.held.take();
         drop(state);
         slot.0.clear_poison();
-        // Dropped outside the slot's lock: a framing's drop runs hyper's and the pipe's.
+
         drop(held);
-        // A token must never alias an earlier generation, including at the integer boundary.
-        // A slot at its last generation is retired; ordinary slots keep their existing reuse.
+
         if generation != u32::MAX {
             self.free
                 .lock()

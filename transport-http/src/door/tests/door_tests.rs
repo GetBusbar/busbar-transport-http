@@ -47,9 +47,7 @@ fn the_settings_read_at_their_paths_and_refuse_the_wrong_kind() {
 }
 
 /// RED: an undeclared key was read past, a zero limit was taken (a zero body cap refuses every
-/// body, a zero timeout every exchange) and a bad value was named `<key>: not of its declared
-/// kind`. The canon: an undeclared key is refused by name, zero is a bad value, and each bad value
-/// says what the key must be.
+
 #[test]
 fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_words() {
     let refused = |s: &'static str| {
@@ -80,7 +78,7 @@ fn the_settings_refuse_undeclared_keys_zero_limits_and_bad_values_in_the_canons_
 }
 
 /// RED: 1.5.5's URL parser lowercased a DNS name (and an IPv6 literal) before the request was
-/// built, so the offered name is lower-case; the dial authority stays as written.
+
 #[test]
 fn locate_offers_a_dns_name_lower_cased() {
     let (_, authority, name) = located(b"https://API.Example.com/").expect("located");
@@ -103,7 +101,7 @@ fn a_settings_blob_that_is_not_an_object_is_refused() {
 }
 
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
-/// the host read one figure for each.
+
 #[test]
 fn the_declared_defaults_are_the_hosts() {
     use busbar_contract::transport::registry::{
@@ -126,7 +124,7 @@ fn a_status_code_maps_to_its_class() {
     assert_eq!(class_of(429), STATUS_CALLER_FAULT);
     assert_eq!(class_of(503), STATUS_FAR_END_FAULT);
     assert_eq!(class_of(101), STATUS_OTHER);
-    // The band edges, each side of each.
+
     for (code, class) in [
         (199, STATUS_OTHER),
         (200, STATUS_SUCCESS),
@@ -144,7 +142,7 @@ fn a_status_code_maps_to_its_class() {
 }
 
 /// The fault table is 1.5.5's breaker table, code by code: the bands, and the statuses read out of
-/// their band. Written out rather than derived from the table, so a row that drifted fails here.
+
 #[test]
 fn a_status_code_maps_to_the_breakers_fault_reading() {
     let expect: &[(u16, u8)] = &[
@@ -178,7 +176,7 @@ fn a_status_code_maps_to_the_breakers_fault_reading() {
 }
 
 /// Every claim that classes its answers reads them for the breaker too, with the same table, and
-/// the tail the door states passes the host's load checks for both tables.
+
 #[test]
 fn every_classed_claim_has_the_fault_table() {
     use busbar_contract::abi::transport::check::{
@@ -199,9 +197,7 @@ fn every_classed_claim_has_the_fault_table() {
 }
 
 /// `locate`'s protocol offer is 1.5.5's client's ALPN offer (reqwest 0.12 by its version
-/// preference): `h2, http/1.1` on a secured target, `http/1.1` alone under the http1-only key, `h2`
-/// alone under the prior-knowledge key (http1-only, applied last, wins when both are set); on a
-/// cleartext one `h2` alone under prior knowledge (spoken by prior knowledge) and none otherwise.
+
 #[test]
 fn locate_offers_what_1_5_5_offered_in_the_handshake() {
     let keys = |s: &'static str| {
@@ -228,7 +224,7 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
         ),
         b"\x08http/1.1"
     );
-    // In the clear: the one protocol spoken by prior knowledge, else none.
+
     assert_eq!(offer(false, "{}"), b"");
     assert_eq!(
         offer(false, r#"{"advanced.upstream_h2_prior_knowledge":true}"#),
@@ -245,12 +241,7 @@ fn locate_offers_what_1_5_5_offered_in_the_handshake() {
 }
 
 /// RED (busbar ARCHITECT ruling on #780 (2), 1.5.5 parity): `locate` offers, and has the far end's
-/// certificate verified against, the ADDRESS an IPv4 spelling names, as 1.5.5's client did (its
-/// URL parser canonicalized the host before it connected): a spelling of loopback is `127.0.0.1`,
-/// a spelling of a public address is that address, a trailing root dot on an IPv4 literal is
-/// dropped. The authority dialled keeps the host as written, so the connector's destination guard
-/// still judges the spelling. A DNS name, an IPv6 literal and a dotted quad are offered as written.
-/// RED on the `locate` that offered `127.1` and `16909060` as names.
+
 #[test]
 fn locate_offers_the_address_an_ipv4_spelling_names() {
     for (target, authority, name) in [
@@ -285,9 +276,7 @@ fn locate_offers_the_address_an_ipv4_spelling_names() {
 }
 
 /// RED: the head is the field block — lower-case names, hyper's (1.5.5's) order with a repeated
-/// field on its own lines after its first, values unaltered — and no hop-by-hop field (the fixed
-/// list, and what `connection` names: a `connection:`, `te:` or `upgrade:` line in the wire input
-/// never appears as a framed field) nor `content-length` ever enters it.
+
 #[test]
 fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
     let mut h = http::HeaderMap::new();
@@ -317,22 +306,22 @@ fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
 }
 
 /// A field block is cut only at a line's start or inside a value, never inside a name: the host
-/// refuses any continuation that does not extend a value.
+
 #[test]
 fn a_field_block_is_cut_only_where_a_continuation_extends_a_value() {
     let block = b"date: Mon\r\nx-a: 1\r\n";
     assert_eq!(field_cut(block, 64, false), block.len());
-    // Inside "date": back to the start; just past the colon: a value.
+
     assert_eq!(field_cut(block, 3, false), 0);
     assert_eq!(field_cut(block, 5, false), 5);
-    // Inside "x-a" on the second line: back to the line's start.
+
     assert_eq!(field_cut(block, 13, false), 11);
-    // Opening inside a value, every byte up to the next name may go.
+
     assert_eq!(field_cut(b"on\r\nx: 1\r\n", 5, true), 4);
 }
 
 /// RED: the request target goes out as 1.5.5's client wrote it. A space is `%20`, an existing
-/// `%20` is not encoded twice, and CR, LF and NUL are refused.
+
 #[test]
 fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
     let enc = |t: &str| String::from_utf8(dest_head::encode_target(t.as_bytes()).unwrap()).unwrap();
@@ -351,7 +340,7 @@ fn a_target_is_percent_encoded_as_1_5_5_wrote_it() {
 }
 
 /// The encoder IS the URL parser 1.5.5's client serialised a path with: the same bytes for every
-/// target in the table.
+
 #[test]
 fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
     let table = [
@@ -387,7 +376,6 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
         "/v1/x??y",
     ];
     for t in table {
-        // 1.5.5 joined a base URL and an absolute path; a relative one is read as absolute.
         let absolute = if t.starts_with('/') || t.starts_with('\\') {
             t.to_owned()
         } else {
@@ -401,12 +389,9 @@ fn the_target_encoder_matches_the_url_parser_1_5_5_used() {
 }
 
 /// THE ENTRY CLAIMS `http`, `https` AND `sse` (THE DESIGN §5: "http claims `http`, `https` and
-/// `sse`"; Part 2 #50), each with its own claim row, and the secured scheme classes and reads its
-/// answers as `http` does. RED before the fix: the Statement claimed `http` and `sse` only.
+
 #[test]
 fn the_entry_claims_http_https_and_sse() {
-    // The names' lengths, in claim order: `http`, `sse`, `https` (the crate forbids the unsafe a
-    // read of their bytes would take; the Statement's own reader is the published suite).
     let names: Vec<usize> = CLAIM_NAMES.iter().map(|c| c.len).collect();
     assert_eq!(names, [4, 3, 5]);
     assert_eq!(CLAIMS.len(), names.len());
@@ -425,8 +410,7 @@ fn the_entry_claims_http_https_and_sse() {
 }
 
 /// The tail states exactly the ops this door serves: dialling, the accepted side (`begin` on
-/// `SIDE_ACCEPT`), and `detach` on an upgrade line. Not adopting: nothing hands a connection to
-/// http.
+
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
@@ -442,12 +426,7 @@ fn the_tail_states_the_ops_the_door_serves() {
 }
 
 /// THE INBOUND CLAIM ROWS ARE WHAT THE ACCEPT SIDE MATCHES (`BUSBAR-1.6.0.md` §6 "Auth points and
-/// guest lists" item 3: "The match vocabulary is defined once in `abi/transport`"; item 4: the
-/// listener's transport "matches the route on its guest list"). Every selector form the `http`
-/// claim row declares (`claims::SELECTOR_FORMS`) is one a guest-list line's route
-/// (`abi::transport::route::RouteMatch`) carries: a `PATH_*` form or a `FIELD_*` predicate. A form
-/// with no route spelling is a claim the door could never honour. RED before the fix: the row
-/// declared `HeaderExact`, which no `FIELD_*` predicate spells.
+
 #[test]
 fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
     use busbar_contract::abi::transport::route::{
@@ -479,10 +458,7 @@ fn every_declared_inbound_form_is_one_a_guest_list_route_carries() {
 }
 
 /// THE `sse` CLAIM IS SERVED, FRAMED EXACTLY AS `http` (BUSBAR-1.6.0.md l.584: "http claims
-/// `http`, `https` and `sse`"; Q128 reader B, coordinator ruling: plain, port 80, the same target,
-/// host line and protocol offer as `http`). `locate` on an `sse` target answers what it answers for
-/// the `http` one, and the framer's own head lines are the same. RED before the fix: `locate`
-/// refused every `sse` target.
+
 #[test]
 fn an_sse_target_locates_as_its_http_twin() {
     for (sse, http) in [

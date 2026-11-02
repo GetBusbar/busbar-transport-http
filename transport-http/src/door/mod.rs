@@ -2,75 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
-//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door. It is the
-//! crate's ONE entry and claims three schemes, `http`, `https` (an `http` target the connector
-//! secures) and `sse` (an event stream is an HTTP response body), all framed alike; it composes
-//! over nothing, the carrier being the connector's choice.
-//!
-//! A framer frames; it does not dial. The connector owns the socket and connection security; the
-//! protocol offer is this framer's (`locate` answers it), the connector makes it in the handshake
-//! and tells this framer what was agreed in [`ConnFacts::agreed_protocol`]. A cleartext connection
-//! has no handshake: it speaks HTTP/2 under the prior-knowledge key (offering `h2` alone, which the
-//! connector hands back as agreed) and HTTP/1.1 otherwise. From there each op is one step of
-//! [`engine::Framing`]:
-//!
-//! * `locate` reads a target URL: its authority, the name offered to the far end, and whether it
-//!   asks for connection security (`https`);
-//! * `begin` opens a dialled framing speaking the agreed protocol, and hands the host the bytes the
-//!   far end is owed first (the HTTP/2 connection preface and settings);
-//! * `encode` renders an envelope as ONE HTTP/1.1 request message, the bytes the egress
-//!   cross-check reads; `emit` takes that message on a stream and sends it on the connection as
-//!   whichever HTTP the connection speaks;
-//! * `ingest` takes what the far end sent; `timer` is the host's clock reaching a deadline the
-//!   framer asked for. Each answers the wire bytes owed and the frame pieces completed.
-//!
-//! A response arrives as frames on its stream: the HEAD frame (one field block, flagged
-//! `PIECE_FIELDS` and carrying the status code, its class and any `Retry-After`; framed even when
-//! no field is left in it), one frame per body chunk, and then an EMPTY frame that says the
-//! response is whole. The field block is `busbar_contract::abi::transport::fields`' rendering:
-//! lower-case names, hyper's (1.5.5's) order, a repeated field on its own lines, hop-by-hop fields
-//! dropped here. A trailer section is not handed up: 1.5.5's client read a response through
-//! reqwest, which yields data only.
-//!
-//! `locate` also answers this framer's protocol offer for a secured connection (ALPN, most
-//! preferred first): `h2, http/1.1`, `http/1.1` alone under the http1-only key, or `h2` alone under
-//! the prior-knowledge key, exactly as 1.5.5's client offered. The connector offers it and hands
-//! back what was agreed. On a cleartext target the offer is `h2` alone under the prior-knowledge
-//! key (the protocol spoken by prior knowledge) and none otherwise.
-//!
-//! One clock bounds each exchange, as 1.5.5's `limits.upstream_request_timeout_secs` did: from the
-//! attempt's start (the deadline the caller stamps on `emit`) to the response body's end.
-//!
-//! An op that has nothing more to do answers what it has, with the next instant it must be called
-//! at when hyper is waiting on a timer. The one op that may wait is the accepted side's call on the
-//! host auth handle (below): a pending `auth.call` answers the op PENDING under the SDK's `Pend`
-//! contract, and the op, re-entered with `FLAG_RESUME`, takes no input twice and re-issues the same
-//! completion handle.
-//!
-//! Every slot is a `SafeSlot` on the SDK's safe surface: the instance is the SDK's typed
-//! `sdk::Instance<Held<Instance>>`, host-lent bytes and host buffers go through `Lent` and
-//! `HostBuf`, and this crate holds no `unsafe`.
-//!
-//! THE ACCEPTED SIDE IS THIS DOOR'S TOO: per accepted connection the connector runs this framer's
-//! accept side, under the TLS server wrap when configured, and the ALPN offer is the framer's.
-//! `begin` on [`SIDE_ACCEPT`] serves the connection as v1.5.5's data listener did ([`accept`]):
-//! hyper's auto server, HTTP/2 by prior knowledge when the far side opens with its preface and
-//! HTTP/1.1 otherwise, HTTP/1's header read bounded at 30 s, upgrades on (v1.5.5
-//! `crates/busbar/src/tls.rs`:560-566, :620). Its TLS offer is `h2, http/1.1` ([`ACCEPT_OFFER`]),
-//! the owner's signed change from v1.5.5's `http/1.1` alone. Each request goes up as a stream (its
-//! head a field block with its method, target and authority in the head slots, then its body); its
-//! answer comes down through `emit`, the first emit its head with the status in `EmitIn::status`,
-//! the later ones its body. `detach` hands the connection to the claimed upgrade framer: as the far
-//! side sent it while nothing has been answered (the upgrade framer answers the upgrade itself), or
-//! from the byte after a request the host answered `101`. `refuse` answers the host's refusal of an
-//! accepted stream or connection ([`Accepted::refuse`]); `adopt` and every carrier op are refused.
-//!
-//! THE ACCEPTED SIDE GOES THROUGH THE GUEST LIST. `begin` on [`SIDE_ACCEPT`] keeps the listener's
-//! lines (`BeginIn::lines`, [`guest`]); after every drive, each decoded request is matched, its
-//! line's auth called at its points, what the auth names stripped, and the request handed in, all
-//! through the host auth handle the instance was opened with (`OpenIn::host`'s services:
-//! `auth.call`, `unit.hand_in`, `unit.refuse`, [`HostKernel`]). Only an admitted request goes up; a
-//! refused one is answered with the kernel's bytes, framed verbatim ([`accept`]).
 
 pub(crate) mod accept;
 pub(crate) mod dest_head;
@@ -78,12 +9,8 @@ pub(crate) mod engine;
 mod framings;
 pub(crate) mod guest;
 
-// This crate's own seal over what the auth handle answers (`Services::auth_call`): an accepting
-// side's answer names what to strip and carries no secret of its own.
 busbar_contract::own_seal!(Own);
 
-// The sans-IO `hyper` drive (pipe, executor, host-clock timer, sink fill), from the contract's SDK,
-// expanded over this crate's own `hyper` and `bytes`.
 busbar_contract::hyper_io!(::bytes::Bytes);
 
 use std::collections::HashMap;
@@ -128,8 +55,6 @@ use framings::{Framings, Held};
 use hyper_io::field_cut;
 use hyper_io::{fill, mark_stream_full, Owed};
 
-// ── the statement ────────────────────────────────────────────────────────────────────────────────
-
 /// The settings this transport reads, at their 1.5.5 paths.
 pub mod setting {
     /// Force cleartext HTTP/2 prior knowledge.
@@ -162,8 +87,7 @@ const fn bytes_str(b: &'static [u8]) -> AbiStr {
 }
 
 /// The schemes this ONE entry claims, by name: the Statement's `claims`, the one place they are
-/// stated. `http`, `sse` (an HTTP response body read as events) and `https` (an `http` target the
-/// connector secures), framed alike.
+
 const CLAIM_NAMES: &[AbiStr] = &[
     abi_str(crate::meta::KEY),
     abi_str(crate::meta::SSE_KEY),
@@ -182,8 +106,7 @@ const HTTP_ROW: Claim = Claim {
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
-/// and no selector of its own (the request that opens a stream is an `http` one); its status leg is
-/// `http`'s, at the first frame.
+
 pub(crate) const CLAIMS: &[Claim] = &[
     HTTP_ROW,
     Claim {
@@ -228,12 +151,7 @@ const fn status_rows() -> [StatusRow; FAULT_CLAIMS * HTTP_CLASSES.len()] {
 }
 
 /// What each answer means to the BREAKER, in HTTP's numbering: the fault table, beside the status
-/// table and never folded into it (the status class is the fee decision's leg). A refused
-/// credential (`401`, `403`) takes the destination down for every caller. A timed-out or throttled
-/// request (`408`, `429`) and every `5xx` (`529`, a provider's overloaded answer, among them) is the
-/// destination's transient fault, its `Retry-After` the cooldown floor. Every other `4xx` is the
-/// caller's own. A status off the table (`2xx`, `3xx`) states no reading. This is 1.5.5's breaker
-/// table exactly, on the wire that owns the numbering.
+
 const HTTP_FAULTS: [(u32, u32, u8); 10] = [
     (400, 400, FAULT_CALLER),
     (401, 401, FAULT_HARD),
@@ -275,7 +193,7 @@ const fn fault_rows() -> [FaultRow; FAULT_CLAIMS * HTTP_FAULTS.len()] {
 }
 
 /// Each setting this framer reads: its path, its kind and the default it declares. The ONE source
-/// of each default: the declarations below render from it and `read_settings` applies it.
+
 const SETTING_ROWS: [(&str, u32, &str); 4] = [
     (setting::H2_PRIOR_KNOWLEDGE, SETTING_FLAG, "false"),
     (setting::HTTP1_ONLY, SETTING_FLAG, "false"),
@@ -308,9 +226,7 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// THE AUTH POINTS THIS DOOR OFFERS: `Peer` (once per connection, before any head: the call
-/// carries no request and its answer no field or name, `door::accept`), `Head` and `HeadBody`.
-/// With no record the host reads `{Head, HeadBody}` and refuses at boot a line whose auth needs
-/// `Peer`.
+
 const OFFERED_POINTS: [u8; 4] = (busbar_contract::abi::auth::POINT_PEER
     | busbar_contract::abi::auth::POINT_HEAD
     | busbar_contract::abi::auth::POINT_HEAD_BODY)
@@ -337,10 +253,8 @@ pub const STATEMENT: Statement = Statement {
     ..statement(crate::meta::KEY, env!("CARGO_PKG_VERSION"), 64)
 };
 
-// ── the instance ─────────────────────────────────────────────────────────────────────────────────
-
 /// What `open` read from the settings (and the last good `refresh` replaced), and the framings it
-/// holds.
+
 pub struct Instance {
     settings: Mutex<Settings>,
     framings: Framings,
@@ -351,7 +265,7 @@ pub struct Instance {
 }
 
 /// Every slot's state: the SDK's held instance over [`Instance`], with the host tables `open` was
-/// handed (the auth handle an accepted side admits its requests through).
+
 type State = Opened<Instance>;
 
 /// The settings as read: the posture every framing begun under them carries, and the two keys
@@ -365,17 +279,14 @@ pub(crate) struct Settings {
 
 impl Instance {
     /// The settings in force: what `open` read, or the last good `refresh`. Held only to copy them,
-    /// by `locate` and `begin` (per connection, never per chunk).
+
     fn settings(&self) -> Settings {
         *self.settings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 /// The default the count setting `path` declares ([`SETTING_ROWS`]).
-///
-/// # Panics
-/// When `path` is not a declared count with a numeric default: a fault in this file, which the
-/// settings tests reach on every count.
+
 fn declared_count(path: &str) -> u64 {
     SETTING_ROWS
         .iter()
@@ -394,9 +305,7 @@ fn bad_count(path: &str) -> &'static str {
 }
 
 /// The settings blob's bytes, parsed (`validate`, `open` and `refresh` alike); `Err` is the first
-/// thing wrong with it, in the words the settings texts share: a blob that is not a JSON object, a
-/// key this transport does not declare, a value its declaration refuses. An absent blob reads as
-/// `{}`.
+
 fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
     let rows = SETTING_ROWS.map(|(path, kind, default)| SettingRow {
         path,
@@ -404,7 +313,6 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
         default,
     });
     let v = settings_reading(bytes, &rows).map_err(|refusal| {
-        // Keep this door's established count diagnostics, including each setting's unit.
         for row in rows.iter().filter(|row| row.kind == SETTING_COUNT) {
             if refusal.text()
                 == Some(format!("settings: {} must be a count above 0", row.path).as_str())
@@ -420,7 +328,7 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
             .as_bool()
             .ok_or_else(|| Refusal::failed(format!("settings: {k} must be true or false"))),
     };
-    // An absent count reads as the default its declaration states (`SETTINGS`): one source.
+
     let count = |k: &'static str| match v.get(k) {
         None => Ok(declared_count(k)),
         Some(x) => x
@@ -434,7 +342,6 @@ fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
     let max = count(setting::BODY_MAX_BYTES)?;
     Ok((
         Posture {
-            // 1.5.5's egress client: keep-alive ping every 30s, 10s to answer, adaptive window on.
             keep_alive_interval: Some(Duration::from_secs(30)),
             keep_alive_timeout: Duration::from_secs(10),
             adaptive_window: true,
@@ -473,8 +380,7 @@ impl Life for Instance {
     }
 
     /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
-    /// force stay; good ones apply to every framing begun after it (a framing already begun keeps
-    /// the posture it began under).
+
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         let s = settings_of(settings)?;
         *self.settings.lock().unwrap_or_else(PoisonError::into_inner) = s;
@@ -500,8 +406,6 @@ macro_rules! slot {
         }
     };
 }
-
-// ── the lifecycle: the SDK's slots over [`Instance`] but this one ───────────────────────────────
 
 slot!(
     /// `cancel`: the one framer op in flight is one parked on a pending `auth.call` (`begin`,
@@ -576,11 +480,7 @@ busbar_contract::not_served! {
 }
 
 /// `refuse`: THE HOST'S REFUSAL on an ACCEPTED connection (the transport ABI's `RefuseIn`), for a
-/// stream the host was handed or the whole connection
-/// ([`Accepted::refuse`]). The kernel's refusal of a request before its hand-in stays
-/// `unit.refuse`'s, framed inside the accepted side; this op is the host's, after it. It never
-/// pends: a request its drive decodes goes through the guest list's steps that never pend
-/// ([`with`]). A dialled connection is refused by its far end, never here.
+
 pub(crate) struct Refuse;
 impl SafeSlot for Refuse {
     type In = RefuseIn;
@@ -591,7 +491,6 @@ impl SafeSlot for Refuse {
         i: Lent<'_, RefuseIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
-        // The framing's own slot, let go before `with` reaches it again.
         let dialled = p.get().map(Opened::life).and_then(|inst| {
             let mut slot = inst.framings.reach(i.framing).ok()?;
             Some(matches!(slot.held(), Held::Dial(_)))
@@ -611,7 +510,6 @@ impl SafeSlot for Refuse {
             i.field(|x| &x.sink),
             &mut o,
             |h, resumed| match h {
-                // `refuse` never pends, so it is never resumed.
                 Held::Accept(a) if !resumed => a.refuse(stream, bytes, status, head_sent),
                 _ => Ok(()),
             },
@@ -619,19 +517,12 @@ impl SafeSlot for Refuse {
     }
 }
 
-// ── the framer ───────────────────────────────────────────────────────────────────────────────────
-
 /// THE ACCEPTED SIDE'S PROTOCOL OFFER (ALPN) under connection security, in the handshake's
-/// ProtocolNameList encoding: `h2, http/1.1`, most preferred first (1.5.5: `http/1.1` alone, a
-/// signed customer-visible change). A client that offers
-/// `http/1.1` alone, or no ALPN, is served HTTP/1.1 exactly as v1.5.5's listener served it; one that
-/// agrees `h2` opens with the HTTP/2 preface, which hyper's auto server reads ([`accept`]). A
-/// cleartext connection has no handshake: HTTP/2 there is the far side's prior knowledge, read off
-/// its preface.
+
 pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
 /// 1.5.5's client's protocol offer (ALPN), in the handshake's ProtocolNameList encoding: the
-/// accepting offer's own list, spelled once.
+
 const OFFER_H2_H1: &[u8] = ACCEPT_OFFER;
 /// The same under the http1-only key.
 const OFFER_H1: &[u8] = b"\x08http/1.1";
@@ -639,12 +530,7 @@ const OFFER_H1: &[u8] = b"\x08http/1.1";
 const OFFER_H2: &[u8] = b"\x02h2";
 
 /// The protocol offer `locate` answers, 1.5.5's by its keys. 1.5.5's client (reqwest 0.12) offered
-/// by its version preference, and each key SET that preference, the one applied last winning: `h2`
-/// alone under prior knowledge, `http/1.1` alone under http1-only (applied after prior knowledge,
-/// so it wins when both are set), `h2, http/1.1` otherwise. In the clear there is no handshake:
-/// the offer is `h2` alone under prior knowledge (the one protocol offered there is the one spoken
-/// by prior knowledge, `LocateOut::alpn_written`, so the connector knows the connection is h2c and
-/// shares it as 1.5.5 did), and none otherwise (HTTP/1.1).
+
 fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static [u8] {
     match (secure, prior_knowledge, http1_only) {
         (true, _, true) => OFFER_H1,
@@ -655,11 +541,7 @@ fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static 
 }
 
 /// AN `sse` TARGET AS ITS `http` TWIN, framed exactly as `http`. An `sse`
-/// stream is an HTTP response body read as events (`crate` docs), so its target is the `http` one
-/// with the same authority, path and query: plain, the scheme's own port 80, the same request
-/// target, `host` line and protocol offer, and on HTTP/2 an `http` `:scheme`. v1.5.5 had no `sse`
-/// target (its one `sse` reading was an `http(s)` request's `alt=sse` query), so nothing it sent
-/// moves. Any other target is returned as it is.
+
 pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
     if uri.scheme_str() != Some(crate::meta::SSE_KEY) {
         return uri;
@@ -670,8 +552,7 @@ pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
 }
 
 /// What `locate` answers for `target`: whether it is secured, the authority to dial (the host as
-/// the URL writes it, so the connector's destination guard judges the spelling the operator wrote),
-/// and the name offered to and verified against the far end ([`offered_name`]).
+
 fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     let Some(uri) = std::str::from_utf8(target)
         .ok()
@@ -702,19 +583,13 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 }
 
 /// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a
-/// URL, so `locate` and `begin` refuse it rather than drop it.
+
 fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
 
 /// THE NAME OFFERED TO THE FAR END AND VERIFIED AGAINST ITS CERTIFICATE, as 1.5.5's client had it:
-/// its URL parser (WHATWG, reqwest 0.12) turned every IPv4 spelling into the dotted quad before it
-/// connected, so `https://127.1/` was verified against `127.0.0.1` and `https://16909060/` against
-/// `1.2.3.4`, each as an IP address, never as the name written. The spellings are the resolver's
-/// (`inet_aton`: decimal, `0x` hex, leading-zero octal, fewer than four parts;
-/// `busbar_contract::net::expand_alternate_ipv4`), and a trailing root dot on an IPv4 literal is
-/// dropped, as WHATWG drops it. IPv6 uses hexadecimal pieces and compresses the first longest run
-/// of at least two zero pieces, including IPv4-mapped addresses. DNS names are ASCII lower-cased.
+
 fn offered_name(host: &str) -> String {
     if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
         use std::fmt::Write;
@@ -770,8 +645,6 @@ impl SafeSlot for Locate {
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
         let (secure, authority, name, offer) = if i.accept == 1 {
-            // An ACCEPTING listener's offer (`LocateIn::accept`): v1.5.5's TLS listener's, whatever
-            // the target (a listener names no far end, so none is read).
             (true, String::new(), String::new(), ACCEPT_OFFER)
         } else {
             let (secure, authority, name) = match located(i.field(|x| &x.target).bytes()) {
@@ -781,7 +654,7 @@ impl SafeSlot for Locate {
                     return Outcome::Failed;
                 }
             };
-            // The offer exists only where a handshake does: on a secured connection.
+
             let offer = p
                 .get()
                 .map(Opened::life)
@@ -793,9 +666,7 @@ impl SafeSlot for Locate {
         };
         o.set(|x| &x.secure, u32::from(secure));
         o.set(|x| &x.has_name, u32::from(!name.is_empty()));
-        // THE FRAMER'S OWN HEAD LINES (THE DESIGN §6 step 5): stated here, added by the host
-        // before the auth signs the head, never by `encode`. An accepting listener names no far
-        // end, so it states none.
+
         let defaults = if i.accept == 1 {
             String::new()
         } else {
@@ -812,9 +683,7 @@ impl SafeSlot for Locate {
         n.extend(name.as_bytes());
         l.extend(offer);
         d.extend(defaults.as_bytes());
-        // One short answer for every buffer, each at its full size. The framer's own lines are owed
-        // to every request, so a defaults buffer too small for them, an unlent one included, is a
-        // short answer, never READY with no lines (an h1 request would go out with no `host`).
+
         let short = !(a.fits() && n.fits() && l.fits() && d.fits());
         let (aw, and) = a.settle(short);
         let (nw, nnd) = n.settle(short);
@@ -826,8 +695,7 @@ impl SafeSlot for Locate {
         o.set(|x| &x.name_needed, nnd as u64);
         o.set(|x| &x.alpn_written, lw as u64);
         o.set(|x| &x.alpn_needed, lnd as u64);
-        // The length line is the host's to state, before the auth: for a fixed, non-empty body,
-        // last, after these lines. `encode` renders it and adds none.
+
         o.set(|x| &x.states_length, 1u8);
         o.set(|x| &x.defaults_written, dw as u64);
         o.set(|x| &x.defaults_needed, dnd as u64);
@@ -882,10 +750,7 @@ impl SafeSlot for Begin {
                 Err(why) => return failed(&mut o, format!("begin: {why}")),
             };
             let selected = loans.is_some();
-            // The accepted side serves whichever HTTP the far side opens with, as v1.5.5's data
-            // listener did (`accept`): no agreed protocol is read here. It is framed under the
-            // listener's guest list, in the kernel's match order (`BeginIn::lines`).
-            // The listener's list, copied once and shared by every connection it accepts.
+
             let lent = i.lines();
             let lines = inst.guests.shared(
                 |kept| {
@@ -897,16 +762,9 @@ impl SafeSlot for Begin {
                 o.error("begin: a guest-list line's route is not text");
                 return Outcome::Failed;
             };
-            // As on the dialled side: the framing joins the table only once its first step is
-            // READY, so a failed begin leaves no entry the host holds no token for. Nothing is
-            // admitted at `begin` (no request is decoded yet); the peer point is called on the
-            // connection's first drive with bytes, before any request is admitted.
-            // The listener's scheme, as the HOST states it (`BeginIn::scheme`): copied into every
-            // request view the auth is shown, never inferred from the handshake's facts. The host
-            // refuses a `begin` stating none.
+
             let scheme = i.scheme;
-            // The protocol the secure layer's handshake agreed (ALPN), when it ran one: the one
-            // the connection speaks until its first bytes show hyper's own choice.
+
             let alpn = i
                 .facts()
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
@@ -918,8 +776,6 @@ impl SafeSlot for Begin {
                     .with_alpn(alpn),
             );
             if selected {
-                // Peer checks use the opening generation, before the host confirms READY and
-                // releases its initial policy pin. A PENDING Begin keeps this exact framing.
                 let Some(token) = inst.framings.insert_held(h) else {
                     return failed(&mut o, "begin: every framing slot is in use".into());
                 };
@@ -979,8 +835,7 @@ impl SafeSlot for Begin {
             o.error("begin: the target is not a URL");
             return Outcome::Failed;
         };
-        // The framing joins the instance's table only once its first step is READY: a begin that
-        // fails hands the host no token, so nothing would ever release an entry it left behind.
+
         let mut h = Held::Dial(framing);
         let r = step(&mut h, i.field(|x| &x.sink), &mut o, None, |_| Ok(()));
         if r != Outcome::Ready {
@@ -1068,7 +923,6 @@ impl SafeSlot for Ingest {
             i.field(|x| &x.sink),
             &mut o,
             |h, resumed| {
-                // A resumed op took its bytes whole the first time.
                 match h {
                     _ if resumed => {}
                     Held::Dial(f) => f.ingest(bytes, i.end != 0),
@@ -1107,10 +961,8 @@ impl SafeSlot for Emit {
             i.field(|x| &x.sink),
             &mut o,
             |h, resumed| match h {
-                // A resumed op took its bytes whole the first time.
                 Held::Dial(_) if resumed => Ok(()),
                 Held::Dial(f) => {
-                    // A dialled stream's emits carry a request: no answer's status rides them.
                     check_emit_flags(&i, SIDE_DIAL, false).map_err(refused_status)?;
                     check_emit_status(&i, false).map_err(refused_status)?;
                     if let Some(sensitive) = sensitive {
@@ -1127,14 +979,10 @@ impl SafeSlot for Emit {
                     }
                 }
                 Held::Accept(a) if resumed => {
-                    // Its answer states the stream's queue as it stands: the first run's
-                    // fullness was answered PENDING, never to the host.
                     full = a.stream_full(i.stream);
                     Ok(())
                 }
                 Held::Accept(a) => {
-                    // The first emit on an accepted stream is its answer's head, with its status;
-                    // every other carries none.
                     let answers_head = a.answers_head(i.stream);
                     check_emit_flags(&i, SIDE_ACCEPT, answers_head).map_err(refused_status)?;
                     check_emit_status(&i, answers_head).map_err(refused_status)?;
@@ -1172,24 +1020,18 @@ impl SafeSlot for Timer {
             i.framing,
             i.field(|x| &x.sink),
             &mut o,
-            |h, _| {
-                // A connection the host refused whole is over: no deadline of it is owed.
-                match h {
-                    Held::Accept(a) if a.refused_whole() => {
-                        Err(engine::Failure("timer: the connection was refused".into()))
-                    }
-                    _ => Ok(()),
+            |h, _| match h {
+                Held::Accept(a) if a.refused_whole() => {
+                    Err(engine::Failure("timer: the connection was refused".into()))
                 }
+                _ => Ok(()),
             },
         )
     }
 }
 
 /// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire bytes
-/// still owed first). A connection nothing answered yet goes AS SENT, its upgrade request first,
-/// for an upgrade framer that answers the upgrade itself (its `adopt`); one whose request was
-/// answered `101` goes from the byte after that request. The framing has ended. A connection
-/// neither holds for, or a dialled one, has nothing to detach.
+
 pub(crate) struct Detach;
 impl SafeSlot for Detach {
     type In = FramingIn;
@@ -1215,9 +1057,7 @@ impl SafeSlot for Detach {
         let sink = i.field(|x| &x.sink);
         a.drive(sink.now_monotonic_ns);
         let agreed = a.agreed();
-        // Whether the connection goes, decided BEFORE a wire byte is taken: a detach that is not
-        // READY hands the host nothing, so the bytes still owed to the far side stay owed (the
-        // next op hands them over), never taken into a buffer the host does not read.
+
         match a.detach() {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -1230,7 +1070,7 @@ impl SafeSlot for Detach {
         let wire = a.take_wire(wire_buf.cap());
         wire_buf.extend(&wire);
         let wire_pending = a.wire_pending();
-        // The connection went above: this answers what it handed over, and moves nothing.
+
         let Ok(Some(rest)) = a.detach() else {
             return failed(&mut o, "detach: the switch has not completed".into());
         };
@@ -1252,7 +1092,6 @@ impl SafeSlot for Detach {
     }
 }
 
-// One bounded copy from detached custody into the host's frame sink.
 fn take_detached(
     rest: &mut std::collections::VecDeque<u8>,
     n: usize,
@@ -1301,8 +1140,7 @@ impl SafeSlot for Encode {
     ) -> Outcome {
         let fields = i.fields();
         let mut pairs = Vec::with_capacity(fields.len() + 2);
-        // The head words, where the host states them, ARE the request line: they lead, so they win
-        // over any same-named envelope field.
+
         let method = i.field(|x| &x.method).bytes();
         let word = i.field(|x| &x.target).bytes();
         let envelope_path = fields.iter().find_map(|f| {
@@ -1310,8 +1148,7 @@ impl SafeSlot for Encode {
             name.eq_ignore_ascii_case(b"path")
                 .then(|| f.field(|x| &x.value).bytes())
         });
-        // The target goes out as 1.5.5's client wrote it: percent-encoded, never refused for a
-        // space (`dest_head::encode_target`).
+
         let target = match (word, envelope_path) {
             (w, _) if !w.is_empty() => Some(w),
             (_, p) => p,
@@ -1345,7 +1182,7 @@ impl SafeSlot for Encode {
             o.error("encode: the rendered message is larger than the wire buffer");
             return Outcome::Failed;
         }
-        // The head, then the body straight from the host's own buffer: the one copy is the wire's.
+
         wire.extend(&head);
         wire.extend(body);
         o.set(|x| &x.yielded.wire_len, wire.written() as u64);
@@ -1392,9 +1229,7 @@ framer_op!(
 );
 
 /// Run `f` on framing `token`, then drive it and fill the sink; a failure text leads with the op's
-/// name. `f` is told whether the op was re-entered with `FLAG_RESUME` (it answered PENDING on a
-/// parked `auth.call`): such an op took its input whole the first time and takes none again, but
-/// what it answers is read afresh.
+
 fn with(
     op: FramerOp,
     p: &sdk::Instance<'_, State>,
@@ -1417,14 +1252,9 @@ fn with(
         extensions: head.field(|x| &x.extensions).bytes(),
         leases: held.leases(),
     };
-    // GUEST-LIST ADMISSION RUNS ON EVERY OP THAT DRIVES: a drive may decode a request (a
-    // pipelined HTTP/1.1 request is read as soon as the answer before it is written, in whichever
-    // op wrote it), and no later op is owed to it. On an op with no ticket (`timer`, `refuse`, a
-    // re-call) the may-pend `auth.call` is never made ([`Accepted::admit`]): a request whose line's
-    // auth must be called waits for the next ticketed op; every other step (the match, the
-    // kernel's refusals, the size gate, the hand-in) runs.
+
     let kernel = Some(kernel);
-    // Reached by its token alone; a framing another op holds is answered at once.
+
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
         Err(why) => return failed(o, format!("{}: {}", op.name, why.why())),
@@ -1436,11 +1266,7 @@ fn with(
 }
 
 /// Run `f` on `h`'s framing, drive it and fill the sink. A framing's failure is answered in the
-/// system's or the far end's words alone, never led by the op's name: a plane passes it on to its
-/// caller (a far end that closed unanswered is "connection closed before message completed", as
-/// 1.5.5's client said it), and this door has no log or audit channel to keep the op name in; the
-/// host knows which op it crossed. The door's own refusals (no open instance, no such framing) keep
-/// their op-named words.
+
 fn step(
     h: &mut Held,
     sink: Lent<'_, FramerSink>,
@@ -1466,10 +1292,6 @@ fn step(
             a.drive(sink.now_monotonic_ns);
             let mut more = false;
             if let Some(context) = kernel {
-                // Admit until nothing moves: every request decoded in this op is answered, admitted
-                // or parked in it, never left waiting for a wake no op owes it. Each round moves a
-                // request on or ends the loop, and the requests are the ones the bytes already
-                // taken hold.
                 loop {
                     let did = a.admit(&mut HostKernel {
                         services: context.services,
@@ -1489,11 +1311,6 @@ fn step(
                         return failed(o, "the host stream policy reply was invalid".into());
                     }
                     if did.parked {
-                        // A pending `auth.call` (the SDK's `Pend`, on this ticketed op): the op
-                        // yields nothing until the host's wake re-issues it on the same ticket
-                        // (the transport contract's "a framer pends only on a ticketed auth call").
-                        // The parked call holds its own `(ticket, seq)`: only that ticket's resume
-                        // re-issues it, and a fresh op on another ticket flows past it.
                         report_receive(a, context, o);
                         return Outcome::Pending;
                     }
@@ -1518,8 +1335,7 @@ fn step(
                     a.operation_done(context.ticket);
                 }
             }
-            // The protocol this accepted connection speaks, as its position in the accepting offer
-            // (`FramerYield::agreed`), on every accepting yield.
+
             o.set(|x| &x.yielded.agreed, a.agreed());
         }
     }
@@ -1527,7 +1343,7 @@ fn step(
 }
 
 /// The output lease owns this numeric snapshot through READY or PENDING. Policy-open control
-/// replies keep their own extension and are immediately recalled before any further socket read.
+
 fn report_receive(a: &Accepted, context: KernelContext<'_>, out: &mut Out<'_, FramerOut>) {
     let bytes = busbar_contract::abi::sdk::transport::receive::encode(a.retained_input() as u64);
     out.lease(
@@ -1670,7 +1486,7 @@ impl Kernel for HostKernel<'_, '_, '_> {
 }
 
 /// An `emit`'s status ([`EmitIn::status`]): stated on the emit that carries an accepted stream's
-/// answer head (`answers_head`), and on no other.
+
 fn check_emit_status(i: &EmitIn, answers_head: bool) -> Result<(), Fault> {
     if i._status_reserved != 0 {
         return Err(fault(Rule::UnknownCode, "emit._status_reserved"));
@@ -1695,7 +1511,7 @@ fn failed(o: &mut Out<'_, FramerOut>, text: String) -> Outcome {
 }
 
 /// The status class of `code`, from the classes the status rows state ([`HTTP_CLASSES`]);
-/// `STATUS_OTHER` off them.
+
 fn class_of(code: u16) -> u8 {
     let code = u32::from(code);
     HTTP_CLASSES

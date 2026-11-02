@@ -1,6 +1,4 @@
 //! Tests for `raw.rs`. Lifted out of the implementation file so its line count
-//! measures implementation and nothing else; still a direct child module, so `use
-//! super::*` reaches the private items it always did.
 
 use super::*;
 
@@ -23,8 +21,6 @@ fn parses_a_request_line_and_headers() {
 
 #[test]
 fn a_chunked_body_survives_arriving_one_byte_at_a_time() {
-    // The boundary that matters: a size line, a chunk's data, the CRLF after it and the
-    // trailer section are all free to be split by the network wherever it likes.
     let wire = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Checksum: 7\r\n\r\n";
     let mut decoder = ChunkedDecoder::default();
     for byte in wire {
@@ -106,31 +102,18 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
 }
 
 /// Whitespace between a field name and its colon is refused, not normalised away.
-///
-/// RFC 9112 is explicit that a server MUST reject such a message: the historical divergence in
-/// how intermediaries handled it is a request-smuggling surface, and trimming the name turns a
-/// header no compliant peer would honour into one this transport does.
+
 #[test]
 fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert!(Head::parse(b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n").is_err());
     assert!(Head::parse(b"GET / HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\n\r\n").is_err());
-    // The legal shape still parses, value whitespace and all.
+
     let ok = Head::parse(b"GET / HTTP/1.1\r\nContent-Length:  5 \r\n\r\n").unwrap();
     assert_eq!(ok.fields().next().unwrap().1, b"5");
 }
 
 /// `chunked` is the LAST coding or the message is not chunked at all.
-///
-/// A sender that applies any other coding must apply `chunked` as the final one, precisely so
-/// the message stays framable; a `Transfer-Encoding` where it is not final leaves the body
-/// length undeterminable, and a reader that took it for chunked anyway would be decoding a
-/// framing the sender never wrote.
-///
-/// RED (codeaudit tests-A L tests/raw.rs:131): and `chunked` ALONE is the coding this transport
-/// reads. `gzip, chunked` was read as plain chunked: the chunk framing undone, the `gzip` coding
-/// dropped with the `transfer-encoding` line, and the still-compressed bytes sent on under a
-/// length with nothing naming their coding. A coding this transport does not implement is refused
-/// (RFC 9112 6.1).
+
 #[test]
 fn chunked_counts_only_as_the_final_transfer_coding() {
     assert_eq!(
@@ -141,8 +124,7 @@ fn chunked_counts_only_as_the_final_transfer_coding() {
         framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
         Ok(BodyFraming::Chunked)
     );
-    // And a coding list that names one at all is still a declared coding, chunked or not: it is
-    // refused, never read by a `Content-Length` (or as no body).
+
     assert_eq!(
         framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n"),
         Err("unsupported transfer coding")
@@ -154,7 +136,7 @@ fn chunked_counts_only_as_the_final_transfer_coding() {
 }
 
 /// The list is the whole field across every line carrying it (RFC 9110 5.3): `chunked` on one
-/// line and `gzip` on the next is `chunked, gzip`, and `chunked` twice is a body wrapped twice.
+
 #[test]
 fn a_coding_list_spans_every_line_of_the_field() {
     for te in [
@@ -190,7 +172,7 @@ fn a_status_line_is_refused() {
 }
 
 /// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
-/// size may be followed by whitespace before its extensions (codeaudit review of D8).
+
 #[test]
 fn whitespace_before_a_chunk_extension_is_allowed() {
     let mut decoder = ChunkedDecoder::default();
@@ -202,9 +184,7 @@ fn whitespace_before_a_chunk_extension_is_allowed() {
 }
 
 /// RED (codeaudit correctness L raw.rs:255): the decoder deleted EVERY CR in a size or trailer
-/// line, so `1\r0` read as the size `10`, and took any run of CRs after a chunk's data. RFC 9112
-/// 7.1: a line ends in CRLF; a CR anywhere else makes it malformed, and a chunk's data is closed
-/// by one CRLF. (A bare LF ending a line is still read, RFC 9112 2.2.)
+
 #[test]
 fn a_cr_that_does_not_end_a_line_is_malformed() {
     for wire in [
@@ -221,7 +201,7 @@ fn a_cr_that_does_not_end_a_line_is_malformed() {
             String::from_utf8_lossy(wire)
         );
     }
-    // Split anywhere, the CRLF still reads as one line end.
+
     let whole = b"5\r\nhello\r\n0\r\n\r\n";
     for at in 0..whole.len() {
         let mut decoder = ChunkedDecoder::default();

@@ -2,14 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE `http` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_http::door::door`) and this
-//! crate's built cdylib (the same door behind the one `export_door!`), each admitted through the
-//! loader's ONE door validation and driven through the ONE dispatcher's crossing, give the same
-//! Statement and the same wire bytes for one request. Run against the busbar rev this repo pins
-//! (`.busbar-ref`).
-//!
-//! THE RED ARMS, same file: the door asked for as another kind is refused, linked (by the door's
-//! own kind) and dropped in (by the stated kind, before `dlopen`). A missing cdylib PANICS: this
-//! test IS the dropped-in door's proof, and never skips.
 
 use std::mem::{size_of, zeroed};
 use std::sync::Arc;
@@ -41,7 +33,7 @@ fn s(text: &str) -> AbiStr {
 }
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip.
+
 fn cdylib() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -88,7 +80,7 @@ fn open(p: &Plugin<Transport>) {
 }
 
 /// One scripted exchange through the dispatcher: begin a dialled http/1.1 connection, encode one
-/// request. What comes back is the wire bytes the door rendered.
+
 fn script(p: &Plugin<Transport>) -> Vec<u8> {
     let mut wire = vec![0_u8; 8192];
     let mut frame = vec![0_u8; 8192];
@@ -112,8 +104,7 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
     i.head = in_head();
     i.side = SIDE_DIAL;
     i.target = s("http://127.0.0.1:40123");
-    // The scheme the host states for the dial (`BeginIn::scheme`): the loader refuses a `begin`
-    // stating none (`check_begin_scheme`), and this target is plain http.
+
     i.scheme = SCHEME_PLAIN;
     i.facts = &facts;
     i.sink = sink();
@@ -135,12 +126,10 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
             name: s("content-type"),
             value: s("application/json"),
         },
-        // The length line the host states before the auth (THE DESIGN §6 step 5).
         Field {
             name: s("content-length"),
             value: s("7"),
         },
-        // The client defaults the host adds before auth, rather than at encode.
         Field {
             name: s("accept"),
             value: s("*/*"),
@@ -204,8 +193,6 @@ fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
     }
 }
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance_suite!`): both legs through the one
-// loader, every step at its pinned crossing count, over `conformance.json`.
 busbar_test_kit::conformance_suite! {
     door: busbar_transport_http::door::door,
     cdylib: "busbar_transport_http_plugin",

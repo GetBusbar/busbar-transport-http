@@ -2,10 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE GUEST LIST an accepted connection is framed under: the listener's lines as `begin` lent them
-//! (`BeginIn::lines`, in the kernel's match order), owned for the framing's life; the match of a
-//! decoded head against them in the contract's ONE route vocabulary
-//! (`abi::transport::route::RouteView`: `path_and_fields_match`, then `admits`); and the strip of
-//! what a line's auth named, so the plane never sees a credential.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -50,7 +46,7 @@ impl Line {
     }
 
     /// The line the host lent, copied out; `None` when its route's path or a predicate name is not
-    /// UTF-8 (`Lent::<LineEntry>::route_view`).
+
     #[must_use]
     pub fn of(l: Lent<'_, LineEntry>) -> Option<Self> {
         let e = *l.get();
@@ -73,7 +69,7 @@ impl Line {
     }
 
     /// A `none` line taking every method on every path (a path holds `/`), for the accepted side's
-    /// own cells.
+
     #[cfg(test)]
     #[must_use]
     pub fn any(line: u32) -> Self {
@@ -92,7 +88,7 @@ impl Line {
     }
 
     /// [`Line::any`] whose auth needs `points`, holding a body to `body_limit` at the body point,
-    /// for the accepted side's own cells.
+
     #[cfg(test)]
     #[must_use]
     pub fn any_needing(line: u32, points: u32, body_limit: u64) -> Self {
@@ -104,7 +100,7 @@ impl Line {
     }
 
     /// Whether the line the host lent is this one, read in place (nothing copied but the route
-    /// view's predicate list).
+
     #[must_use]
     pub fn same(&self, l: Lent<'_, LineEntry>) -> bool {
         let e = *l.get();
@@ -127,7 +123,7 @@ impl Line {
     }
 
     /// The line's route in the contract's vocabulary; its predicate list built only where it has
-    /// one (an empty list allocates nothing).
+
     fn view(&self) -> RouteView<'_> {
         RouteView {
             methods: self.methods,
@@ -165,7 +161,7 @@ pub struct Lists(Mutex<Vec<Arc<[Line]>>>);
 
 impl Lists {
     /// The list `same` recognises, else the one `copy` makes (kept for the next `begin`); `None`
-    /// when `copy` answers none.
+
     pub fn shared(
         &self,
         same: impl Fn(&[Line]) -> bool,
@@ -204,7 +200,6 @@ pub enum Matched {
 pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])]) -> Matched {
     let mut miss = None;
     for (n, l) in lines.iter().enumerate() {
-        // The path first, with no predicate list built; the list only for a line whose path holds.
         if !l.path_view().path_and_fields_match(path, &[]) {
             continue;
         }
@@ -225,12 +220,7 @@ pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])
 }
 
 /// `query` without every key `names` lists as a query key ([`Place::Query`]); the pairs kept, in
-/// order and as the far side spelled them. A key is compared as it percent-decodes, exactly as
-/// v1.5.5 read every inbound query key (`crates/busbar/src/auth/token.rs`:996-1003 `parse_query`,
-/// :1012-1035 `pct_decode`: `%XX` and `+` decoded, a malformed `%` kept as written), and
-/// case-sensitively: `%6Bey` is the key `key`, `Key` is not. v1.5.5 itself read no credential from
-/// an inbound query (its token carriers were header lines only, `crates/busbar/src/auth/mod.rs`
-/// :593-615), so its one inbound query reader is the rule. `None` when nothing is left.
+
 #[must_use]
 pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> {
     let kept: Vec<&str> = query
@@ -247,7 +237,7 @@ pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> 
 }
 
 /// A query component percent-decoded as v1.5.5's `pct_decode` did (`auth/token.rs`:1012-1035):
-/// `+` is a space, `%` with two hex digits is their byte, any other `%` is itself.
+
 fn decoded(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -275,7 +265,7 @@ fn decoded(s: &str) -> Vec<u8> {
 }
 
 /// Whether field line `name` is one `names` lists as a field line ([`Place::Field`]), compared
-/// ASCII case-insensitively.
+
 #[must_use]
 pub fn strips_field(name: &str, names: &[(String, Place)]) -> bool {
     names

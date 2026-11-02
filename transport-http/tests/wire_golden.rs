@@ -2,41 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE 1.5.5 WIRE GOLDEN: the http door's exit test, byte parity with the published 1.5.5 wire.
-//!
-//! The golden is what the PUBLISHED 1.5.5 binary put on the wire. The C0 capture cells (busbar's
-//! `testing/shadow-oracle/golden/1.5.5/cells/` at the pin, read in place) were recorded from it by
-//! busbar-release's `capture` driver: a mock upstream kept every HTTP/1.1 request byte for byte, and
-//! every HTTP/2 connection's frames, with each request header field's HPACK representation and bytes.
-//!
-//! This test reads every such cell and drives the door with the same logical request, as a plane
-//! hands it over: the verb, the target, the plane's own header fields in their order, and the body.
-//! What the http connection adds itself is taken OUT of the fields first (`host` and
-//! `content-length`), so it must be put back exactly where 1.5.5 put it: `host` and the default
-//! `accept` by the host's merge of the lines the framer's `locate` states (THE DESIGN §6 step 5),
-//! `content-length` by the framing. A trailing `accept: */*` (1.5.5's client
-//! default) is taken out too: when the caller sets none, the http door adds it (THE DESIGN §5: "the
-//! http transport owns the client defaults"). Then the door's bytes are compared with the recording:
-//!
-//! * HTTP/1.1: the whole request message, byte for byte;
-//! * HTTP/2: the connection preface, every frame the client sent up to the request's end (type,
-//!   flags, stream, length, and the SETTINGS and WINDOW_UPDATE values), and the request's header
-//!   block, field by field, as the HPACK bytes 1.5.5 wrote.
-//!
-//! A wire-exact recording pins the mock's port, so its `host` / `:authority` carries the literal
-//! port: the door is handed THAT port and every byte is compared as recorded. A recording that
-//! masks the run's port (`<PORT>`) gets a fixed port and the door's bytes are masked the same way;
-//! there the one HPACK field that carries the port (`:authority`) is compared by its representation
-//! (literal with incremental indexing, name index 1, Huffman) rather than its bytes, exactly as the
-//! recording masks it.
-//!
-//! An HTTP/2 connection is a conversation, so the far end's side is replayed from the recording:
-//! the server bytes the client had read before a stream opened (the transcript's `s2c_before`),
-//! and, while the request body waits on flow control, the capture mock's own rule, one connection
-//! and one stream WINDOW_UPDATE per DATA frame, each exactly that frame's length. The door's frames
-//! are compared up to the stream's END_STREAM, as `frames_before_end` records them.
-//!
-//! A missing golden is a FAILURE, never a skip: a wire suite that found nothing to compare proves
-//! nothing.
 
 mod common;
 
@@ -57,7 +22,7 @@ use common::{frame_name, h2_frames, H2Frame};
 const PORT: u16 = 40123;
 
 /// The port a wire-exact recording pinned, read off its `host` / `:authority`; `None` where the
-/// recording masked it.
+
 fn recorded_port(r: &Recorded) -> Option<u16> {
     r.headers
         .iter()
@@ -67,7 +32,7 @@ fn recorded_port(r: &Recorded) -> Option<u16> {
 }
 
 /// The cells this suite must find, at the least: the h1 dialect set, the h2 bearer, the token
-/// mint, a GET, the header-order pair. A golden dir missing any of them fails the suite.
+
 const REQUIRED: &[&str] = &[
     "egress.auth__cred-identity__anthropic",
     "egress.auth__cred-identity__openai",
@@ -122,12 +87,8 @@ unsafe fn call<I, O>(
     );
 }
 
-// ── the golden ───────────────────────────────────────────────────────────────────────────────────
-
 /// Busbar's own capture cells at the pin, never a copy in this repo (the fleet template deletes one):
-/// `BUSBAR_WIRE_GOLDEN_DIR` names the cells dir itself; otherwise `BUSBAR_GOLDEN_DIR` (plugin CI's
-/// busbar checkout, `testing/shadow-oracle/golden`) or `BUSBAR_CHECKOUT` (a busbar tree) leads to it.
-/// None of them set is a missing golden, and so a failure.
+
 fn golden_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("BUSBAR_WIRE_GOLDEN_DIR") {
         return PathBuf::from(d);
@@ -209,9 +170,7 @@ fn recorded() -> Vec<Recorded> {
 }
 
 /// The plane's own fields: what the http connection adds itself is taken out, so the door has to
-/// add it back: `host`/`:authority`, `content-length`, the pseudo-fields, and 1.5.5's client-default
-/// `accept: */*` where it trails the caller's fields (THE DESIGN §5: "When the caller sets none, the
-/// http door adds `accept: */*`"). An `accept` the caller wrote among its own fields stays.
+
 fn plane_fields(r: &Recorded) -> Vec<(String, String)> {
     let mut own: Vec<(String, String)> = r
         .headers
@@ -230,8 +189,6 @@ fn plane_fields(r: &Recorded) -> Vec<(String, String)> {
     }
     own
 }
-
-// ── the door ─────────────────────────────────────────────────────────────────────────────────────
 
 const WIRE_CAP: usize = 1 << 20;
 
@@ -341,8 +298,7 @@ impl Door {
                 value: s(path),
             },
         ];
-        // THE HOST'S MERGE (THE DESIGN §6 step 5): each line the framer's `locate` states that the
-        // request does not carry is added to the head before the auth, after the caller's fields.
+
         let mut fields = fields.to_vec();
         for line in self.defaults(&self.target.clone()).split("\r\n") {
             if let Some((n, v)) = line.split_once(": ") {
@@ -351,7 +307,7 @@ impl Door {
                 }
             }
         }
-        // Then the length line the host states for a fixed, non-empty body, last.
+
         if !body.is_empty()
             && !fields
                 .iter()
@@ -405,7 +361,7 @@ impl Door {
 
 impl Door {
     /// THE FRAMER'S OWN HEAD LINES `locate` states for `target` (`LocateIn::defaults_buf`): what the
-    /// host adds to a request head that does not carry them, before the auth signs it.
+
     fn defaults(&self, target: &str) -> String {
         let (mut a, mut n, mut l, mut d) = (vec![0; 512], vec![0; 512], vec![0; 64], vec![0; 512]);
         let mut i: LocateIn = z();
@@ -432,8 +388,6 @@ impl Drop for Door {
     }
 }
 
-// ── h1 ───────────────────────────────────────────────────────────────────────────────────────────
-
 fn door_h1(r: &Recorded) -> String {
     let settings = r#"{"advanced.upstream_http1_only":true}"#;
     let pinned = recorded_port(r);
@@ -446,8 +400,6 @@ fn door_h1(r: &Recorded) -> String {
         None => sent.replace(&format!(":{PORT}"), ":<PORT>"),
     }
 }
-
-// ── h2 ───────────────────────────────────────────────────────────────────────────────────────────
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -487,8 +439,6 @@ fn compare_block(cell: &str, want_fields: &[Value], block: &[u8]) -> Result<(), 
         let name = f["name"].as_str().unwrap_or_default();
         let bytes = f["bytes"].as_str().unwrap_or_default();
         if bytes == "<PORT-BEARING>" {
-            // Literal with incremental indexing, name index 1 (`:authority`): 0x41, then the
-            // Huffman bit and a one-byte length.
             let idx = f["index"].as_u64().unwrap_or(0);
             let huff = f["huffman_value"].as_bool().unwrap_or(false);
             if f["repr"] != "literal-incremental" || idx != 1 {
@@ -553,7 +503,7 @@ fn window_update(stream: u32, increment: u32) -> Vec<u8> {
 }
 
 /// Every recorded request on ONE h2 connection, driven through ONE door framing, with the far
-/// end's side replayed from the recording (the module doc).
+
 fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
     let pinned = reqs.first().and_then(|r| recorded_port(r));
     let target = format!("http://127.0.0.1:{}", pinned.unwrap_or(PORT));
@@ -562,8 +512,7 @@ fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
         "",
         &target,
     );
-    // How much of the connection's server bytes the door has read, and how many of the door's
-    // DATA frames the mock has answered with WINDOW_UPDATEs.
+
     let (mut s2c_read, mut credited) = (0usize, 0usize);
     for r in reqs {
         let h2 =
@@ -571,14 +520,13 @@ fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
                 .ok_or_else(|| format!("{cell}: an h2c entry with no h2 detail"))?;
         let stream = h2["stream"].as_u64().unwrap_or(1);
         let s2c = unhex(h2["s2c_before"].as_str().unwrap_or_default());
-        // A later stream opens after the client has read what the server wrote before it.
+
         if stream > 1 && s2c.len() > s2c_read {
             door.ingest(&s2c[s2c_read..]);
             s2c_read = s2c.len();
         }
         door.request(stream, &r.method, &r.path, &plane_fields(r), &r.body);
-        // A body that waits on flow control: the client reads the server's bytes, then the
-        // mock's WINDOW_UPDATEs, until the stream ends or nothing more moves.
+
         loop {
             let (_, frames) = h2_frames(&door.sent);
             if end_of(&frames, stream).is_some() {
@@ -655,7 +603,7 @@ fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
                 lines(&got)
             ));
         }
-        // This request's header block: the HEADERS (+CONTINUATION) on its stream.
+
         let block: Vec<u8> = frames
             .iter()
             .filter(|(t, _, st, _)| (*t == 1 || *t == 9) && u64::from(*st) == stream)
@@ -694,8 +642,6 @@ fn has_mask(body: &[u8]) -> bool {
     false
 }
 
-// ── the suite ────────────────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
     let all = recorded();
@@ -713,11 +659,7 @@ fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
     for r in all.iter().filter(|r| r.proto == "h1") {
         let want = r.raw.as_deref().expect("an h1 capture keeps its raw bytes");
         let mut got = door_h1(r);
-        // Where the recording masked part of the BODY (a signed assertion, a PKCE verifier, a
-        // run-varying id), the door is handed the masked body, so its `content-length` counts the
-        // mask; the recording's own (numeric, or `<LEN>`) stands. Only that header's value is
-        // taken over: its name, case and position are still the door's to get right, and its
-        // value must be the length of the body the door was handed.
+
         if let (Some(w), Some(g)) = (content_length(want), content_length(&got)) {
             if w != g && (w == "<LEN>" || has_mask(&r.body)) {
                 if g != r.body.len().to_string() {
@@ -769,8 +711,7 @@ fn the_door_puts_1_5_5_s_recorded_wire_bytes_on_the_wire() {
 }
 
 /// Over a secured connection that agreed `h2`, the request is 1.5.5's h2c request with ONE byte
-/// different: `:scheme` is `https`, HPACK static index 7 (`0x87`), where cleartext is index 6
-/// (`0x86`). The recorded h2c bearer cell is the rest of the proof; this pins that byte.
+
 #[test]
 fn an_h2_request_over_a_secured_connection_says_scheme_https() {
     let mut door = Door::open_at("{}", "h2", "https://api.example.com");
@@ -794,11 +735,7 @@ fn an_h2_request_over_a_secured_connection_says_scheme_https() {
 }
 
 /// RED (THE DESIGN §6 step 5, OWNER-LOCKED: "The transport finalises the head (its own lines: host,
-/// length, framing), calls the auth at its points, adds the lines the auth returns ... Nothing is
-/// added to the head after the auth has run"): `locate` states the framer's own head lines for a
-/// target, 1.5.5's client defaults in 1.5.5's order, so the host adds them BEFORE the auth signs
-/// the head: `accept: */*`, then `host` (its port only when it is not the scheme's own). RED on
-/// the framer that stated none and added them at `encode`, after the auth.
+
 #[test]
 fn locate_states_the_framers_own_head_lines() {
     let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");
@@ -821,8 +758,7 @@ fn locate_states_the_framers_own_head_lines() {
 }
 
 /// RED (THE DESIGN §6 step 5, ruling (A) 2026-10-19): `locate` asks the host to state the request's
-/// length line (`LocateOut::states_length`), so the length is in the head before the auth runs and
-/// nothing adds it after. RED on the framer that asked for none.
+
 #[test]
 fn locate_asks_the_host_to_state_the_length() {
     let door = Door::open_at("{}", "http/1.1", "http://127.0.0.1:9");

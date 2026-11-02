@@ -2,14 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `http` DOOR'S CONFORMANCE: the same door, compiled in and dropped in, driven the same way.
-//!
-//! The test is the HOST. It holds the socket (an in-memory duplex to a real hyper server on a tokio
-//! runtime of its own), the clock (a virtual monotonic clock it advances by hand) and the sink
-//! buffers, and it calls the framer only through the transport kind's table: `begin`, `emit`,
-//! `ingest`, `timer`. The framer is driven from the test's own thread, outside any runtime.
-//!
-//! Each scenario runs twice, through the linked door and through the cdylib `cargo test` built from
-//! `src/lib.rs`, and both must print the same proof lines.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
@@ -79,8 +71,6 @@ fn s(text: &'static str) -> AbiStr {
     }
 }
 
-// ── the far end: a real hyper server ─────────────────────────────────────────────────────────────
-
 /// A response body the test releases: the first chunk at once, the rest when told.
 struct ChanBody(mpsc::Receiver<Bytes>);
 impl Body for ChanBody {
@@ -95,7 +85,7 @@ impl Body for ChanBody {
 }
 
 /// The socket the host holds: what the server wrote and the host has not ingested, and a switch
-/// that drops the server's bytes on the floor (a far end gone silent).
+
 struct Socket {
     rx: Mutex<(VecDeque<u8>, bool)>,
     silent: AtomicBool,
@@ -179,8 +169,6 @@ fn serve(rt: &tokio::runtime::Runtime, h2: bool) -> Arc<Socket> {
     });
     sock
 }
-
-// ── the host ─────────────────────────────────────────────────────────────────────────────────────
 
 /// One frame piece as the host read it out of its sink.
 #[derive(Debug, Clone)]
@@ -283,7 +271,7 @@ impl Host {
             deadline: None,
             more: false,
             caps,
-            // The encoded request is read out of `wire` too, so it is never smaller than a message.
+
             wire: vec![0; caps.0.max(4096)],
             frame: vec![0; caps.1],
             pieces: vec![z(); caps.2],
@@ -437,7 +425,6 @@ impl Host {
                 name: s("content-type"),
                 value: s("application/json"),
             },
-            // The length line the host states before the auth (THE DESIGN §6 step 5).
             Field {
                 name: s("content-length"),
                 value: AbiStr {
@@ -452,7 +439,7 @@ impl Host {
         i.body = body.as_ptr();
         i.body_len = body.len();
         i.sink = self.sink();
-        // `encode` renders a whole message at once, so the host gives it the whole buffer.
+
         i.sink.wire_cap = self.wire.len();
         let mut o: FramerOut = z();
         assert_eq!(
@@ -505,9 +492,7 @@ impl Host {
     }
 
     /// Ingest whatever the far end sends until `done` holds of what was handed up (the explicit
-    /// end of what the cell waits for, never a quiet spell on a loaded runner), the far end ends, or
-    /// an op fails (its outcome). A far end that has not got there in [`PUMP_DEADLINE`] fails the
-    /// cell in words.
+
     fn pump_until(&mut self, done: impl Fn(&[Got]) -> bool, got: &mut Vec<Got>) -> Outcome {
         let deadline = std::time::Instant::now() + PUMP_DEADLINE;
         while !done(got) {
@@ -523,8 +508,7 @@ impl Host {
     }
 
     /// Ingest whatever the far end has sent until it stays quiet for `quiet` (for a cell that
-    /// asserts nothing the far end sends after it); the first op that fails ends the pump with its
-    /// outcome.
+
     fn pump(&mut self, quiet: Duration, got: &mut Vec<Got>) -> Outcome {
         let mut idle = Duration::ZERO;
         let step = Duration::from_millis(10);
@@ -564,7 +548,7 @@ impl Host {
     }
 
     /// One pass of [`Host::pump`]: `None` when the far end sent nothing yet (after a short wait),
-    /// `Some(Ready)` once it ended, `Some(other)` when an op failed; the bytes it sent ingested.
+
     fn pump_once(&mut self, got: &mut Vec<Got>) -> Option<Outcome> {
         let (bytes, end) = {
             let mut g = self.sock.rx.lock().expect("rx");
@@ -692,8 +676,6 @@ fn ended(got: &[Got], stream: u64) -> bool {
     })
 }
 
-// ── the scenarios ────────────────────────────────────────────────────────────────────────────────
-
 #[derive(Clone, Copy, PartialEq)]
 enum Case {
     /// Cleartext, no protocol agreed, the prior-knowledge key on: HTTP/2.
@@ -734,21 +716,19 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
         .expect("a head frame");
     println!("PROOF {label}: HEAD {}", head.code);
     assert_eq!((head.stream, head.code), (1, 200));
-    // The head states the class and the breaker's reading of its own status: a 200 is success, and
-    // nothing to count against the far end, with no `Retry-After` asked for.
+
     assert_eq!(
         (head.status_class, head.fault, head.retry_after_secs),
         (STATUS_SUCCESS, FAULT_NONE, 0),
         "{label}: the 200 head's class, fault reading and retry-after"
     );
-    // The head is ONE field block, flagged as one: no status line, no hop-by-hop field.
+
     assert_ne!(head.flags & PIECE_FIELDS, 0, "the head is a fields piece");
-    // A streamed answer declares no body length, and its head piece states none: read at the
-    // contract's 48-byte piece stride, the same on the linked and the dropped-in door.
+
     assert_eq!(head.declared_len, None, "{label}: no declared length");
     let block = String::from_utf8_lossy(&head.bytes).into_owned();
     assert!(!block.starts_with("HTTP/"), "{block}");
-    // The reason phrase is a head slot, never a field: HTTP/1's exactly as sent, none on HTTP/2.
+
     let reason: &[(u64, Vec<u8>)] = if case == Case::Http1Only {
         &[(1, b"OK".to_vec())]
     } else {
@@ -767,8 +747,6 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
     assert!(!ended(&got, 1), "the stalled response is not whole");
 
     if h2 {
-        // The adaptive window's ping is answered before the clock moves (a ping still in flight
-        // holds the keep-alive's back).
         host.pump_acks(&mut got);
         let p0 = host.pings();
         if case == Case::KeepAliveTimeout {
@@ -872,8 +850,7 @@ fn the_linked_and_the_dropped_in_door_frame_the_same() {
 }
 
 /// Two requests on ONE HTTP/2 connection: the one whose head never comes fails ALONE, at the
-/// request timeout (one clock per stream, send to body end), with a failure piece on its stream;
-/// its sibling, which finished inside its own clock, is untouched and the connection lives.
+
 fn one_stream_fails_alone(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime) {
     let sock = serve(rt, true);
     let mut host = Host::open(
@@ -944,8 +921,7 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
     rt.block_on(sock.release.send(())).expect("release");
     host.pump_until(|g| ended(g, 1), &mut got);
     assert!(ended(&got, 1), "the exchange completed");
-    // A field block a small sink split mid-line says so on the piece that continues the line
-    // (PIECE_CONTINUED); every other fields piece starts a line.
+
     let mut mid_line = false;
     for g in got.iter().filter(|g| g.flags & PIECE_FIELDS != 0) {
         assert_eq!(
@@ -956,8 +932,7 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
         );
         mid_line = g.flags & PIECE_END_OF_FRAME == 0 && !g.bytes.ends_with(b"\n");
     }
-    // The server stamps its head with the second it answered in; that one field is not the
-    // framer's, so it is taken out of both runs before they are compared.
+
     let mut frames = host.frame_log.clone();
     if let Some(at) = frames.windows(6).position(|w| w == b"date: ") {
         let end = at
@@ -974,7 +949,7 @@ fn exchange(ops: &'static Ops, rt: &tokio::runtime::Runtime, caps: Caps) -> (Vec
 }
 
 /// Compare every request and connection-setup byte while allowing PING and WINDOW_UPDATE
-/// scheduling to vary with the server's read/ACK timing. No application frame is removed.
+
 fn stable_h2_wire(wire: &[u8]) -> Vec<u8> {
     const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     assert!(
@@ -1008,9 +983,7 @@ fn stable_h2_wire(wire: &[u8]) -> Vec<u8> {
 }
 
 /// The re-call rule's check: an exchange collected through a sink so small that every op is
-/// re-called must preserve the SAME request/response bytes as a roomy sink. Timing-dependent
-/// HTTP/2 PING/WINDOW_UPDATE frames are checked separately from that byte comparison. A framer that answered
-/// anything twice on a re-call, or dropped anything, differs.
+
 fn recall_continues(tight: &(Vec<u8>, Vec<u8>), roomy: &(Vec<u8>, Vec<u8>)) -> Result<(), String> {
     if tight.0 != roomy.0 {
         return Err(format!(
@@ -1042,7 +1015,7 @@ fn one_h2_stream_fails_alone_linked_and_dropped() {
 }
 
 /// A `429` with `retry-after: 7` reaches the host as a head whose piece states the caller-fault
-/// class, the transient fault reading and the seven seconds, linked and dropped-in alike.
+
 #[test]
 fn a_429_head_states_its_class_fault_and_retry_after() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1094,7 +1067,7 @@ fn a_yield_more_recall_answers_nothing_twice() {
             recall_continues(&tight, &roomy)
         );
         assert_eq!(recall_continues(&tight, &roomy), Ok(()));
-        // RED: a framer that answered the head frame's first piece twice is caught.
+
         let mut dup = tight.clone();
         let first = dup.1[..5].to_vec();
         dup.1.splice(5..5, first);
@@ -1102,7 +1075,7 @@ fn a_yield_more_recall_answers_nothing_twice() {
             recall_continues(&dup, &roomy).is_err(),
             "a duplicated piece is caught"
         );
-        // RED, the wire half: a framer that wrote the first wire bytes twice is caught too.
+
         let mut dup = tight.clone();
         assert!(!dup.0.is_empty(), "the exchange wrote wire bytes");
         let at = dup.0.len().min(5);
@@ -1116,8 +1089,7 @@ fn a_yield_more_recall_answers_nothing_twice() {
 }
 
 /// A field name that is not an RFC 9110 token (`authorization:x`) would be re-read as a second
-/// `authorization` on the door's own reparse: through the whole door, `encode` fails it, linked
-/// and dropped-in alike, while a token name still encodes.
+
 #[test]
 fn a_non_token_field_name_fails_encode_through_the_door() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1143,11 +1115,8 @@ fn a_non_token_field_name_fails_encode_through_the_door() {
     }
 }
 
-// ── the accepted side (INBOUND-LISTEN) ───────────────────────────────────────────────────────────
-
 /// One accepted connection driven through the table as the connector drives it: the host hands the
-/// far side's raw bytes to `ingest`, reads the request's head and body out of its sink, and answers
-/// through `emit`, the first emit its head with the status in `EmitIn::status`.
+
 struct AcceptHost {
     ops: &'static Ops,
     inst: *mut c_void,
@@ -1166,7 +1135,6 @@ struct AcceptHost {
     /// The scripted kernel's context: the key of this host's [`Script`].
     ctx: u64,
     /// The ticket `begin`, `ingest` and `emit` run on, as the host tickets them (`timer` and
-    /// `refuse` run on none, as the connector crosses them).
     ticket: Ticket,
     /// An answer said the connection is over (`YIELD_ENDED`).
     ended: bool,
@@ -1272,7 +1240,7 @@ impl AcceptHost {
     }
 
     /// An accepted connection on a listener whose one line takes every `POST /v1/messages` with
-    /// auth `none`, its hand-in answered CONTINUE: the request goes up as before.
+
     fn open(ops: &'static Ops) -> Self {
         Self::open_with(
             ops,
@@ -1282,13 +1250,13 @@ impl AcceptHost {
     }
 
     /// An accepted connection on a listener with guest list `lines`, the auth handle answered by
-    /// `script` (`OpenIn::host`'s services table).
+
     fn open_with(ops: &'static Ops, lines: Vec<LineEntry>, script: Script) -> Self {
         Self::open_on(ops, lines, script, |_| {}, SCHEME_PLAIN)
     }
 
     /// [`AcceptHost::open_with`] on a connection whose `ConnFacts` `facts` fills, as the host's
-    /// secure layer states them.
+
     fn open_on(
         ops: &'static Ops,
         lines: Vec<LineEntry>,
@@ -1368,7 +1336,7 @@ impl AcceptHost {
             flags: 0,
         };
         i.side = SIDE_ACCEPT;
-        // The listener's scheme, as the host states it (busbar step 2, `BeginIn::scheme`).
+
         i.scheme = scheme;
         i.facts = &facts;
         i.lines = h.lines.as_ptr();
@@ -1440,7 +1408,7 @@ impl AcceptHost {
     }
 
     /// `ingest` with head flags `flags` (`FLAG_RESUME`: the host re-issuing the op that answered
-    /// PENDING, with the same bytes).
+
     fn ingest_with(&mut self, bytes: &[u8], flags: u32) -> Outcome {
         let mut i: IngestIn = z();
         i.head.ticket = self.ticket;
@@ -1461,7 +1429,7 @@ impl AcceptHost {
     }
 
     /// `emit` with head flags `flags` (`FLAG_RESUME`: the host re-issuing the op that answered
-    /// PENDING): its outcome and its yield's flags.
+
     fn emit_with(
         &mut self,
         stream: u64,
@@ -1488,7 +1456,7 @@ impl AcceptHost {
     }
 
     /// `refuse`: `bytes` for `stream` (`None`: the whole connection), with the neutral `status`
-    /// and `head_sent`, on no ticket (it never pends), re-called while it answers `YIELD_MORE`.
+
     fn refuse(
         &mut self,
         stream: Option<u64>,
@@ -1522,7 +1490,7 @@ impl AcceptHost {
     }
 
     /// `detach`, on no ticket, re-called while it answers `YIELD_MORE`: its outcome and every
-    /// frame byte it handed over (the bytes the adopting framer is given).
+
     fn detach(&mut self) -> (Outcome, Vec<u8>) {
         let mut handed = Vec::new();
         loop {
@@ -1659,7 +1627,6 @@ fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
         "{label}: the request is whole"
     );
 
-    // RED: an answer head with no status, and a status on an emit that carries no head.
     assert_eq!(
         h.emit(1, b"content-type: text/plain\r\n", false, 0),
         Outcome::Failed,
@@ -1687,8 +1654,7 @@ fn answered(label: &str, ops: &'static Ops) -> Vec<u8> {
 }
 
 /// The protocol offer the door answers for an ACCEPTING listener: `h2, http/1.1`, the owner's
-/// signed change from v1.5.5's `http/1.1` alone (OWNER RULING Q137, BUSBAR-1.6.0.md l.5137-5138;
-/// parity binding PB-69), not its dial offer.
+
 fn accept_offer(ops: &'static Ops) -> Vec<u8> {
     let mut i: OpenIn = z();
     let mut o: OpenOut = z();
@@ -1747,8 +1713,6 @@ fn the_accepted_side_answers_alike_linked_and_dropped_in() {
         assert_eq!(offer, b"\x02h2\x08http/1.1", "{image}: Q137");
     }
 }
-
-// ── the guest list and the auth handle (BUSBAR-1.6.0.md §6 "Auth points and guest lists") ──────
 
 /// One call the door made on the host auth handle, as the scripted kernel read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1839,8 +1803,6 @@ const MINTED: UnitRef = UnitRef { id: 41, mac: 42 };
 static SCRIPTS: Mutex<BTreeMap<u64, Script>> = Mutex::new(BTreeMap::new());
 static NEXT_CTX: AtomicU64 = AtomicU64::new(1);
 
-// A failing test may poison the shared registry while holding its own context. Other contexts
-// retain their independent scripts and must still report their original results.
 fn scripts() -> std::sync::MutexGuard<'static, BTreeMap<u64, Script>> {
     SCRIPTS
         .lock()
@@ -1970,8 +1932,7 @@ extern "C" fn auth_call(ctx: HostCtx, input: *const c_void, out: *mut ServiceOut
         });
         script.seqs.push(i.head.handle.seq);
         script.tickets.push(i.head.handle.ticket);
-        // The loader's rule (THE DESIGN §11.12 l.1602): a may-pend service called with no ticket
-        // is REFUSED.
+
         if i.head.handle.ticket.is_none() {
             return outcome(out, Outcome::Refused);
         }
@@ -2054,8 +2015,7 @@ extern "C" fn unit_hand_in(ctx: HostCtx, input: *const c_void, out: *mut Service
 }
 
 /// The kernel's refusal for `cause`: its status and body (1.5.5's no-route and size-gate bodies,
-/// `http.crosscut__unknown-path__bare` and `http.crosscut__413__openai`), `content-type` its one
-/// field.
+
 fn refusal(cause: u32) -> (u16, &'static str) {
     match cause {
         REFUSE_NO_ROUTE => (
@@ -2073,7 +2033,7 @@ fn refusal(cause: u32) -> (u16, &'static str) {
 }
 
 /// The bytes the kernel's refusal for `cause` becomes on HTTP/1.1, undated: its status line, its
-/// field, the length hyper states for a body of known size (as v1.5.5's `Full` body), its body.
+
 fn refusal_wire(cause: u32) -> String {
     let (status, body) = refusal(cause);
     let reason = hyper::StatusCode::from_u16(status)
@@ -2108,7 +2068,7 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
         };
         drop(scripts);
         let (status, body) = refusal(i.cause);
-        // The kernel's memory, valid past the call (the test leaks it).
+
         let fields: &'static [Field] = Box::leak(
             named
                 .into_iter()
@@ -2239,7 +2199,7 @@ fn head_stop(label: &str, ops: &'static Ops) {
 }
 
 /// A `HeadBody` line whose body passes its limit: `OVER_GATE` is asked BEFORE any verdict, and
-/// the auth is never called (1.5.5 answered 413 before inbound SigV4, spec §6 item 4).
+
 fn over_gate(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2261,7 +2221,7 @@ fn over_gate(label: &str, ops: &'static Ops) {
 }
 
 /// A `HeadBody` line within its limit: the auth is shown the head and the whole body, then the
-/// request goes up whole.
+
 fn head_body_within(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2289,7 +2249,7 @@ fn head_body_within(label: &str, ops: &'static Ops) {
 }
 
 /// What the auth names is stripped before the hand-in and before anything goes up: a field line
-/// (named in another case: ASCII case-insensitive) and a query key (case-sensitive: `Key` stays).
+
 fn strips(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2386,7 +2346,7 @@ fn hand_in_stop(label: &str, ops: &'static Ops) {
 }
 
 /// A `none` line: no auth call; the hand-in carries no unit (the kernel mints it there), and the
-/// request goes up.
+
 fn none_line(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2412,7 +2372,7 @@ fn none_line(label: &str, ops: &'static Ops) {
 }
 
 /// The unit is carried: a `{Peer, Head}` line calls the peer point once (no request, no unit),
-/// then the head (no unit yet), and the hand-in carries the unit the head call minted.
+
 fn unit_carried(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2440,8 +2400,7 @@ fn unit_carried(label: &str, ops: &'static Ops) {
 }
 
 /// A request the kernel neither admitted nor refused: nothing went up to the plane, and the door
-/// wrote no answer of its own (coordinator ruling on #24 open question 4: a request never goes
-/// upstream when the hand-in or the refusal fails).
+
 fn never_reached_the_plane(label: &str, h: &AcceptHost) {
     assert_eq!(h.heads_up(), 0, "{label}: nothing went up to the host");
     assert!(h.words.is_empty(), "{label}: no head slots went up");
@@ -2455,7 +2414,7 @@ fn never_reached_the_plane(label: &str, h: &AcceptHost) {
         "{label}: no bytes of the transport's own: {:?}",
         String::from_utf8_lossy(&h.out)
     );
-    // An unanswered HTTP/1.1 request ends its connection (hyper closes it with no bytes).
+
     assert!(h.ended, "{label}: the connection is closed");
 }
 
@@ -2567,8 +2526,7 @@ fn refusal_fails(label: &str, ops: &'static Ops) {
 }
 
 /// A query key the far side percent-encoded is the key it decodes to, as v1.5.5 read every inbound
-/// query key (`crates/busbar/src/auth/token.rs`:996-1003 `parse_query`, :1012-1035 `pct_decode`:
-/// `%XX` and `+` decoded before the key is compared): `%6Bey` is `key`, stripped; `Key` is not.
+
 fn strips_a_decoded_query_key(label: &str, ops: &'static Ops) {
     let h = admitted(
         ops,
@@ -2608,8 +2566,7 @@ const TICKET: Ticket = Ticket {
 };
 
 /// `timer` is no ticketed op (`contract!(TIMER, true, false, ..)`: it never pends): it never calls
-/// the auth handle and never answers PENDING, even with a request parked on a pending `auth.call`
-/// (Q128 reader A finding 2; THE DESIGN §11.12 l.1602-1604, Appendix A.4.6 l.3646).
+
 fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -2637,8 +2594,7 @@ fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
         0,
         "{label}: nothing went up past the parked call"
     );
-    // The parked request was not dropped by the timer: the resume answers it (Q128 reader B
-    // finding 1: no request is ever dropped without an answer).
+
     assert_eq!(
         h.ingest_with(POST_HELLO, FLAG_RESUME),
         Outcome::Ready,
@@ -2649,9 +2605,7 @@ fn timer_never_calls_the_auth(label: &str, ops: &'static Ops) {
 }
 
 /// A pending `auth.call` parks the op; the host's resume re-issues the op with the same bytes and
-/// `FLAG_RESUME`: the door takes no byte twice, re-issues the SAME completion handle, and the
-/// request goes up once, whole (the transport contract: "the framer re-issues the same handle, and
-/// the service answers its STORED result").
+
 fn a_resume_reissues_the_same_handle(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -2689,8 +2643,7 @@ fn a_resume_reissues_the_same_handle(label: &str, ops: &'static Ops) {
 }
 
 /// A `cancel` of an op parked on a pending `auth.call`: its bytes were taken, so the disposition is
-/// PARTIAL, and the parked call is let go (a later op calls afresh, under a new handle); a cancel
-/// of a ticket nothing is parked on moved nothing (Q128 reader A finding 3).
+
 fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -2726,8 +2679,7 @@ fn cancel_of_a_parked_op(label: &str, ops: &'static Ops) {
 }
 
 /// RED (codeaudit concurrency L mod.rs:504): a `cancel` that meets a framing another op holds
-/// right now cannot look at it, and answered NOTHING_MOVED as if no parked call could sit there. It
-/// says it could not look (FAILED, the framing busy), never that nothing moved.
+
 fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -2750,10 +2702,7 @@ fn cancel_meeting_a_held_framing(label: &str, ops: &'static Ops) {
 }
 
 /// RED (codeaudit correctness M mod.rs:1153): a request hyper decodes during the host's `refuse`
-/// (a pipelined HTTP/1.1 request, read as soon as the refused answer is written) was never put
-/// through the guest list: `refuse` admitted nothing and no later op was owed to the connection,
-/// so the client waited for an answer that never came. Every admission step that calls no
-/// may-pend service runs on it: here the request's `none` line hands it in and it goes up.
+
 fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
     let one = b"POST /v1/messages HTTP/1.1\r\nhost: busbar.test\r\ncontent-length: 5\r\n\r\nhello";
     let two: Vec<u8> = one.iter().chain(one.iter()).copied().collect();
@@ -2782,10 +2731,7 @@ fn a_request_decoded_during_refuse_is_admitted(label: &str, ops: &'static Ops) {
 }
 
 /// RED (codeaudit error-handling M mod.rs:1014, correctness L mod.rs:1014): `detach` took the
-/// answer bytes still owed to the far side into the host's wire buffer before it knew it would
-/// answer READY; answering REFUSED (nothing switched protocols) it handed the host none of them,
-/// and they were gone: the far side read an answer with a hole in it. A detach that is not READY
-/// takes nothing, and the bytes go out with the next op.
+
 fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
     let mut h = admitted(
         ops,
@@ -2793,7 +2739,7 @@ fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
         Script::default(),
         POST_HELLO,
     );
-    // A host wire buffer of 16 bytes: the answer is owed over several ops.
+
     h.wire = vec![0; 16];
     assert_eq!(
         h.emit(1, b"content-length: 5\r\n", false, 200),
@@ -2813,9 +2759,7 @@ fn a_refused_detach_keeps_the_owed_bytes(label: &str, ops: &'static Ops) {
 }
 
 /// RED (codeaudit error-handling L mod.rs:940): an `emit` that left its stream's queue at the
-/// high-water mark AND parked on a pending `auth.call` (another request's, decoded and waiting)
-/// answered PENDING; its resume ran nothing and answered READY without `YIELD_STREAM_FULL`, so the
-/// host kept writing a stream that was full. The resume states the stream's fullness as it stands.
+
 fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -2828,7 +2772,7 @@ fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
             ..Script::default()
         },
     );
-    // A's auth pends on this op's ticket; B is admitted and goes up.
+
     assert_eq!(
         h.ingest(&h2_requests(&[(1, "/a"), (3, "/b")])),
         Outcome::Pending,
@@ -2846,14 +2790,13 @@ fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
         .find(|(_, _, t)| t == b"/b")
         .map(|(s, _, _)| *s)
         .expect("B went up");
-    // B's answer, streamed: the far side's window takes the first chunks, the rest queue; the
-    // sixth fills the queue to its high-water mark.
+
     assert_eq!(h.emit(b, b"", false, 200), Outcome::Ready, "{label}");
     let chunk = vec![b'x'; 64 * 1024];
     for _ in 0..5 {
         assert_eq!(h.emit(b, &chunk, false, 0), Outcome::Ready, "{label}");
     }
-    // A's parked call is let go, and its next call pends: on the emit that fills B's queue.
+
     assert_eq!(h.cancel(parked), CANCEL_PARTIAL, "{label}");
     if let Some(s) = scripts().get_mut(&h.ctx) {
         s.pend = 1;
@@ -2878,7 +2821,7 @@ fn a_resumed_emit_states_its_stream_full(label: &str, ops: &'static Ops) {
 }
 
 /// Requests pipelined past any per-op bound are each answered in the op that decoded them: none is
-/// left waiting for a wake that never comes (Q128 reader B finding 1).
+
 fn pipelined_refusals(label: &str, ops: &'static Ops) {
     const N: usize = 24;
     let one = b"GET /nope HTTP/1.1\r\nhost: busbar.test\r\n\r\n";
@@ -2916,8 +2859,7 @@ fn pipelined_refusals(label: &str, ops: &'static Ops) {
 }
 
 /// THE ABI'S `refuse` ON AN ACCEPTED STREAM (Q128 reader B finding 2; ruling 22): a stream refused
-/// before its answer head is answered with `bytes` at the mapped `status`, its length stated, as
-/// v1.5.5's server answered a handler's error response.
+
 fn refuse_a_stream_before_its_head(label: &str, ops: &'static Ops) {
     let mut h = admitted(
         ops,
@@ -2945,7 +2887,7 @@ fn refuse_a_stream_before_its_head(label: &str, ops: &'static Ops) {
 }
 
 /// `head_sent`: the answer's head already went; the stream ends failed. On HTTP/1.1 the connection
-/// closes with no terminating chunk, so the far side never reads a cut answer as whole.
+
 fn refuse_a_stream_after_its_head(label: &str, ops: &'static Ops) {
     let mut h = admitted(
         ops,
@@ -2970,7 +2912,7 @@ fn refuse_a_stream_after_its_head(label: &str, ops: &'static Ops) {
 }
 
 /// The whole connection (`has_stream` 0): the refusal's bytes are the transport's whole envelope
-/// (the connector's `unit0_refusal`), written as they are; the connection is over.
+
 fn refuse_the_connection(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
     let bytes = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\n\r\n";
@@ -2981,16 +2923,10 @@ fn refuse_the_connection(label: &str, ops: &'static Ops) {
 }
 
 /// THE SCHEME THE AUTH IS SHOWN (`HeadView::scheme`, busbar e858ecc: `0` is refused off the peer
-/// point): the one the host states for the accepted connection, never `0`. Until `BeginIn` states
-/// it, the host's statement is `BeginIn::facts` ("what connection security established"): a secure
-/// layer presents the host's certificate and agrees a protocol; a cleartext connection has neither.
+
 fn shows_the_scheme(label: &str, ops: &'static Ops) {
-    // The scheme is the one the HOST states for the listener (busbar step 2, `BeginIn::scheme`:
-    // "from the listener (whether the connector terminated connection security on it)"), never
-    // inferred from the handshake's facts (Q128 r232 LOW 2's fix).
     let cases: [SchemeCase; 4] = [
         ("cleartext", |_| {}, SCHEME_PLAIN, SCHEME_PLAIN),
-        // A TLS client offering no SNI, no ALPN and no certificate.
         (
             "TLS, no SNI, ALPN or certificate",
             |_| {},
@@ -3006,7 +2942,6 @@ fn shows_the_scheme(label: &str, ops: &'static Ops) {
             SCHEME_SECURE,
             SCHEME_SECURE,
         ),
-        // Facts the inference read as TLS, on a listener the host states cleartext.
         (
             "cleartext, facts naming SNI and ALPN",
             |f| {
@@ -3037,9 +2972,7 @@ fn shows_the_scheme(label: &str, ops: &'static Ops) {
 }
 
 /// A PENDING `auth.call` PARKS ONLY ITS OWN STREAM, on its own ticket (busbar e858ecc, the transport
-/// contract: "a parked `ingest` holds nothing of the host's ... the framer holds back only the
-/// stream whose auth it waits on"): a fresh op on another ticket never re-issues the parked handle
-/// under its own ticket, and the resume on the parked ticket does, with the same handle.
+
 fn parks_on_its_own_ticket(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -3079,8 +3012,7 @@ fn parks_on_its_own_ticket(label: &str, ops: &'static Ops) {
 }
 
 /// THE DOOR OFFERS THE PEER POINT (Q128 reader B r212, coordinator ruling: POINT_PEER is served
-/// under the Peer rule): its Statement's offered-points record (`EXT_OFFERED_POINTS`) states Peer,
-/// Head and HeadBody, so the host boots a line whose auth needs Peer instead of refusing it.
+
 fn offers_the_peer_point(label: &str, door: *const Door) {
     use busbar_contract::abi::auth::AuthPoints;
     use busbar_contract::abi::transport::check::check_offered_points;
@@ -3101,7 +3033,7 @@ fn offers_the_peer_point(label: &str, door: *const Door) {
 }
 
 /// THE PEER POINT, once per connection, before any request's head call (THE DESIGN §6 item 7):
-/// two requests on one connection, one peer call, made first.
+
 fn peer_once_per_connection(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -3134,8 +3066,7 @@ fn peer_once_per_connection(label: &str, ops: &'static Ops) {
 }
 
 /// THE PEER RULE (busbar 9aff8cf7b7 `check_auth_call`: at the peer point "no field, no name and no
-/// byte, on either side"): the peer call carries no request, and a peer answer that names a line to
-/// strip is refused: the connection closes with no bytes and nothing goes up.
+
 fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -3159,13 +3090,13 @@ fn a_peer_answer_naming_lines_is_refused(label: &str, ops: &'static Ops) {
     );
     assert_eq!(h.heads_up(), 0, "{label}: nothing went up");
     assert!(h.out.is_empty(), "{label}: no bytes of the transport's own");
-    // The refusal closes the connection, never leaves it open and silent.
+
     assert!(h.ended, "{label}: the connection is closed");
     h.close();
 }
 
 /// One scheme cell: its label, the handshake facts, the scheme the host states for the listener,
-/// the scheme the auth must be shown.
+
 type SchemeCase = (&'static str, fn(&mut ConnFacts), u8, u8);
 
 /// One HTTP/2 frame: its type, flags, stream and payload (RFC 9113 §4.1).
@@ -3180,7 +3111,7 @@ fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The preface, an empty SETTINGS, and one whole `GET` request per `(stream, path)` (HPACK:
-/// `:method GET`, `:scheme http` static, `:path` and `:authority` literal, not indexed).
+
 fn h2_requests(requests: &[(u32, &str)]) -> Vec<u8> {
     let mut wire = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
     wire.extend(h2_frame(4, 0, 0, &[]));
@@ -3200,7 +3131,7 @@ fn h2_requests(requests: &[(u32, &str)]) -> Vec<u8> {
 }
 
 /// ALPN agreed `h2` (the accept offer's first, Q137): the connection is served as HTTP/2 from its
-/// preface, its request admitted and gone up.
+
 fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_on(
         ops,
@@ -3228,9 +3159,7 @@ fn alpn_h2_is_served_as_h2(label: &str, ops: &'static Ops) {
 }
 
 /// A PENDING `auth.call` PARKS ONLY ITS OWN STREAM (THE DESIGN §6 item 7, l.975-976; Q128 r231
-/// finding 3): request A, on a line whose auth pends, does not hold back request B on a `none`
-/// line on the same connection. B is admitted in the op A parked in, and its head goes up no later
-/// than the next op, a fresh one on another ticket, while A stays parked.
+
 fn a_pending_auth_parks_only_its_stream(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open_with(
         ops,
@@ -3277,8 +3206,7 @@ fn a_pending_auth_parks_only_its_stream(label: &str, ops: &'static Ops) {
 }
 
 /// THE REQUEST BEING REFUSED (busbar step 2, `UnitRefuseIn::request`: "The request being refused,
-/// as decoded ... Its `scheme` is the one the transport states for the connection"): `unit.refuse`
-/// is handed the decoded request for every cause, the no-route and method-miss refusals included.
+
 fn refusal_carries_the_request(label: &str, ops: &'static Ops) {
     for (req, method, target) in [
         (
@@ -3317,7 +3245,7 @@ fn refusal_carries_the_request(label: &str, ops: &'static Ops) {
 }
 
 /// THE KERNEL'S REFUSAL KEEPS ITS FIELDS (D3): every field `unit.refuse` answers is framed on the
-/// refusal, in the kernel's order, before the length hyper states for its body; nothing goes up.
+
 fn kernel_refusal_keeps_its_fields(label: &str, ops: &'static Ops) {
     let script = Script {
         refusal_fields: vec![
@@ -3348,10 +3276,7 @@ fn kernel_refusal_keeps_its_fields(label: &str, ops: &'static Ops) {
 }
 
 /// AN UPGRADE THE LINE HANDS TO ANOTHER FRAMER IS NOT ANSWERED HERE (coordinator ruling, row 192):
-/// the request is admitted through its line and goes up; the host answers nothing and detaches,
-/// and the adopting framer is handed the upgrade request's head bytes and every byte after them,
-/// as the far side sent them. This door writes no `101` and no other byte: the adopting framer
-/// writes its own `101`.
+
 fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
     let request: &[u8] = b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n";
     let mut h = admitted(
@@ -3392,7 +3317,7 @@ fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
 }
 
 /// A `HEAD` request is answered with its head alone, as v1.5.5's server (hyper) answered it: the
-/// status and the fields the host emitted, and no body byte, whatever body the host emits.
+
 fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
     assert_eq!(
@@ -3414,8 +3339,7 @@ fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
         Outcome::Ready,
         "{label}: the head"
     );
-    // The body the host emits for it is never written; whether the op takes it or answers the
-    // stream over is hyper's, not the wire's.
+
     let outcome = h.emit(1, b"hello", true, 0);
     assert!(
         matches!(outcome, Outcome::Ready | Outcome::Failed),
@@ -3446,8 +3370,7 @@ fn head_answered_without_a_body(label: &str, ops: &'static Ops) {
 }
 
 /// THE HEADER READ BOUND (v1.5.5 `hardened_conn_builder`, 30 s on the host's clock): a head the far
-/// side trickles and never finishes ends the connection at the bound and not before it; nothing
-/// goes up.
+
 fn header_read_bound(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
     let start = h.now;
@@ -3473,10 +3396,7 @@ fn header_read_bound(label: &str, ops: &'static Ops) {
 }
 
 /// THE HOST'S OWN REFUSAL ON A STREAM (D3, coordinator ruling, row 192): `RefuseIn` carries bytes
-/// by design, and the host frames the whole refusal, its fields included, before it calls `refuse`;
-/// stating no neutral status (`0`, the connector's `unit0_refusal`), the bytes state their own. They
-/// reach the wire byte-identical, nothing of this door's added, and the connection is over, as a
-/// refusal of the whole connection is. RED on the door that framed them as the body of a `500`.
+
 fn host_framed_refusal_arrives_byte_identical(label: &str, ops: &'static Ops) {
     let mut h = admitted(
         ops,
@@ -3523,15 +3443,8 @@ fn h2_frames(wire: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
 }
 
 /// THE ANSWER ENDS WITH THE REQUEST BODY UNREAD (the over-cap case: the host answers `413` while
-/// the request body is still arriving), and the stream ends as 1.5.5's server (hyper under axum,
-/// whose body limit answered and let the unread body go) ended it. HTTP/1.1: the answer is written
-/// whole and the connection closes, no later body byte going up. HTTP/2: the answer goes out
-/// whole (its last DATA frame ends the stream on this side), then the stream is reset `NO_ERROR`
-/// (RFC 9113 §8.1: a server that answers before the request is whole asks the client to stop
-/// sending it), and the connection is kept: no GOAWAY. RED on the accepted side that held the
-/// unread body and went on reading it after the answer ended.
+
 fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
-    // HTTP/1.1: 5 of 100 declared body bytes have arrived.
     let mut h = admitted(
         ops,
         vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
@@ -3571,7 +3484,6 @@ fn answer_ends_with_the_body_unread(label: &str, ops: &'static Ops) {
     );
     h.close();
 
-    // HTTP/2 by prior knowledge: a POST whose DATA has not ended its stream.
     let mut h = AcceptHost::open_with(
         ops,
         vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)],
@@ -3643,11 +3555,7 @@ fn alpn_names(list: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// THE ACCEPTED SIDE STATES THE PROTOCOL IT AGREED (`FramerYield::agreed`, busbar #1446): the
-/// 1-based position, in the door's own accepting offer (`locate` with `LocateIn::accept`), of the
-/// protocol the connection speaks. Under TLS the handshake's ALPN result is stated from `begin`;
-/// in the clear the protocol is the one hyper serves once the first bytes show it: the HTTP/2
-/// preface is h2 by prior knowledge, anything else HTTP/1.1. RED on the accepted side that stated
-/// none.
+
 fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     let offer = alpn_names(&accept_offer(ops));
     let position = |name: &[u8]| -> u32 {
@@ -3660,7 +3568,6 @@ fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     let h1: &[u8] = b"GET /v1/messages HTTP/1.1\r\nhost: busbar.test\r\n\r\n";
     let lines = || vec![line(5, 0, METHOD_ANY, "/v1/messages", 0)];
 
-    // TLS, ALPN h2: stated from `begin`, and on every yield after it.
     let mut h = AcceptHost::open_on(
         ops,
         lines(),
@@ -3676,7 +3583,6 @@ fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     assert_eq!(h.agreed, position(b"h2"), "{label}: ALPN h2, on ingest");
     h.close();
 
-    // TLS, ALPN http/1.1.
     let mut h = AcceptHost::open_on(
         ops,
         lines(),
@@ -3697,14 +3603,12 @@ fn states_the_protocol_it_agreed(label: &str, ops: &'static Ops) {
     );
     h.close();
 
-    // Cleartext HTTP/1.1: nothing to state before the first bytes, then HTTP/1.1.
     let mut h = AcceptHost::open_with(ops, lines(), Script::default());
     assert_eq!(h.agreed, 0, "{label}: cleartext, no byte yet");
     assert_eq!(h.ingest(h1), Outcome::Ready);
     assert_eq!(h.agreed, position(b"http/1.1"), "{label}: cleartext h1");
     h.close();
 
-    // Cleartext h2 by prior knowledge: the preface.
     let mut h = AcceptHost::open_with(ops, lines(), Script::default());
     assert_eq!(
         h.ingest(&h2_requests(&[(1, "/v1/messages")])),
@@ -3736,11 +3640,7 @@ fn accepting_offer_on(ops: &'static Ops, inst: *mut c_void) -> Vec<u8> {
 }
 
 /// A NON-EMPTY ACCEPTING OFFER ON A CLEARTEXT LISTENER (busbar's framed worker asks the door for
-/// its accepting offer on every listener, TLS or not; in the clear the host uses the list only to
-/// resolve the position the door states, never in a handshake) changes nothing else on the
-/// accepted side: a cleartext `begin` after it states no protocol before the first bytes, expects
-/// no handshake, refuses nothing, and serves HTTP/1.1 as v1.5.5's listener did, stating only the
-/// position of `http/1.1` in that list.
+
 fn a_cleartext_offer_changes_nothing_else(label: &str, ops: &'static Ops) {
     let mut h = AcceptHost::open(ops);
     let offer = alpn_names(&accepting_offer_on(ops, h.inst));
@@ -4070,8 +3970,6 @@ fn cancel_unpublished_heads(label: &str, ops: &'static Ops) {
         ops,
         vec![line(9, POINT_HEAD_BODY, METHOD_ANY, "/v1/messages", 8)],
         Script {
-            // Admission may prioritize either stream after its policy loan. Park the second
-            // auth callback so the first sibling's admitted head is already queued on this op.
             pend_call: Some(2),
             ..Script::default()
         },
@@ -4081,7 +3979,7 @@ fn cancel_unpublished_heads(label: &str, ops: &'static Ops) {
     );
     assert_eq!(began, Outcome::Ready);
     let mut bytes = h2_requests(&[(1, "/v1/messages"), (3, "/v1/messages")]);
-    // These two decoded heads have bodies still to come: leave END_STREAM unset.
+
     let mut at = 24;
     while at + 9 <= bytes.len() {
         let len = (usize::from(bytes[at]) << 16)
@@ -4458,9 +4356,7 @@ fn pump_until_returns_the_actual_framing_failure() {
             release,
         });
         let mut host = Host::open(ops, "{}", sock, ROOMY);
-        // There was no Begin: actual Ingest refuses this nonexistent framing. Stop the old pump
-        // on its next loop condition so its swallowed failure is an immediate assertion, not a
-        // thirty-second timeout.
+
         let polls = std::cell::Cell::new(0);
         let result = host.pump_until(
             |_| {
@@ -4481,8 +4377,7 @@ fn pump_until_returns_the_actual_framing_failure() {
 
 impl AcceptHost {
     /// Copy reply metadata while the actual door's output lease is live, on PENDING as well as
-    /// READY. The literal existing extension envelope keeps this regression usable before the
-    /// SDK counter helper and adapter fix are published.
+
     fn ingest_retained(&mut self, bytes: &[u8], flags: u32) -> (Outcome, Option<u64>, bool) {
         let mut i: IngestIn = z();
         i.head.ticket = self.ticket;
@@ -4537,7 +4432,6 @@ impl AcceptHost {
 }
 
 fn pending_input_reports_pressure_and_resumes(label: &str, ops: &'static Ops) {
-    // The connector's existing receive window and read chunk, not a new adapter body limit.
     const WINDOW: usize = 1024 * 1024;
     const CHUNK: usize = 16 * 1024;
     let body = vec![b'x'; 2 * WINDOW];

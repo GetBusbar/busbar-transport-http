@@ -2,9 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The `http` framer, driven through its own table the way the host drives it: the lifecycle's
-//! settings texts, `refresh`, the role stubs, the missing instance, and what a failure text may
-//! repeat of a target. (An integration test, so the crate itself stays `#![forbid(unsafe_code)]`:
-//! driving a raw table is the host's side, and needs it.)
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -158,7 +155,7 @@ fn locate(inst: *mut c_void, target: &str) -> (Outcome, Vec<u8>, String) {
 }
 
 /// `locate` of `target` with a defaults buffer of `cap` bytes (none lent at 0): its outcome, the
-/// protocol offer, its text, and the defaults bytes it wrote and needs.
+
 fn locate_lending(
     inst: *mut c_void,
     target: &str,
@@ -186,11 +183,8 @@ fn locate_lending(
     )
 }
 
-// ── the lifecycle the SDK answers (KIND-transport sibling alignment D2, D3, D16) ────────────────
-
 /// RED (sibling review D2, D16): the door answered READY to a release of a lease it never handed
-/// out, from a slot of its own. The lifecycle SDK's answer, as every sibling's: REFUSED, in
-/// `release: no such lease`'s words (the door leases nothing, so every release is a host bug).
+
 #[test]
 fn a_release_of_a_lease_never_handed_out_is_refused() {
     use busbar_contract::abi::mechanism::lifecycle::ReleaseIn;
@@ -209,20 +203,15 @@ fn a_release_of_a_lease_never_handed_out_is_refused() {
 }
 
 /// RED (sibling review D3): the door's own `refresh` wrapper answered FAILED `refresh: no open
-/// instance`. The lifecycle SDK's slot is the kind's (four of six siblings): with no instance it
-/// answers FAULT (the words, if wanted, belong in the SDK, core T9).
+
 #[test]
 fn a_refresh_with_no_open_instance_is_the_sdks_fault() {
     let (r, _) = refresh(std::ptr::null_mut(), "{}");
     assert_eq!(r, Outcome::Fault);
 }
 
-// ── refresh ──────────────────────────────────────────────────────────────────────────────────────
-
 /// RED: `refresh` answered READY and kept the settings `open` read, whatever the new blob said.
-/// A refresh reads the new settings with `validate`'s texts: a bad blob is FAILED and the old
-/// settings stay; a good one applies to what is begun after it (here the cleartext offer, which
-/// the prior-knowledge key sets).
+
 #[test]
 fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
     let inst = open("");
@@ -253,11 +242,8 @@ fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
     assert_eq!(locate(inst, "http://a.test/").1, b"\x02h2");
 }
 
-// ── locate ───────────────────────────────────────────────────────────────────────────────────────
-
 /// The framer's own head lines (`accept`, `host`) are owed to every request, so a host that lends
-/// no room for them, or too little, is answered short with the size they need, never READY with no
-/// lines (a request that would go out with no `host` on HTTP/1.1).
+
 #[test]
 fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
     let inst = open("");
@@ -276,10 +262,8 @@ fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
     assert_eq!(written, want);
 }
 
-// ── settings, through the door ───────────────────────────────────────────────────────────────────
-
 /// RED: `validate` refused a bad blob as `settings: not JSON`, a wrong kind as `<key>: not of its
-/// declared kind`, and read past an undeclared key. Each is now the canon's text.
+
 #[test]
 fn validate_answers_the_canon_settings_texts() {
     assert_eq!(validate(""), (Outcome::Ready, String::new()));
@@ -307,8 +291,6 @@ fn validate_answers_the_canon_settings_texts() {
     );
 }
 
-// ── the role stubs and the missing instance ──────────────────────────────────────────────────────
-
 /// One op of `inst` over all-zero `in` and `out`: its outcome and its text.
 /// # Safety
 /// The caller supplies this slot's concrete ABI input/output types, live nested ranges, and
@@ -325,8 +307,7 @@ unsafe fn op<I, O>(f: Option<Op>, inst: *mut c_void, index: u32) -> (Outcome, St
 }
 
 /// RED: every op of the role this framer does not play answered a bare REFUSED, with no words.
-/// Each is now REFUSED in the canon's words, naming the op. (`refuse` and `detach` are the accepted
-/// side's, served.)
+
 #[test]
 fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words() {
     let inst = open("");
@@ -394,7 +375,7 @@ fn every_op_of_the_carrier_role_and_each_unserved_framer_op_is_refused_in_words(
 }
 
 /// RED: `begin` with no open instance answered a bare FAILED, and `ingest`, `emit`, `timer` and
-/// `finish` answered `no such framing` with no op named. Each is now `<op>: no open instance`.
+
 #[test]
 fn a_framer_op_with_no_open_instance_is_failed_in_words() {
     let none = std::ptr::null_mut();
@@ -432,8 +413,7 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
         unsafe { op::<FinishIn, FramerOut>(o.finish, none, slot::FINISH) },
         failed("finish")
     );
-    // RED (codeaudit craft L mod.rs:999): `detach` named a framing it never looked at (`detach:
-    // no such framing`); `refuse` is the other op with no instance.
+
     assert_eq!(
         // SAFETY: this fixture lends the matching concrete ABI frames and owns their nested buffers
         // and the door instance for this synchronous call; the selected slot and index agree.
@@ -449,7 +429,7 @@ fn a_framer_op_with_no_open_instance_is_failed_in_words() {
 }
 
 /// RED: an op on a framing the instance does not hold answered `no such framing`, naming no op.
-/// Every kind-op text now leads with its op.
+
 #[test]
 fn a_framer_op_on_an_unknown_framing_names_its_op() {
     let inst = open("");
@@ -493,16 +473,8 @@ fn a_framer_op_on_an_unknown_framing_names_its_op() {
     );
 }
 
-// ── what a failure a caller sees says ────────────────────────────────────────────────────────────
-
 /// RED (coordinator ruling 2026-10-29, as transport-tcp #42's): a failure a caller sees carries the
-/// host's or the system's words alone. A far end that closes before it answers fails the framing in
-/// hyper's words, `connection closed before message completed`, which the a2a card fetch passes on
-/// to its caller as 1.5.5's client did (`client error (SendRequest): connection closed before
-/// message completed`). RED on the door that led every framing failure with its op's name
-/// (`ingest: connection closed before message completed`). This door has no log or audit channel
-/// to keep the op name in, so it says none; its own refusals (no open instance, no such framing)
-/// keep theirs (`a_framer_op_on_an_unknown_framing_names_its_op`).
+
 #[test]
 fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     let inst = open(r#"{"advanced.upstream_http1_only":true}"#);
@@ -576,7 +548,7 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
         unsafe { call(o.emit, inst, &mut m, &mut mo, slot::EMIT) },
         Outcome::Ready
     );
-    // The far end closes: no byte, the end of its stream.
+
     let mut i: IngestIn = z();
     i.framing = framing;
     i.end = 1;
@@ -596,11 +568,8 @@ fn a_far_end_that_closes_unanswered_fails_in_the_systems_words_alone() {
     );
 }
 
-// ── what a target may carry ──────────────────────────────────────────────────────────────────────
-
 /// RED: `locate` and `begin` took a target carrying userinfo and dropped it silently (`locate`
-/// answered its authority, `begin` opened a framing). A credential never rides a URL: each is
-/// FAILED in the canon's words, which repeat no byte of the target.
+
 #[test]
 fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
     let inst = open("");
@@ -629,10 +598,8 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
     );
 }
 
-// ── the statement ────────────────────────────────────────────────────────────────────────────────
-
 /// RED: the Statement carried no extensions, so the plugin's `declares.json` never reached the
-/// host. It rides the Statement's extensions under `EXT_DECLARES`, byte for byte.
+
 #[test]
 fn the_statement_carries_the_declares_document() {
     let ext = door::STATEMENT.extensions;
