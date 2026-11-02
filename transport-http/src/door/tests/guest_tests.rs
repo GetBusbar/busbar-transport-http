@@ -3,10 +3,22 @@
 
 use super::*;
 use busbar_contract::abi::transport::route::{
-    FIELD_PRESENT, METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
+    FIELD_PRESENT, FIELD_VALUE_PREFIX, METHOD_GET, METHOD_POST, PATH_EXACT, PATH_PREFIX,
 };
 
 fn line(id: u32, methods: u32, form: u32, path: &str, fields: &[(u32, &str)]) -> Line {
+    let valued: Vec<(u32, &str, &[u8])> = fields.iter().map(|(op, n)| (*op, *n, &[][..])).collect();
+    valued_line(id, methods, form, path, &valued)
+}
+
+/// [`line`] whose predicates carry a value (the prefix of a `FIELD_VALUE_PREFIX`).
+fn valued_line(
+    id: u32,
+    methods: u32,
+    form: u32,
+    path: &str,
+    fields: &[(u32, &str, &[u8])],
+) -> Line {
     Line {
         line: id,
         points: 0,
@@ -17,7 +29,7 @@ fn line(id: u32, methods: u32, form: u32, path: &str, fields: &[(u32, &str)]) ->
         path: path.to_owned(),
         fields: fields
             .iter()
-            .map(|(op, n)| (*op, (*n).to_owned(), Vec::new()))
+            .map(|(op, n, v)| (*op, (*n).to_owned(), v.to_vec()))
             .collect(),
         rung: 0,
     }
@@ -58,6 +70,35 @@ fn the_guest_list_matches_in_order() {
     );
     assert_eq!(matched(&lines, "GET", "/nope", &[]), Matched::NoRoute);
     assert_eq!(matched(&[], "GET", "/", &[]), Matched::NoRoute);
+}
+
+/// A line whose predicate carries a value prefix holds only for a request whose field starts with
+/// it; one that lacks it falls through to the later line.
+#[test]
+fn a_value_prefix_line_needs_its_prefix() {
+    let lines = [
+        valued_line(
+            1,
+            METHOD_POST,
+            PATH_EXACT,
+            "/v1/messages",
+            &[(FIELD_VALUE_PREFIX, "authorization", b"Bearer ")],
+        ),
+        line(2, METHOD_POST, PATH_EXACT, "/v1/messages", &[]),
+    ];
+    let with = |v: &'static [u8]| -> [(&'static str, &'static [u8]); 1] { [("Authorization", v)] };
+    assert_eq!(
+        matched(&lines, "POST", "/v1/messages", &with(b"Bearer x")),
+        Matched::Line(0)
+    );
+    assert_eq!(
+        matched(&lines, "POST", "/v1/messages", &with(b"Basic x")),
+        Matched::Line(1)
+    );
+    assert_eq!(
+        matched(&lines[..1], "POST", "/v1/messages", &with(b"Basic x")),
+        Matched::NoRoute
+    );
 }
 
 /// A query key is stripped case-sensitively, as spelled, with or without a value; a field name
