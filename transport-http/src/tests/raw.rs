@@ -246,3 +246,42 @@ fn a_cr_that_does_not_end_a_line_is_malformed() {
     decoder.feed(b"5\nhello\n0\n\n").expect("bare LFs");
     assert_eq!(decoder.take(), b"hello");
 }
+
+#[test]
+fn a_content_length_with_unicode_whitespace_is_refused() {
+    // NBSP is obs-text, not OWS (RFC 9112 5.1): it is not trimmed, so the length is not digits.
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nContent-Length: 5\u{a0}\r\n\r\n"),
+        Err("invalid content-length")
+    );
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nContent-Length: 5 \t\r\n\r\n"),
+        Ok(BodyFraming::Length(5))
+    );
+}
+
+#[test]
+fn a_transfer_encoding_on_http_1_0_is_refused() {
+    assert_eq!(
+        framing("POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Err("transfer-encoding on HTTP/1.0")
+    );
+    assert_eq!(
+        framing("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"),
+        Ok(BodyFraming::Chunked)
+    );
+}
+
+#[test]
+fn a_blank_line_inside_the_header_block_is_refused() {
+    for head in [
+        "POST / HTTP/1.1\r\nA: b\r\n\nTransfer-Encoding: chunked\r\n\r\n",
+        "POST / HTTP/1.1\r\nA: b\n\nTransfer-Encoding: chunked\r\n\r\n",
+    ] {
+        assert_eq!(
+            Head::parse(head.as_bytes()).err(),
+            Some("unparsable request head"),
+            "{head:?}"
+        );
+    }
+}
