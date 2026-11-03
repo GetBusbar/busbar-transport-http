@@ -923,6 +923,7 @@ impl Accepted {
                 queue.declared = (a.h1 && !resp.headers().contains_key(http::header::TRANSFER_ENCODING)
                     && resp.headers().get_all(http::header::CONTENT_LENGTH).iter().count() == 1)
                     .then(|| resp.headers().get(http::header::CONTENT_LENGTH)
+                    .filter(|v| !v.as_bytes().is_empty() && v.as_bytes().iter().all(u8::is_ascii_digit))
                     .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())).flatten();
                 queue.trailers_supported = a.trailer_peer
                     && !code.is_informational()
