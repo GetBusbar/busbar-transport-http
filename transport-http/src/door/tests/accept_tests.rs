@@ -1928,7 +1928,9 @@ fn a_fixed_length_wire_end_still_accepts_the_hosts_empty_logical_end() {
     assert_eq!(next.heads.len(), 1);
     assert!(a.shared.lock().unwrap().streams.contains_key(&first), "logical End is still owed");
     assert!(a.emit(first, b"extra", true, 0).is_err(), "wire completion cannot accept extra bytes");
+    assert!(a.emit_trailers(first, b"x-late: no\r\n").is_err(), "fixed-length completion cannot accept trailers");
     a.emit(first, b"", true, 0).expect("empty logical End after wire completion");
+    assert!(a.emit(first, b"", true, 0).is_err(), "logical End is accepted exactly once");
     a.emit(next.heads[0].0, b"content-length: 4\r\n", false, 200).unwrap();
     a.emit(next.heads[0].0, b"done", true, 0).unwrap();
     run(&mut a, SEC);
