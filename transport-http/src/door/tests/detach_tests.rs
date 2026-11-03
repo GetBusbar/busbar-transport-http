@@ -11,8 +11,15 @@ use std::ffi::c_void;
 
 const REQUEST: &[u8] = b"GET /ws HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nauthorization: Bearer detach-custody-canary\r\n\r\n\x81\x02hi";
 
+// This test-only helper crosses the real SDK entry rather than bypassing the slot adapter.
+#[allow(unsafe_code)]
 fn call<S: SafeSlot>(p: *mut c_void, index: u32, i: &S::In, o: &mut S::Out) -> Outcome {
-    // SAFETY: p is the live instance minted by the SDK below; each input owns all of its buffers.
+    // SAFETY: p is null for Open or is the matching State instance minted by that SDK Open,
+    // remains live until the serialized Close call, and is never used after Close. Inputs and
+    // outputs are fully initialized with the SDK's AbiIn/AbiOut blank constructors. Nonempty
+    // sink pointers name distinct caller-owned mutable slices, disjoint from i and o, alive
+    // throughout this synchronous call; all other pointer/length pairs are null/zero. The test
+    // serializes every call, lends i immutably and o exclusively, and retains no borrowed input.
     unsafe { <Safe<S> as Entry>::enter(p, index, i, o) }
 }
 
