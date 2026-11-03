@@ -1082,6 +1082,14 @@ impl SafeSlot for Detach {
             YIELD_ENDED
         };
         o.set(|x| &x.yielded, y);
+        if y.flags & YIELD_ENDED != 0 {
+            // All output bytes were copied into the caller's sinks above. The host transfers
+            // custody and clears this token after ENDED, so it will never call Finish on it.
+            drop(slot);
+            if let Err(why) = inst.framings.remove(i.framing) {
+                return failed(&mut o, format!("detach: {}", why.why()));
+            }
+        }
         Outcome::Ready
     }
 }
@@ -1586,3 +1594,7 @@ busbar_contract::plugin_door! {
 #[cfg(test)]
 #[path = "tests/door_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/detach_tests.rs"]
+mod detach_tests;
