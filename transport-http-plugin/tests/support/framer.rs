@@ -1269,7 +1269,8 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
             transcript.push(format!("{label}: {answer}"));
         };
         {
-            let label = "finish upgrade";
+            // A refused handoff retains custody, so the original framing still needs Finish.
+            let label = "finish retained upgrade";
             let before = framer_crossings(p);
             let value = once(p, token, Op::Finish, &mut tight).line();
             assert_eq!(framer_crossings(p) - before, 1, "{label} crossings");
@@ -1330,13 +1331,30 @@ fn upgrade(transcript: &mut Vec<String>, p: &Plugin<Transport>, k: &Value, token
 
     if whole.is_null() {
         {
-            let label = "finish upgrade";
             let before = framer_crossings(p);
             let value = once(p, token, Op::Finish, &mut tight).line();
-            assert_eq!(framer_crossings(p) - before, 1, "{label} crossings");
-            let answer = value;
-            assert!(answer.starts_with("Ready "), "{label}: {answer}");
-            transcript.push(format!("{label}: {answer}"));
+            assert_eq!(
+                framer_crossings(p) - before,
+                1,
+                "upgrade retirement crossing"
+            );
+            if refused(detach) {
+                // No terminal transfer occurred; Finish must still retire the retained framing.
+                assert!(
+                    value.starts_with("Ready "),
+                    "finish retained upgrade: {value}"
+                );
+                transcript.push(format!("finish retained upgrade: {value}"));
+            } else {
+                // The exact ENDED drain and output custody were checked above. The host no longer
+                // finishes this token; an explicit stale-token probe must prove it was retired.
+                assert_eq!(
+                    value,
+                    "Failed lease=false err=\"finish: no such framing\" wire=\"\" frames=[] partial=\"\" raw=\"\" flags=0 framing=false",
+                    "terminal detach must consume the original framing without lending custody"
+                );
+                transcript.push(format!("finish consumed upgrade token: {value}"));
+            }
         };
     }
     if refused(adopt) {
