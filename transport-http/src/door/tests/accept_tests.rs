@@ -1913,3 +1913,38 @@ fn a_write_half_close_still_fails_an_incomplete_request_body() {
     );
     assert!(!tail.whole);
 }
+
+#[test]
+fn a_fixed_length_wire_end_still_accepts_the_hosts_empty_logical_end() {
+    let mut a = accepted();
+    a.ingest(b"GET /first HTTP/1.1\r\nhost: test\r\n\r\nGET /second HTTP/1.1\r\nhost: test\r\n\r\n", true);
+    run(&mut a, SEC);
+    let first = up(&mut a).heads[0].0;
+    a.emit(first, b"content-length: 2\r\n", false, 200).unwrap();
+    a.emit(first, b"hi", false, 0).unwrap();
+    run(&mut a, SEC);
+    let next = up(&mut a);
+    assert!(!next.failed, "exact wire length is not peer abandonment");
+    assert_eq!(next.heads.len(), 1);
+    assert!(a.shared.lock().unwrap().streams.contains_key(&first), "logical End is still owed");
+    assert!(a.emit(first, b"extra", true, 0).is_err(), "wire completion cannot accept extra bytes");
+    a.emit(first, b"", true, 0).expect("empty logical End after wire completion");
+    a.emit(next.heads[0].0, b"content-length: 4\r\n", false, 200).unwrap();
+    a.emit(next.heads[0].0, b"done", true, 0).unwrap();
+    run(&mut a, SEC);
+    assert!(!up(&mut a).failed);
+    let wire = a.take_wire(usize::MAX);
+    assert_eq!(wire.windows(15).filter(|w| *w == b"HTTP/1.1 200 OK").count(), 2);
+    assert!(wire.windows(4).any(|w| w == b"done"));
+}
+
+#[test]
+fn a_reset_before_the_declared_answer_length_still_fails() {
+    let (mut a, stream) = h2_request();
+    a.emit(stream, b"content-length: 4\r\n", false, 200).unwrap();
+    a.emit(stream, b"hi", false, 0).unwrap();
+    run(&mut a, SEC);
+    reset(&mut a);
+    assert!(up(&mut a).failed, "a truncated declared-length answer is abandoned");
+    assert!(a.emit(stream, b"", true, 0).is_err());
+}

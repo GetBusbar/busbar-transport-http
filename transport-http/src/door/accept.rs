@@ -153,6 +153,9 @@ struct ReplyQ {
     trailer_names: Option<HashSet<http::HeaderName>>,
     trailers_supported: bool,
     queued: usize,
+    /// Explicit wire length may finish in Hyper before the host sends its logical End.
+    declared: Option<u64>,
+    delivered: u64,
     ended: bool,
     full: bool,
     waker: Option<Waker>,
@@ -191,6 +194,7 @@ impl Body for Reply {
         }
         if let Some(c) = q.chunks.pop_front() {
             q.queued -= c.len();
+            q.delivered = q.delivered.saturating_add(c.len() as u64);
             return Poll::Ready(Some(Ok(Frame::data(c))));
         }
         if let Some(trailers) = q.trailers.take() {
@@ -916,6 +920,8 @@ impl Accepted {
                 .map_err(|e| Failure(format!("emit: the head is not an answer: {e}")))?;
             {
                 let mut queue = q.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.declared = a.h1.then(|| resp.headers().get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())).flatten();
                 queue.trailers_supported = a.trailer_peer
                     && !code.is_informational()
                     && code != http::StatusCode::NO_CONTENT
@@ -959,6 +965,11 @@ impl Accepted {
             return Err(Failure(format!(
                 "emit: stream {stream}'s answer already ended"
             )));
+        }
+        // Hyper can release a fixed-length body as soon as its declared bytes are consumed.
+        // Only the host's empty logical End may follow that completed wire body.
+        if q.gone && (!end || !bytes.is_empty() || !wire_body_complete(&q)) {
+            return Err(Failure("emit: the wire answer already ended".into()));
         }
         if !bytes.is_empty() {
             q.queued += bytes.len();
@@ -2083,7 +2094,7 @@ fn given_up(a: &Answer) -> bool {
         .is_some_and(futures_channel::oneshot::Sender::is_canceled);
     let mid_answer = a.reply.as_ref().is_some_and(|q| {
         let q = q.lock().unwrap_or_else(PoisonError::into_inner);
-        q.gone && !q.broken && !(q.ended && q.chunks.is_empty())
+        q.gone && !q.broken && !(q.ended && q.chunks.is_empty()) && !wire_body_complete(&q)
     });
     !a.switched && (before_head || mid_answer)
 }
@@ -2161,3 +2172,8 @@ fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
 #[cfg(test)]
 #[path = "tests/accept_tests.rs"]
 mod tests;
+
+/// Hyper may finish a declared-length body before the host sends its empty logical End.
+fn wire_body_complete(q: &ReplyQ) -> bool {
+    q.declared == Some(q.delivered) && q.chunks.is_empty() && q.trailers.is_none()
+}
