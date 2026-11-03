@@ -1861,3 +1861,55 @@ fn an_accepted_request_preserves_the_exact_head_handed_in_after_auth() {
         assert!(refused.take_wire(usize::MAX).starts_with(b"HTTP/1.1 401 Unauthorized\r\n"));
     }
 }
+
+#[test]
+fn a_write_half_close_preserves_a_complete_request_parked_on_auth() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_HEAD, 8);
+    kernel.wait = true;
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nabcd",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert!(up(&mut a).heads.is_empty());
+    a.ingest(b"", true);
+    run_with(&mut a, SEC, &mut kernel);
+    assert!(!a.ended(), "read EOF cannot abandon pending admission");
+    assert!(!up(&mut a).failed);
+    kernel.wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    let got = up(&mut a);
+    assert_eq!(got.heads.len(), 1);
+    assert_eq!(got.body, b"abcd");
+    assert!(got.whole);
+    assert!(!got.failed);
+    a.emit(got.heads[0].0, b"content-length: 4\r\n", false, 200)
+        .expect("answer head after EOF");
+    a.emit(got.heads[0].0, b"done", true, 0)
+        .expect("answer body after EOF");
+    a.drive(SEC);
+    let wire = a.take_wire(usize::MAX);
+    assert!(wire.windows(4).any(|part| part == b"done"));
+}
+
+#[test]
+fn a_write_half_close_still_fails_an_incomplete_request_body() {
+    let mut a = accepted();
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nab",
+        false,
+    );
+    run(&mut a, SEC);
+    let first = up(&mut a);
+    assert_eq!(first.heads.len(), 1);
+    assert!(!first.whole);
+    a.ingest(b"", true);
+    run(&mut a, SEC);
+    let tail = up(&mut a);
+    assert!(
+        tail.failed,
+        "EOF cannot turn a truncated body into a whole request"
+    );
+    assert!(!tail.whole);
+}

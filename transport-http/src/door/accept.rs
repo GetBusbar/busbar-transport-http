@@ -476,6 +476,9 @@ impl Accepted {
         let mut builder = auto::Builder::new(tasks.spawner());
         builder
             .http1()
+            // Preserve responses and pending admission when the peer closes only its write side.
+            // Hyper still rejects EOF before a declared request body is complete.
+            .half_close(true)
             .timer(io.timer())
             .header_read_timeout(HEADER_READ_TIMEOUT);
         let conn = builder
