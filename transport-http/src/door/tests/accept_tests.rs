@@ -1948,3 +1948,45 @@ fn a_reset_before_the_declared_answer_length_still_fails() {
     assert!(up(&mut a).failed, "a truncated declared-length answer is abandoned");
     assert!(a.emit(stream, b"", true, 0).is_err());
 }
+
+
+#[test]
+fn an_http1_consumer_drop_before_the_declared_response_length_fails() {
+    let mut a = accepted();
+    a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(stream, b"content-length: 4\r\n", false, 200).unwrap();
+    a.emit(stream, b"hi", false, 0).unwrap();
+    run(&mut a, SEC);
+    {
+        let sh = a.shared.lock().unwrap();
+        let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
+        assert_eq!(q.declared, Some(4));
+        assert_eq!(q.delivered, 2);
+        assert!(!q.ended);
+    }
+    // Drop the real Hyper consumer while the response remains incomplete.
+    a.conn = None;
+    run(&mut a, SEC);
+    assert!(up(&mut a).failed);
+    assert!(a.emit(stream, b"", true, 0).is_err());
+}
+
+#[test]
+fn conflicting_transfer_encoding_and_length_cannot_claim_wire_completion() {
+    let mut a = accepted();
+    a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(stream, b"content-length: 0\r\ntransfer-encoding: chunked\r\n", false, 200).unwrap();
+    {
+        let sh = a.shared.lock().unwrap();
+        let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
+        assert_eq!(q.declared, None);
+        assert!(!wire_body_complete(&q));
+    }
+    run(&mut a, SEC);
+    assert!(up(&mut a).failed, "invalid response framing is not a completed body");
+    assert!(a.emit(stream, b"", true, 0).is_err());
+}
