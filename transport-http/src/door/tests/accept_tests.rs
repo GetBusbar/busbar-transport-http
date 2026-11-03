@@ -1992,3 +1992,22 @@ fn conflicting_transfer_encoding_and_length_cannot_claim_wire_completion() {
     assert!(up(&mut a).failed, "invalid response framing is not a completed body");
     assert!(a.emit(stream, b"", true, 0).is_err());
 }
+
+
+#[test]
+fn conflicting_content_lengths_cannot_claim_wire_completion() {
+    let mut a = accepted();
+    a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.emit(stream, b"content-length: 0\r\ncontent-length: 4\r\n", false, 200).unwrap();
+    {
+        let sh = a.shared.lock().unwrap();
+        let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
+        assert_eq!(q.declared, None);
+        assert!(!wire_body_complete(&q));
+    }
+    run(&mut a, SEC);
+    assert!(up(&mut a).failed, "conflicting lengths are not a completed body");
+    assert!(a.emit(stream, b"", true, 0).is_err());
+}

@@ -920,7 +920,8 @@ impl Accepted {
                 .map_err(|e| Failure(format!("emit: the head is not an answer: {e}")))?;
             {
                 let mut queue = q.lock().unwrap_or_else(PoisonError::into_inner);
-                queue.declared = (a.h1 && !resp.headers().contains_key(http::header::TRANSFER_ENCODING))
+                queue.declared = (a.h1 && !resp.headers().contains_key(http::header::TRANSFER_ENCODING)
+                    && resp.headers().get_all(http::header::CONTENT_LENGTH).iter().count() == 1)
                     .then(|| resp.headers().get(http::header::CONTENT_LENGTH)
                     .and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())).flatten();
                 queue.trailers_supported = a.trailer_peer
