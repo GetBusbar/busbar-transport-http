@@ -1917,7 +1917,10 @@ fn a_write_half_close_still_fails_an_incomplete_request_body() {
 #[test]
 fn a_fixed_length_wire_end_still_accepts_the_hosts_empty_logical_end() {
     let mut a = accepted();
-    a.ingest(b"GET /first HTTP/1.1\r\nhost: test\r\n\r\nGET /second HTTP/1.1\r\nhost: test\r\n\r\n", true);
+    a.ingest(
+        b"GET /first HTTP/1.1\r\nhost: test\r\n\r\nGET /second HTTP/1.1\r\nhost: test\r\n\r\n",
+        true,
+    );
     run(&mut a, SEC);
     let first = up(&mut a).heads[0].0;
     a.emit(first, b"content-length: 2\r\n", false, 200).unwrap();
@@ -1926,31 +1929,53 @@ fn a_fixed_length_wire_end_still_accepts_the_hosts_empty_logical_end() {
     let next = up(&mut a);
     assert!(!next.failed, "exact wire length is not peer abandonment");
     assert_eq!(next.heads.len(), 1);
-    assert!(a.shared.lock().unwrap().streams.contains_key(&first), "logical End is still owed");
-    assert!(a.emit(first, b"extra", true, 0).is_err(), "wire completion cannot accept extra bytes");
-    assert!(a.emit_trailers(first, b"x-late: no\r\n").is_err(), "fixed-length completion cannot accept trailers");
-    a.emit(first, b"", true, 0).expect("empty logical End after wire completion");
-    assert!(a.emit(first, b"", true, 0).is_err(), "logical End is accepted exactly once");
-    a.emit(next.heads[0].0, b"content-length: 4\r\n", false, 200).unwrap();
+    assert!(
+        a.shared.lock().unwrap().streams.contains_key(&first),
+        "logical End is still owed"
+    );
+    assert!(
+        a.emit(first, b"extra", true, 0).is_err(),
+        "wire completion cannot accept extra bytes"
+    );
+    assert!(
+        a.emit_trailers(first, b"x-late: no\r\n").is_err(),
+        "fixed-length completion cannot accept trailers"
+    );
+    a.emit(first, b"", true, 0)
+        .expect("empty logical End after wire completion");
+    assert!(
+        a.emit(first, b"", true, 0).is_err(),
+        "logical End is accepted exactly once"
+    );
+    a.emit(next.heads[0].0, b"content-length: 4\r\n", false, 200)
+        .unwrap();
     a.emit(next.heads[0].0, b"done", true, 0).unwrap();
     run(&mut a, SEC);
     assert!(!up(&mut a).failed);
     let wire = a.take_wire(usize::MAX);
-    assert_eq!(wire.windows(15).filter(|w| *w == b"HTTP/1.1 200 OK").count(), 2);
+    assert_eq!(
+        wire.windows(15)
+            .filter(|w| *w == b"HTTP/1.1 200 OK")
+            .count(),
+        2
+    );
     assert!(wire.windows(4).any(|w| w == b"done"));
 }
 
 #[test]
 fn a_reset_before_the_declared_answer_length_still_fails() {
     let (mut a, stream) = h2_request();
-    a.emit(stream, b"content-length: 4\r\n", false, 200).unwrap();
+    a.emit(stream, b"content-length: 4\r\n", false, 200)
+        .unwrap();
     a.emit(stream, b"hi", false, 0).unwrap();
     run(&mut a, SEC);
     reset(&mut a);
-    assert!(up(&mut a).failed, "a truncated declared-length answer is abandoned");
+    assert!(
+        up(&mut a).failed,
+        "a truncated declared-length answer is abandoned"
+    );
     assert!(a.emit(stream, b"", true, 0).is_err());
 }
-
 
 #[test]
 fn an_http1_consumer_drop_before_the_declared_response_length_fails() {
@@ -1958,7 +1983,8 @@ fn an_http1_consumer_drop_before_the_declared_response_length_fails() {
     a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
     run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
-    a.emit(stream, b"content-length: 4\r\n", false, 200).unwrap();
+    a.emit(stream, b"content-length: 4\r\n", false, 200)
+        .unwrap();
     a.emit(stream, b"hi", false, 0).unwrap();
     run(&mut a, SEC);
     {
@@ -1981,7 +2007,13 @@ fn conflicting_transfer_encoding_and_length_cannot_claim_wire_completion() {
     a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
     run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
-    a.emit(stream, b"content-length: 0\r\ntransfer-encoding: chunked\r\n", false, 200).unwrap();
+    a.emit(
+        stream,
+        b"content-length: 0\r\ntransfer-encoding: chunked\r\n",
+        false,
+        200,
+    )
+    .unwrap();
     {
         let sh = a.shared.lock().unwrap();
         let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
@@ -1989,10 +2021,12 @@ fn conflicting_transfer_encoding_and_length_cannot_claim_wire_completion() {
         assert!(!wire_body_complete(&q));
     }
     run(&mut a, SEC);
-    assert!(up(&mut a).failed, "invalid response framing is not a completed body");
+    assert!(
+        up(&mut a).failed,
+        "invalid response framing is not a completed body"
+    );
     assert!(a.emit(stream, b"", true, 0).is_err());
 }
-
 
 #[test]
 fn conflicting_content_lengths_cannot_claim_wire_completion() {
@@ -2000,7 +2034,13 @@ fn conflicting_content_lengths_cannot_claim_wire_completion() {
     a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
     run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
-    a.emit(stream, b"content-length: 0\r\ncontent-length: 4\r\n", false, 200).unwrap();
+    a.emit(
+        stream,
+        b"content-length: 0\r\ncontent-length: 4\r\n",
+        false,
+        200,
+    )
+    .unwrap();
     {
         let sh = a.shared.lock().unwrap();
         let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
@@ -2008,10 +2048,12 @@ fn conflicting_content_lengths_cannot_claim_wire_completion() {
         assert!(!wire_body_complete(&q));
     }
     run(&mut a, SEC);
-    assert!(up(&mut a).failed, "conflicting lengths are not a completed body");
+    assert!(
+        up(&mut a).failed,
+        "conflicting lengths are not a completed body"
+    );
     assert!(a.emit(stream, b"", true, 0).is_err());
 }
-
 
 #[test]
 fn a_signed_content_length_cannot_claim_wire_completion() {
@@ -2019,7 +2061,8 @@ fn a_signed_content_length_cannot_claim_wire_completion() {
     a.ingest(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n", false);
     run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
-    a.emit(stream, b"content-length: +0\r\n", false, 200).unwrap();
+    a.emit(stream, b"content-length: +0\r\n", false, 200)
+        .unwrap();
     {
         let sh = a.shared.lock().unwrap();
         let q = sh.streams[&stream].reply.as_ref().unwrap().lock().unwrap();
