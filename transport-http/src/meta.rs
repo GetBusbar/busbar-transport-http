@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! What this transport declares about itself: the schemes it claims, how each is framed, and the
+//! transport kind's tail its door states.
 
 use busbar_contract::abi::transport::{
     TransportTail, FRAME_PIECE_SIZE, FRAMING_STREAM, ROLE_FRAMER,
@@ -14,9 +15,11 @@ pub const KEY: &str = "http";
 pub(crate) const SSE_KEY: &str = "sse";
 
 /// The secured form of the scheme: an `https` target is an `http` one whose bytes the connector
+/// secures before they leave.
 pub(crate) const SECURE_KEY: &str = "https";
 
 /// The layers this framer is built over: none. The carrier is the connector's choice from the
+/// target's scheme; no transport names another.
 pub(crate) const COMPOSES_OVER: &[&str] = &[];
 
 /// Whether this transport carries sessions: no (each claim row states `session` 0).

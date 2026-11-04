@@ -35,6 +35,14 @@ under that line's body limit. The accepted side retains the existing header/body
 bounds. An unanswered HTTP/1 upgrade can be handed to its upgrade framer as sent, and a completed
 `101` switch hands over the subsequent bytes. HTTP/2 stays on its original framing.
 
+## Differences from 1.5.5
+
+Initially silent accepted connections now enter the existing 30-second idle close bound,
+including before HTTP protocol detection, to bound pre-authentication resource retention.
+Plugin-owned credential-bearing header, target and wire copies are wiped or streamed directly
+into the host sink. Body and handover-copy limits are checked before allocating an over-limit
+copy. Valid request and response wire behavior is unchanged by these hardening measures.
+
 ## Build
 
 ```bash

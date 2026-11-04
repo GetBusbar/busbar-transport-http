@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! A TRANSPORT IS A WIRE, NEVER A PLANE — asserted over this crate's own source and its own manifest.
+//! A TRANSPORT IS A WIRE, NEVER A PLANE — asserted over this crate's own source and its own
+//! manifest.  ## Why this test exists and why it is not a review note  The mount in this crate
+//! serves any plane's declared surface.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The crate's purity vocabulary: the plane-crate spellings, the dialect words (named so a
+/// The crate's purity vocabulary: the plane-crate spellings, the dialect words (named so a caller
+/// can ask for one without spelling it), and every literal haystack the positive/negative
+/// controls plant — all read from `fixtures/plane_vocabulary.txt`.
 struct Vocab {
     plane_crates: Vec<String>,
     dialect_words: HashMap<String, String>,
@@ -70,7 +74,8 @@ fn load_vocab() -> Vocab {
     }
 }
 
-/// The core names a transport may not reach for, in both spellings.
+/// The core names a transport may not reach for, in both spellings.  The tree's rule runs one
+/// way: core drives plugins, and a plugin never names core.
 const CORE_NAMES: &[&str] = &[
     "busbar-kernel",
     "busbar_kernel",
@@ -99,7 +104,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether `word` occurs in `haystack` with a non-alphanumeric neighbour on each side.
+/// Whether `word` occurs in `haystack` with a non-alphanumeric neighbour on each side.  A
+/// whole-word match rather than a substring one, deliberately: `authority` contains no dialect
+/// and neither does `resolve`, but a substring scan for `a2a` would fire on a hexadecimal literal
+/// and a scan for `llm` on nothing at all until somebody wrote `collmate`.
 fn contains_word(haystack: &str, word: &str) -> bool {
     let lower = haystack.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -199,6 +207,8 @@ fn disallowed_busbar_dependency_keys(manifest: &str) -> Vec<String> {
 }
 
 /// No dependency of this crate — including a dev-dependency — is a plane crate or a core crate.
+/// The allowed set of busbar names in a transport's manifest is exactly two: `busbar-contract`
+/// and `busbar-contract-transport`, plus the sibling transports it composes over.
 #[test]
 fn the_manifest_names_neither_a_plane_nor_core() {
     let vocab = load_vocab();
@@ -223,7 +233,9 @@ fn the_manifest_names_neither_a_plane_nor_core() {
     );
 }
 
-/// The scan is not vacuous: a planted name is found, in both spellings and in the manifest's shape.
+/// The scan is not vacuous: a planted name is found, in both spellings and in the manifest's
+/// shape.  The failure mode this refuses is the one every text scanner has — a matcher that finds
+/// nothing because it can find nothing.
 #[test]
 fn the_scan_would_catch_a_planted_name() {
     let vocab = load_vocab();

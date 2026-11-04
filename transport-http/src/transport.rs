@@ -2,10 +2,12 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The framer entry's own message rendering: an outbound envelope rendered as the one HTTP/1.1
+//! request message the door's `encode` answers, the bytes the egress cross-check reads.
 
 use zeroize::Zeroizing;
 
 /// An RFC 9110 `token`: one or more `tchar`. A field name is one; anything else (a `:`, a space,
+/// a control byte, a non-ASCII byte) is not a name this wire can carry back out unchanged.
 fn is_token(name: &[u8]) -> bool {
     !name.is_empty()
         && name.iter().all(|b| {
@@ -31,6 +33,8 @@ fn is_token(name: &[u8]) -> bool {
 }
 
 /// Render the head of the one HTTP/1.1 request message an outbound envelope (`fields`,
+/// post-decoration) with a `body_len`-byte body makes: the request line and the fields (the
+/// `content-length` among them, as the host stated it), through the blank line.
 pub(crate) fn render_head(
     fields: &[(&str, &[u8])],
     body_len: usize,

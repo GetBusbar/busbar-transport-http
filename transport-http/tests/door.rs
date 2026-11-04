@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The `http` framer, driven through its own table the way the host drives it: the lifecycle's
+//! settings texts, `refresh`, the role stubs, the missing instance, and what a failure text may
+//! repeat of a target.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -155,6 +157,7 @@ fn locate(inst: *mut c_void, target: &str) -> (Outcome, Vec<u8>, String) {
 }
 
 /// `locate` of `target` with a defaults buffer of `cap` bytes (none lent at 0): its outcome, the
+/// protocol offer, its text, and the defaults bytes it wrote and needs.
 fn locate_lending(
     inst: *mut c_void,
     target: &str,
@@ -239,6 +242,8 @@ fn refresh_reads_the_new_settings_and_keeps_the_old_on_a_bad_blob() {
 }
 
 /// The framer's own head lines (`accept`, `host`) are owed to every request, so a host that lends
+/// no room for them, or too little, is answered short with the size they need, never READY with
+/// no lines (a request that would go out with no `host` on HTTP/1.1).
 #[test]
 fn locate_answers_short_when_the_defaults_buffer_cannot_hold_its_lines() {
     let inst = open("");

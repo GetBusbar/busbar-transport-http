@@ -7,6 +7,7 @@
 pub type H2Frame = (u8, u8, u32, Vec<u8>);
 
 /// The connection preface and every frame of `b`, the WHOLE wire: bytes past the last whole frame
+/// (a stray tail, or a frame cut short) fail the cell in words rather than going uncompared.
 pub fn h2_frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
     let mut out = Vec::new();
     let mut i = 24.min(b.len());
@@ -30,6 +31,7 @@ pub fn h2_frames(b: &[u8]) -> (Vec<u8>, Vec<H2Frame>) {
 }
 
 /// Whether `b` (a client's bytes) holds a whole request: on HTTP/2 a frame on a stream that ends
+/// it (END_STREAM); on HTTP/1.1 the head and the body its `content-length` states.
 #[allow(dead_code)]
 pub fn request_whole(b: &[u8], h2: bool) -> bool {
     if h2 {

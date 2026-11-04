@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The framings table: reached by token alone, never waited on, and a token that outlived its
+//! framing reaches nothing.
 
 use super::*;
 use crate::door::engine::{Posture, Proto};
@@ -35,6 +36,7 @@ fn every_index_has_one_place() {
 }
 
 /// A framing another op holds is answered at once (`Busy`), never waited for; once it is let go
+/// the next op reaches it.
 #[test]
 fn a_held_framing_answers_busy_at_once() {
     let table = Framings::default();
@@ -115,7 +117,8 @@ fn a_poisoned_slot_is_still_freed_by_its_removal() {
     assert!(table.reach(b).is_ok(), "the slot serves the next framing");
 }
 
-/// Accelerate only the private table's generation to its final representable value. This does
+/// Accelerate only the private table's generation to its final representable value. This does not
+/// claim billions of real connection cycles; it proves the boundary where wrapping aliases.
 #[test]
 fn an_exhausted_slot_never_mints_a_generation_zero_alias() {
     let table = Framings::default();
@@ -260,4 +263,11 @@ fn the_boxing_factory_runs_under_the_reserved_slot_after_releasing_the_free_list
         .unwrap();
     assert!(matches!(table.reach(held).unwrap().held(), Held::Accept(_)));
     table.remove(held).unwrap();
+}
+
+impl Framings {
+    /// Hold the dialled `framing`, answering its token, or `None` when every slot is in use.
+    pub(in crate::door) fn insert(&self, framing: Framing) -> Option<u64> {
+        self.insert_with(|| Held::Dial(Box::new(framing)))
+    }
 }

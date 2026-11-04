@@ -10,6 +10,7 @@ use std::convert::Infallible;
 const SEC: u64 = 1_000_000_000;
 
 /// The kernel a `none` line meets: every hand-in CONTINUE; no auth is called on it and nothing is
+/// refused.
 struct Open;
 
 /// The ticket a test kernel's op runs on: a ticketed one, where `auth.call` may be made.
@@ -321,6 +322,7 @@ fn undated(mut wire: Vec<u8>) -> Vec<u8> {
 }
 
 /// Whether `wire` holds one whole HTTP/1.1 answer: its head, then the body its `content-length`
+/// states, or its chunked body through the last chunk (a head stating neither has no body here).
 fn answer_whole(wire: &[u8]) -> bool {
     let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") else {
         return false;
@@ -409,6 +411,7 @@ fn v155(
 }
 
 /// The door's accepted side answering `request` the same way, as a host drives it: the head emit
+/// (status, field block), then the body emits.
 fn door(
     request: &[u8],
     status: u16,
@@ -623,6 +626,8 @@ fn an_answered_or_h2_connection_is_not_handed_over_as_sent() {
 }
 
 /// THE COPY KEPT FOR A HAND-OVER AS SENT is bounded and kept only while a hand-over is possible
+/// (Q128 reader A finding 1; THE DESIGN §1 l.199-201, a bound on live work is a refusal at
+/// admission): an HTTP/2 connection is never handed over, so it keeps none.
 #[test]
 fn an_h2_connection_keeps_no_copy_of_what_it_was_sent() {
     let mut a = accepted();
@@ -647,6 +652,9 @@ fn an_admitted_request_that_asks_no_upgrade_lets_the_copy_go() {
 }
 
 /// The copy is bounded at hyper's HTTP/1 head limit (`engine::HEAD_MAX_BYTES`, the one an upgrade
+/// request's head is read under): past it no hand-over as sent is possible, so the copy goes, and
+/// the connection is NOT cut (Q128 reader B finding 2, overriding reader A's earlier "refuse over
+/// it": v1.5.5's server served such a connection on).
 #[test]
 fn a_copy_past_the_head_limit_is_let_go_and_the_connection_kept() {
     const HEAD_LIMIT: usize = crate::door::engine::HEAD_MAX_BYTES;
@@ -785,7 +793,9 @@ fn a_connection_forgets_every_finished_request() {
     assert!(n <= 1, "{n} records kept");
 }
 
-/// A request that carries an `Upgrade` line AND a body is served as any other: its body never fills
+/// A request that carries an `Upgrade` line AND a body is served as any other: its body never
+/// fills the hand-over copy, so the connection is not cut, and it gets its normal answer (Q128
+/// reader B finding 2: the copy holds an upgrade request's HEAD only).
 #[test]
 fn an_upgrade_request_with_a_large_body_gets_its_normal_answer() {
     let mut a = accepted();
@@ -824,6 +834,7 @@ fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// An HTTP/2 connection with one whole `GET /` request on stream 1, admitted and gone up: the
+/// accepted side and the request's stream.
 fn h2_request() -> (Accepted, u64) {
     let mut a = accepted();
     a.ingest(H2_PREFACE, false);
@@ -889,6 +900,7 @@ fn a_stream_the_far_side_resets_before_its_head_ends_failed_and_is_let_go() {
 }
 
 /// A streaming answer held at its high-water mark, its stream reset: the host is woken (the
+/// stream's failure piece ends its hold), not left waiting for a writable piece that never comes.
 #[test]
 fn a_full_stream_the_far_side_resets_is_woken_not_stalled() {
     let (mut a, stream) = h2_request();
@@ -1120,6 +1132,7 @@ fn an_idle_h2_connection_is_closed_and_a_busy_one_is_not() {
 }
 
 /// An admitted request whose body has stalled (nothing for 30 s), or trickles below 1 KiB/s once
+/// 10 s have passed, fails its stream, as v1.5.5's listener failed such a body (`TimeoutBody`).
 #[test]
 fn a_stalled_or_trickled_request_body_fails_its_stream() {
     let post =
@@ -1817,6 +1830,8 @@ impl Kernel for CapturedAdmission {
 }
 
 /// The actual accepted-side parser, auth call, hand-in and emitted frame must agree. A filter
+/// used for dialled answers used to delete these fields after hand-in, producing an empty 401
+/// when the real data listener tried to claim even an anonymous GET /healthz.
 #[test]
 fn an_accepted_request_preserves_the_exact_head_handed_in_after_auth() {
     for (wire, body) in [
@@ -2072,4 +2087,118 @@ fn a_signed_content_length_cannot_claim_wire_completion() {
     run(&mut a, SEC);
     assert!(up(&mut a).failed, "a signed length is not a completed body");
     assert!(a.emit(stream, b"", true, 0).is_err());
+}
+
+#[test]
+fn a_sub_kibibyte_body_limit_has_a_nonzero_deadline() {
+    assert_eq!(accepted().with_body_max(512).body_total_ns, SEC);
+}
+
+#[test]
+fn handover_copy_is_bounded_before_drive() {
+    let mut a = accepted();
+    a.ingest(&vec![b'x'; HEAD_MAX_BYTES + 1], false);
+    assert!(a.raw.is_none());
+}
+
+#[test]
+fn bodyless_responses_accept_a_later_logical_end() {
+    for (request, status, fields) in [
+        (
+            b"HEAD / HTTP/1.1\r\nhost: test\r\n\r\n".as_slice(),
+            200,
+            b"content-length: 100\r\n".as_slice(),
+        ),
+        (GET, 204, b"".as_slice()),
+        (GET, 304, b"content-length: 100\r\n".as_slice()),
+    ] {
+        let mut a = accepted();
+        a.ingest(request, false);
+        run(&mut a, SEC);
+        let stream = up(&mut a).heads[0].0;
+        a.emit(stream, fields, false, status).unwrap();
+        run(&mut a, SEC);
+        assert!(!a.pieces().iter().any(|p| p.failed));
+        a.emit(stream, b"", true, 0).unwrap();
+    }
+}
+
+#[test]
+fn an_initially_silent_connection_is_bounded() {
+    let mut a = accepted();
+    run(&mut a, SEC);
+    assert!(a.next_deadline().is_some());
+    run(&mut a, 32 * SEC);
+    run(&mut a, 43 * SEC);
+    assert!(a.ended());
+}
+
+#[test]
+fn admitted_header_and_target_copies_are_wiped_on_release() {
+    let request = http::Request::builder()
+        .uri("/path?token=secret")
+        .header("authorization", "Bearer secret")
+        .body(())
+        .unwrap();
+    let (parts, _) = request.into_parts();
+    let probe = crate::wipe_probe::Probe::start();
+    let piece = head_piece(1, &parts);
+    crate::wipe_probe::watch("accepted fields", &piece.bytes);
+    crate::wipe_probe::watch("accepted target", &piece.head.as_ref().unwrap().target);
+    drop(piece);
+    probe
+        .finish()
+        .assert_wiped_on_linux(&["accepted fields", "accepted target"]);
+}
+
+#[test]
+fn cancelling_an_admitted_opening_records_its_terminal_notification() {
+    let mut a = accepted();
+    a.ingest(GET, false);
+    run(&mut a, SEC);
+    let stream = up(&mut a).heads[0].0;
+    a.shared
+        .lock()
+        .unwrap()
+        .streams
+        .get_mut(&stream)
+        .unwrap()
+        .opened_on = Some(OP_TICKET);
+    assert!(a.cancel(OP_TICKET));
+    assert!(a.shared.lock().unwrap().streams[&stream].told);
+    assert_eq!(a.pieces().iter().filter(|piece| piece.failed).count(), 1);
+}
+
+#[test]
+fn peer_service_failures_retain_a_distinct_safe_cause() {
+    let mut a = Accepted::accept(SEC, vec![Line::any_needing(1, POINT_PEER, 0)]);
+    a.admit_peer(&mut Open);
+    assert!(!a.peer_ready());
+    assert!(a
+        .failure_reason()
+        .unwrap()
+        .contains("service failed: Unserved"));
+}
+
+#[test]
+fn an_over_limit_body_frame_never_grows_the_held_allocation() {
+    let mut held = vec![1; 4];
+    let capacity = held.capacity();
+    let address = held.as_ptr();
+    assert!(!hold_bounded(&mut held, &[2; 100], 8));
+    assert_eq!(held, [1; 4]);
+    assert_eq!(held.capacity(), capacity);
+    assert_eq!(held.as_ptr(), address);
+    assert!(hold_bounded(&mut held, &[2; 4], 8));
+    assert_eq!(held.len(), 8);
+}
+
+#[test]
+fn a_large_initial_h2_ingest_preserves_protocol_detection_without_a_copy() {
+    let mut a = accepted();
+    let mut bytes = H2_PREFACE.to_vec();
+    bytes.resize(HEAD_MAX_BYTES + 1, 0);
+    a.ingest(&bytes, false);
+    assert!(a.h2);
+    assert!(a.raw.is_none());
 }

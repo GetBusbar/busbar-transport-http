@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE FRAMINGS AN INSTANCE HOLDS, by token, with no lock shared between them.
+//! THE FRAMINGS AN INSTANCE HOLDS, by token, with no lock shared between them.  No contended
+//! atomic per chunk, and request-path ops answer in bounded CPU, never blocking.
 
 use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
 
@@ -14,6 +15,7 @@ const BASE: usize = 64;
 const SEGMENTS: usize = 16;
 
 /// One framing the instance holds: a dialled connection's client, or an accepted connection's
+/// server.
 pub(super) enum Held {
     /// A dialled connection (`SIDE_DIAL`).
     Dial(Box<Framing>),
@@ -101,12 +103,6 @@ fn untoken(token: u64) -> Option<(u32, u32)> {
 }
 
 impl Framings {
-    /// Hold the dialled `framing`, answering its token, or `None` when every slot is in use.
-    #[cfg(test)]
-    pub(super) fn insert(&self, framing: Framing) -> Option<u64> {
-        self.insert_with(|| Held::Dial(Box::new(framing)))
-    }
-
     /// Construct the owned framing only after its slot and generation are reserved.
     pub(super) fn insert_with(&self, make: impl FnOnce() -> Held) -> Option<u64> {
         let index = {
@@ -138,7 +134,8 @@ impl Framings {
         Some(token(index, slot.generation))
     }
 
-    /// The framing `token` names, held for one op.
+    /// The framing `token` names, held for one op.  # Errors  [`Reach::Gone`]: no framing holds
+    /// the token; [`Reach::Busy`]: another op holds it.
     pub(super) fn reach(&self, token: u64) -> Result<MutexGuard<'_, SlotState>, Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);
@@ -161,6 +158,9 @@ impl Framings {
     }
 
     /// Visit every framing no op holds right now, `f` on each. Never waits (the op holding a
+    /// framing may be the very one whose host call crossed here): a framing another op holds is
+    /// skipped, and the answer says one was (`true`), so the caller never reads a skipped framing
+    /// as one with nothing on it.
     pub(super) fn each(&self, mut f: impl FnMut(&mut Held)) -> bool {
         let mut skipped = false;
         for segment in self.segments.iter().filter_map(OnceLock::get) {
@@ -181,6 +181,10 @@ impl Framings {
     }
 
     /// Drop the framing `token` names and give its slot back. The one op that WAITS for its slot:
+    /// a framing's last op must always free it, so a removal that meets an op holding the slot
+    /// (`cancel`'s visit, or an op another thread runs) waits for it to let go (every op answers
+    /// in bounded CPU), and one that meets a slot a panicking op poisoned frees it too, and
+    /// clears the poison, so the slot serves the next framing.
     pub(super) fn remove(&self, token: u64) -> Result<(), Reach> {
         let (index, generation) = untoken(token).ok_or(Reach::Gone)?;
         let (k, at) = place(index as usize);

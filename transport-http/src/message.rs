@@ -2,10 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The HTTP/1.1 message the framer reads a request through: whether the bytes an `emit` has
+//! carried so far are one whole message yet (the egress cross-check's framing), the request
+//! target a dialled exchange goes to, and the upstream's `Retry-After` read off a response head.
 
 use crate::raw;
 
-/// Read the upstream's `Retry-After` off a response head and resolve it to whole seconds.
+/// Read the upstream's `Retry-After` off a response head and resolve it to whole seconds.  The
+/// header is optional, appears at most once in any answer that means it, and a value this parser
+/// cannot read is treated as absent — a wait nobody can compute is not a wait, and guessing one
+/// would park a lane on a header nobody wrote.
 pub(crate) fn retry_after_secs(headers: &http::HeaderMap, now_secs: u64) -> Option<u64> {
     let raw = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
     parse_retry_after(raw, now_secs)
@@ -39,6 +44,7 @@ pub(crate) fn parse_retry_after(value: &str, now: u64) -> Option<u64> {
 }
 
 /// Where an egress request actually goes: the dialled scheme and authority, carrying the target
+/// the message STATED.
 pub(crate) fn request_target(
     dial: &http::Uri,
     path: Option<&str>,
@@ -68,6 +74,9 @@ pub(crate) struct Whole {
 }
 
 /// A message this transport has been handed enough of to send, or `None` for a prefix of one.
+/// The three endings are the wire's own: a declared `Content-Length` reached, the terminal chunk
+/// of a chunked body seen, or a message that declares neither coding and therefore carries no
+/// body at all.
 pub(crate) fn complete_message(
     buffered: &[u8],
     cache: &mut EgressHead,
@@ -178,7 +187,9 @@ pub(crate) struct EgressHead {
     pub(crate) searched: usize,
 }
 
-/// The offset just past the blank line that ends a header block, searching from `start`.
+/// The offset just past the blank line that ends a header block, searching from `start`.  The
+/// search JUMPS between line feeds rather than stepping a four-byte window over every position;
+/// the terminator's last byte is one, so no candidate is skipped.
 pub(crate) fn find_header_end_from(buf: &[u8], start: usize) -> Option<usize> {
     let mut i = start.min(buf.len());
     loop {

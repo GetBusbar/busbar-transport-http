@@ -2,12 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! A minimal HTTP/1.1 request reader over borrowed bytes: just enough to read the request line
+//! and header fields of the message `encode` renders and `emit` is handed, and to undo a chunked
+//! body across however many reads it arrives in.
 
 /// A request head, read in place.
 pub(crate) struct Head<'a> {
     /// The request method.
     pub(crate) method: &'a str,
     /// The request target the message STATED; `None` = it named none (an empty target word,
+    /// `METHOD  HTTP/version`).
     pub(crate) path: Option<&'a str>,
     /// The header block, its request line included.
     block: &'a [u8],
@@ -33,6 +36,7 @@ fn lines(block: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// A field line's name and its value without the optional whitespace (SP, HTAB) around it (RFC
+/// 9112 5.1); every other byte of the value stays (obs-text included).
 fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
     let colon = memchr::memchr(b':', line)?;
     let value = &line[colon + 1..];
@@ -47,6 +51,7 @@ fn split_field(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 impl<'a> Head<'a> {
     /// Read the head at the front of `bytes`, which may end exactly at the header terminator or
+    /// carry the body after it.
     pub(crate) fn parse(bytes: &'a [u8]) -> Result<Self, &'static str> {
         const UNPARSABLE: &str = "unparsable request head";
         let block = memchr::memmem::find(bytes, b"\r\n\r\n").map_or(bytes, |p| &bytes[..p + 2]);
@@ -115,7 +120,12 @@ impl<'a> Head<'a> {
             })
     }
 
-    /// How the body is framed.
+    /// How the body is framed.  `chunked` ALONE is the coding this transport reads: it must be
+    /// the final transfer coding (RFC 9112 6.1: a list where it is not last leaves the body
+    /// length undeterminable), applied only ONCE (`chunked, chunked` is a body wrapped twice),
+    /// and any other coding in the list (`gzip, chunked`) is one this transport does not
+    /// implement, so it is refused (RFC 9112 6.1), never dropped while its bytes go on unnamed;
+    /// falling through to `Content-Length` would answer a question the sender did not ask.
     pub(crate) fn framing(&self) -> Result<BodyFraming, &'static str> {
         let (mut codings, mut chunked) = (0_usize, 0_usize);
         for coding in self.members("transfer-encoding") {
@@ -189,19 +199,31 @@ enum ChunkState {
 pub(crate) struct ChunkedMalformed;
 
 /// A size line's `1*HEXDIG` (RFC 9112 7.1: no sign, no whitespace, not empty). Chunk extensions
-fn chunk_size(line: &str) -> Result<usize, ChunkedMalformed> {
-    let size = match line.split_once(';') {
-        Some((size, _)) => size.trim_end_matches([' ', '\t']),
+/// after a semicolon are not read, and whitespace may stand between a size and them (BWS, RFC
+/// 9112 7.1.1).
+fn chunk_size(line: &[u8]) -> Result<usize, ChunkedMalformed> {
+    let size = match line.iter().position(|byte| *byte == b';') {
+        Some(end) => {
+            let size = &line[..end];
+            let end = size
+                .iter()
+                .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+                .map_or(0, |at| at + 1);
+            &size[..end]
+        }
         None => line,
     };
-    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) {
         return Err(ChunkedMalformed);
     }
+    let size = std::str::from_utf8(size).map_err(|_| ChunkedMalformed)?;
     usize::from_str_radix(size, 16).map_err(|_| ChunkedMalformed)
 }
 
 impl ChunkedDecoder {
     /// Feed everything that has arrived since the last call, answering how many of `bytes` the
+    /// message took: all of them, unless the terminal chunk and its trailer section ended it
+    /// first.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<usize, ChunkedMalformed> {
         let mut at = 0;
         while at < bytes.len() {
@@ -252,7 +274,8 @@ impl ChunkedDecoder {
         Ok(bytes.len())
     }
 
-    /// A size or trailer line has ended: its one CR before the LF is the line end's; a CR anywhere
+    /// A size or trailer line has ended: its one CR before the LF is the line end's; a CR
+    /// anywhere else makes it malformed (RFC 9112 7.1), never a byte spliced out.
     fn end_line(&mut self) -> Result<(), ChunkedMalformed> {
         if self.line.last() == Some(&b'\r') {
             self.line.pop();
@@ -260,7 +283,7 @@ impl ChunkedDecoder {
         if self.line.contains(&b'\r') {
             return Err(ChunkedMalformed);
         }
-        let line = std::str::from_utf8(&self.line).map_err(|_| ChunkedMalformed)?;
+        let line = self.line.as_slice();
         self.state = match self.state {
             ChunkState::Size => match chunk_size(line)? {
                 0 => ChunkState::Trailers,
@@ -270,7 +293,7 @@ impl ChunkedDecoder {
                 }
             },
             _ if line.is_empty() => ChunkState::Done,
-            _ if line.contains(':') => ChunkState::Trailers,
+            _ if line.contains(&b':') => ChunkState::Trailers,
             _ => return Err(ChunkedMalformed),
         };
         zeroize::Zeroize::zeroize(&mut *self.line);

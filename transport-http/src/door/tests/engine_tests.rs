@@ -98,7 +98,8 @@ fn asked(proto: Proto, timeout_secs: u64) -> Framing {
     f
 }
 
-/// Every body byte handed up on stream 1 (the head piece and failure pieces excluded), and whether
+/// Every body byte handed up on stream 1 (the head piece and failure pieces excluded), and
+/// whether the stream ended whole.
 fn body(f: &mut Framing) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut whole = false;
@@ -184,6 +185,8 @@ fn declared(f: &mut Framing) -> Option<Option<u64>> {
 }
 
 /// The head piece states the body length the answer's head declared (`Content-Length`, busbar
+/// #1032's `PIECE_HAS_DECLARED_LEN`), on HTTP/1.1 and on HTTP/2, so the host's pre-body download
+/// cap reads it before a body byte; a head that declares none (a chunked answer) states none.
 #[test]
 fn the_head_piece_states_the_body_length_the_head_declared() {
     let mut f = asked(Proto::H1, 300);
@@ -211,6 +214,7 @@ fn the_head_piece_states_the_body_length_the_head_declared() {
 }
 
 /// The length a head declares is read whole or not at all: identical duplicates are one length,
+/// and a disagreeing or malformed value declares none.
 #[test]
 fn a_declared_length_is_one_valid_content_length() {
     let head = |values: &[&str]| {
@@ -302,6 +306,8 @@ fn a_streamed_response_past_the_request_body_cap_passes_through() {
 }
 
 /// The clock is the ATTEMPT's, stamped before the dial: a connect that took 200s leaves the
+/// exchange 100s of a 300s timeout, so a body still arriving at 300s from the attempt's start is
+/// cut there, not 300s after the request went out.
 #[test]
 fn a_slow_connect_and_a_slow_body_share_one_attempt_clock() {
     let connected = 200 * SEC;
@@ -433,6 +439,7 @@ fn a_dns_host_goes_out_lower_case() {
 }
 
 /// What one emit of an envelope rendered by `encode` does on a fresh HTTP/1.1 framing whose body
+/// cap is `cap`: the emit's answer and the bytes the connection wrote.
 fn rendered_and_sent(
     cap: usize,
     fields: &[(&str, &[u8])],
@@ -728,6 +735,7 @@ fn the_wire_head_is_the_head_the_auth_saw() {
 }
 
 /// What an HTTP/2 far end reads off `wire`, a client connection's bytes: its first request's
+/// field lines in order, pseudo-fields aside, and its `:authority`.
 fn h2_far_end_reads(wire: Vec<u8>) -> (Vec<(String, String)>, String) {
     use tokio::io::AsyncWriteExt;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -957,6 +965,8 @@ fn an_sse_dial_puts_its_http_twins_bytes_on_the_wire() {
 }
 
 /// A framing that fails in the same drive that queued output (a body shorter than its declared
+/// length, the far end closing) states the failure on the stream after what was handed up: the
+/// host never calls a connection again once it ended, so the failure text rides a piece.
 #[test]
 fn a_framing_failing_with_output_owed_fails_each_live_stream_after_it() {
     let mut f = asked(Proto::H1, 300);
@@ -1307,4 +1317,61 @@ fn queued_request_body_ownership_is_wiped_when_the_framing_is_dropped() {
             "queued request body"
         }]);
     }
+}
+
+#[test]
+fn an_incomplete_request_arms_and_obeys_its_timeout() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H1, posture(1), 0).unwrap();
+    f.emit(
+        1,
+        b"POST / HTTP/1.1\r\ncontent-length: 10\r\n\r\nx",
+        false,
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(f.next_deadline().is_some_and(|at| at <= SEC));
+    f.drive(2 * SEC, 0);
+    assert!(failed(&mut f));
+}
+
+#[test]
+fn a_ready_response_cannot_bypass_an_expired_attempt() {
+    let mut f = asked(Proto::H1, 1);
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok", false);
+    f.drive(2 * SEC, 0);
+    assert!(failed(&mut f));
+    assert!(!body(&mut f).1);
+}
+
+#[test]
+fn an_expired_h2_request_discards_remaining_fragments_until_end() {
+    let mut f = Framing::dial("http://127.0.0.1:9", Proto::H2, posture(1), 0).unwrap();
+    f.drive(0, 0);
+    f.ingest(&h2(4, 0, 0, &[]), false);
+    f.drive(0, 0);
+    let _ = f.take_wire(usize::MAX);
+    f.emit(
+        1,
+        b"POST / HTTP/1.1\r\ncontent-length: 1000\r\n\r\nx",
+        false,
+        0,
+        0,
+    )
+    .unwrap();
+    f.drive(2 * SEC, 0);
+    assert!(matches!(f.exchanges[0].1, Stage::Refused));
+    assert_eq!(f.pieces().iter().filter(|piece| piece.failed).count(), 1);
+    f.emit(
+        1,
+        b"GET /never-authed HTTP/1.1\r\nx-injected: 1\r\n\r\n",
+        true,
+        2 * SEC,
+        0,
+    )
+    .unwrap();
+    f.drive(2 * SEC, 0);
+    assert!(f.exchanges.is_empty());
+    assert!(!h2_frame_types(&f.take_wire(usize::MAX)).contains(&1));
+    assert_eq!(f.pieces().iter().filter(|piece| piece.failed).count(), 1);
 }

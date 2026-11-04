@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The crate's own battery: the HTTP/1.1 message an `emit` accumulates (one parse and one chunked
+//! decode per message, the smuggling pair refused), the request envelope `encode` renders, the
+//! start-line check, and the `Retry-After` reading a response head carries.
 
 use super::*;
 
@@ -54,6 +56,7 @@ fn retry_after_parses_both_normative_forms() {
 }
 
 /// RFC 9110 5.6.7: a recipient MUST accept all three HTTP-date forms, and a date with an
+/// out-of-range field is no date at all (1.5.5 parsed with `httpdate` and read it the same way).
 #[test]
 fn retry_after_reads_every_http_date_form() {
     let now = 784_111_777 - 120;
@@ -74,7 +77,8 @@ fn retry_after_reads_every_http_date_form() {
     );
 }
 
-/// The egress header block is parsed once per message, not once per `write` call.
+/// The egress header block is parsed once per message, not once per `write` call.  `write`
+/// accumulates, and it asks "is this message whole yet?" on every chunk.
 #[test]
 fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n".to_vec();
@@ -100,7 +104,11 @@ fn the_egress_header_block_is_parsed_once_across_many_write_calls() {
     );
 }
 
-/// The egress chunked body is decoded once, not once per `write` call.
+/// The egress chunked body is decoded once, not once per `write` call.  The sibling of the
+/// header-parse cell above, and the same standard: `write` accumulates and asks "is this message
+/// whole yet?" on every chunk, and answering that with a FRESH decoder re-decoded every byte
+/// received so far — quadratic in the body, with a full re-allocation of the decoded chunks each
+/// time.
 #[test]
 fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     let mut buffered = b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
@@ -148,7 +156,9 @@ fn the_egress_chunked_body_is_decoded_once_across_many_write_calls() {
     );
 }
 
-/// The egress mirror of `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`,
+/// The egress mirror of
+/// `a_message_with_both_a_transfer_encoding_and_a_content_length_is_refused`, the ingress
+/// reader's own refusal.
 #[test]
 fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     let smuggled = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
@@ -176,7 +186,9 @@ fn egress_refuses_a_chunked_body_declared_with_a_content_length() {
     );
 }
 
-/// Every request line names its version. Without the check any two words followed by a space parse
+/// Every request line names its version. Without the check any two words followed by a space
+/// parse as a request, so a blob that is not HTTP at all is read as one and its first two words
+/// become a method and a path this transport goes on to act on.
 #[test]
 fn a_start_line_with_no_http_version_is_not_a_message() {
     assert!(
@@ -199,7 +211,9 @@ fn a_start_line_with_no_http_version_is_not_a_message() {
     assert!(raw::Head::parse(b"GET / HTTP/1.0\r\nHost: x\r\n\r\n").is_ok());
 }
 
-/// The envelope's bytes are an HTTP message, because that is what this wire is.
+/// The envelope's bytes are an HTTP message, because that is what this wire is.  The egress unit
+/// used to write a neutral layout — every field as `name: value`, a blank line, the body — and
+/// hand it to `write` as if it were a request.
 #[test]
 fn the_envelope_encodes_as_an_http_message() {
     let bytes = crate::transport::render_envelope(
@@ -234,7 +248,9 @@ fn the_envelope_encodes_as_an_http_message() {
     assert_eq!(whole.body(&bytes), b"{\"model\":\"m\"}");
 }
 
-/// An envelope naming NO path is not one that named `/`: it renders an empty target word and reads
+/// An envelope naming NO path is not one that named `/`: it renders an empty target word and
+/// reads back as no target at all, while a stated `/` reads back as `/` (the framing decides
+/// where each goes, `crate::message::request_target`).
 #[test]
 fn no_target_named_and_a_stated_root_stay_distinct() {
     let unnamed = crate::transport::render_envelope(&[("method", b"GET".as_slice())], b"").unwrap();
@@ -251,6 +267,8 @@ fn no_target_named_and_a_stated_root_stay_distinct() {
 }
 
 /// A CR or an LF in a field is not data on this wire: it ENDS the line. A caller that can put one
+/// in a value chooses where this transport's header block ends and what stands after it — a
+/// second header, a body boundary, a whole second request.
 #[test]
 fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
     let poisoned: &[(&str, &[u8])] = &[
@@ -286,6 +304,8 @@ fn a_field_cannot_smuggle_a_line_ending_into_the_header_block() {
 }
 
 /// A field name is an RFC 9110 token. A `:` in one is re-read as a different field when the door
+/// re-parses its own rendered message (`authorization:x` + `v` becomes `authorization` = `x: v`),
+/// which slips past the kernel's same-name auth replacement: refused, nothing rendered.
 #[test]
 fn a_field_name_that_is_not_a_token_is_refused() {
     for name in [
@@ -319,6 +339,7 @@ fn a_field_name_that_is_not_a_token_is_refused() {
 }
 
 /// `encode` refuses a method that is not an RFC 9110 token, and a target carrying a space, as
+/// `Unrepresentable`, never answering READY with a request line its own `emit` then refuses.
 #[test]
 fn encode_refuses_a_request_line_its_emit_could_not_read() {
     let refused = |method: &[u8], path: &[u8]| {
@@ -422,7 +443,8 @@ fn the_header_end_search_honours_its_start() {
     assert_eq!(find_header_end_from(b"\r\n\r\nab", 4), None);
 }
 
-/// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a list
+/// A `Content-Length` that does not name exactly one valid length is unrecoverable framing: a
+/// list whose members disagree, two lines that disagree, a sign, non-digits.
 #[test]
 fn a_content_length_that_names_no_single_length_is_refused() {
     for head in [
@@ -468,7 +490,8 @@ fn a_declared_length_over_the_body_cap_is_refused() {
         .is_some());
 }
 
-/// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame; the
+/// A `Transfer-Encoding` that is not (only) `chunked` is a coding this transport cannot frame;
+/// the message is refused rather than read by its `Content-Length`.
 #[test]
 fn a_transfer_encoding_other_than_chunked_is_refused() {
     for te in ["gzip", "chunked, gzip", "gzip, chunked"] {
@@ -524,6 +547,7 @@ fn encode_refuses_what_emit_would_refuse() {
 }
 
 /// The `linked` entry's `SESSION` is what every claim row the door states says (sibling alignment
+/// D14): the root folds one, the host reads the other.
 #[test]
 fn linked_session_is_every_claim_rows_session() {
     let session = crate::linked::SESSION;

@@ -25,6 +25,7 @@ fn production_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The lines of `text` that declare process-global state: a `static` item (any visibility,
+/// `static mut` included) or a `thread_local!` block.
 fn global_state(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim_start)
@@ -44,6 +45,7 @@ fn global_state(text: &str) -> Vec<String> {
 }
 
 /// The scan's positive control: it sees a static in every visibility and a thread-local, and
+/// passes a `const` and a `&'static` lifetime.
 #[test]
 fn the_scan_sees_a_static_where_one_is_written() {
     assert_eq!(global_state("static A: u8 = 0;").len(), 1);

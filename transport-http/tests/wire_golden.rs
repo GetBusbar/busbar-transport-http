@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE 1.5.5 WIRE GOLDEN: the http door's exit test, byte parity with the published 1.5.5 wire.
+//! The golden is what the PUBLISHED 1.5.5 binary put on the wire.
 
 mod common;
 
@@ -22,6 +23,7 @@ use common::{frame_name, h2_frames, H2Frame};
 const PORT: u16 = 40123;
 
 /// The port a wire-exact recording pinned, read off its `host` / `:authority`; `None` where the
+/// recording masked it.
 fn recorded_port(r: &Recorded) -> Option<u16> {
     r.headers
         .iter()
@@ -31,6 +33,7 @@ fn recorded_port(r: &Recorded) -> Option<u16> {
 }
 
 /// The cells this suite must find, at the least: the h1 dialect set, the h2 bearer, the token
+/// mint, a GET, the header-order pair.
 const REQUIRED: &[&str] = &[
     "egress.auth__cred-identity__anthropic",
     "egress.auth__cred-identity__openai",
@@ -85,7 +88,10 @@ unsafe fn call<I, O>(
     );
 }
 
-/// Busbar's own capture cells at the pin, never a copy in this repo (the fleet template deletes one):
+/// Busbar's own capture cells at the pin, never a copy in this repo (the fleet template deletes
+/// one): `BUSBAR_WIRE_GOLDEN_DIR` names the cells dir itself; otherwise `BUSBAR_GOLDEN_DIR`
+/// (plugin CI's busbar checkout, `testing/shadow-oracle/golden`) or `BUSBAR_CHECKOUT` (a busbar
+/// tree) leads to it.
 fn golden_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("BUSBAR_WIRE_GOLDEN_DIR") {
         return PathBuf::from(d);
@@ -167,6 +173,9 @@ fn recorded() -> Vec<Recorded> {
 }
 
 /// The plane's own fields: what the http connection adds itself is taken out, so the door has to
+/// add it back: `host`/`:authority`, `content-length`, the pseudo-fields, and 1.5.5's
+/// client-default `accept: */*` where it trails the caller's fields (THE DESIGN §5: "When the
+/// caller sets none, the http door adds `accept: */*`").
 fn plane_fields(r: &Recorded) -> Vec<(String, String)> {
     let mut own: Vec<(String, String)> = r
         .headers
@@ -356,7 +365,8 @@ impl Door {
 }
 
 impl Door {
-    /// THE FRAMER'S OWN HEAD LINES `locate` states for `target` (`LocateIn::defaults_buf`): what the
+    /// THE FRAMER'S OWN HEAD LINES `locate` states for `target` (`LocateIn::defaults_buf`): what
+    /// the host adds to a request head that does not carry them, before the auth signs it.
     fn defaults(&self, target: &str) -> String {
         let (mut a, mut n, mut l, mut d) = (vec![0; 512], vec![0; 512], vec![0; 64], vec![0; 512]);
         let mut i: LocateIn = z();
@@ -498,6 +508,7 @@ fn window_update(stream: u32, increment: u32) -> Vec<u8> {
 }
 
 /// Every recorded request on ONE h2 connection, driven through ONE door framing, with the far
+/// end's side replayed from the recording (the module doc).
 fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
     let pinned = reqs.first().and_then(|r| recorded_port(r));
     let target = format!("http://127.0.0.1:{}", pinned.unwrap_or(PORT));
@@ -598,6 +609,16 @@ fn check_h2_connection(cell: &str, reqs: &[&Recorded]) -> Result<(), String> {
             ));
         }
 
+        let data: Vec<u8> = frames
+            .iter()
+            .filter(|(kind, _, id, _)| *kind == 0 && u64::from(*id) == stream)
+            .flat_map(|(_, _, _, bytes)| bytes.iter().copied())
+            .collect();
+        if data != r.body {
+            return Err(format!(
+                "{cell} stream {stream}: DATA bytes differ from the recorded request"
+            ));
+        }
         let block: Vec<u8> = frames
             .iter()
             .filter(|(t, _, st, _)| (*t == 1 || *t == 9) && u64::from(*st) == stream)

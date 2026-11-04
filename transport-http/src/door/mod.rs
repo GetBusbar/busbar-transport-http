@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE `http` DOOR: this transport as a FRAMER on the transport kind's table
+//! (`busbar_contract::abi::transport`), compiled in or dropped in through the one door.
 
 pub(crate) mod accept;
 pub(crate) mod dest_head;
@@ -87,6 +88,7 @@ const fn bytes_str(b: &'static [u8]) -> AbiStr {
 }
 
 /// The schemes this ONE entry claims, by name: the Statement's `claims`, the one place they are
+/// stated.
 const CLAIM_NAMES: &[AbiStr] = &[
     abi_str(crate::meta::KEY),
     abi_str(crate::meta::SSE_KEY),
@@ -105,6 +107,8 @@ const HTTP_ROW: Claim = Claim {
 };
 
 /// Each claimed scheme's row, by index into [`CLAIM_NAMES`]. The `sse` row reads no request facts
+/// and no selector of its own (the request that opens a stream is an `http` one); its status leg
+/// is `http`'s, at the first frame.
 pub(crate) const CLAIMS: &[Claim] = &[
     HTTP_ROW,
     Claim {
@@ -149,6 +153,7 @@ const fn status_rows() -> [StatusRow; FAULT_CLAIMS * HTTP_CLASSES.len()] {
 }
 
 /// What each answer means to the BREAKER, in HTTP's numbering: the fault table, beside the status
+/// table and never folded into it (the status class is the fee decision's leg).
 const HTTP_FAULTS: [(u32, u32, u8); 10] = [
     (400, 400, FAULT_CALLER),
     (401, 401, FAULT_HARD),
@@ -190,6 +195,7 @@ const fn fault_rows() -> [FaultRow; FAULT_CLAIMS * HTTP_FAULTS.len()] {
 }
 
 /// Each setting this framer reads: its path, its kind and the default it declares. The ONE source
+/// of each default: the declarations below render from it and `read_settings` applies it.
 const SETTING_ROWS: [(&str, u32, &str); 4] = [
     (setting::H2_PRIOR_KNOWLEDGE, SETTING_FLAG, "false"),
     (setting::HTTP1_ONLY, SETTING_FLAG, "false"),
@@ -222,6 +228,7 @@ const fn setting_decls() -> [SettingDecl; SETTING_ROWS.len()] {
 pub(crate) const SETTINGS: &[SettingDecl] = &setting_decls();
 
 /// THE AUTH POINTS THIS DOOR OFFERS: `Peer` (once per connection, before any head: the call
+/// carries no request and its answer no field or name, `door::accept`), `Head` and `HeadBody`.
 const OFFERED_POINTS: [u8; 4] = (busbar_contract::abi::auth::POINT_PEER
     | busbar_contract::abi::auth::POINT_HEAD
     | busbar_contract::abi::auth::POINT_HEAD_BODY)
@@ -249,6 +256,7 @@ pub const STATEMENT: Statement = Statement {
 };
 
 /// What `open` read from the settings (and the last good `refresh` replaced), and the framings it
+/// holds.
 pub struct Instance {
     settings: Mutex<Settings>,
     framings: Framings,
@@ -259,6 +267,7 @@ pub struct Instance {
 }
 
 /// Every slot's state: the SDK's held instance over [`Instance`], with the host tables `open` was
+/// handed (the auth handle an accepted side admits its requests through).
 type State = Opened<Instance>;
 
 /// The settings as read: the posture every framing begun under them carries, and the two keys
@@ -271,13 +280,16 @@ pub(crate) struct Settings {
 }
 
 impl Instance {
-    /// The settings in force: what `open` read, or the last good `refresh`. Held only to copy them,
+    /// The settings in force: what `open` read, or the last good `refresh`. Held only to copy
+    /// them, by `locate` and `begin` (per connection, never per chunk).
     fn settings(&self) -> Settings {
         *self.settings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-/// The default the count setting `path` declares ([`SETTING_ROWS`]).
+/// The default the count setting `path` declares ([`SETTING_ROWS`]).  # Panics When `path` is not
+/// a declared count with a numeric default: a fault in this file, which the settings tests reach
+/// on every count.
 fn declared_count(path: &str) -> u64 {
     SETTING_ROWS
         .iter()
@@ -296,6 +308,8 @@ fn bad_count(path: &str) -> &'static str {
 }
 
 /// The settings blob's bytes, parsed (`validate`, `open` and `refresh` alike); `Err` is the first
+/// thing wrong with it, in the words the settings texts share: a blob that is not a JSON object,
+/// a key this transport does not declare, a value its declaration refuses.
 fn read_settings(bytes: &[u8]) -> Result<(Posture, bool, bool), Refusal> {
     let rows = SETTING_ROWS.map(|(path, kind, default)| SettingRow {
         path,
@@ -370,6 +384,8 @@ impl Life for Instance {
     }
 
     /// The new settings, read with `validate`'s texts. A bad blob is FAILED and the settings in
+    /// force stay; good ones apply to every framing begun after it (a framing already begun keeps
+    /// the posture it began under).
     fn refresh(&self, settings: &[u8], _: &[&[u8]], _: u64) -> Result<Refreshed, Refusal> {
         let s = settings_of(settings)?;
         *self.settings.lock().unwrap_or_else(PoisonError::into_inner) = s;
@@ -469,6 +485,7 @@ busbar_contract::not_served! {
 }
 
 /// `refuse`: THE HOST'S REFUSAL on an ACCEPTED connection (the transport ABI's `RefuseIn`), for a
+/// stream the host was handed or the whole connection ([`Accepted::refuse`]).
 pub(crate) struct Refuse;
 impl SafeSlot for Refuse {
     type In = RefuseIn;
@@ -506,6 +523,8 @@ impl SafeSlot for Refuse {
 }
 
 /// THE ACCEPTED SIDE'S PROTOCOL OFFER (ALPN) under connection security, in the handshake's
+/// ProtocolNameList encoding: `h2, http/1.1`, most preferred first (1.5.5: `http/1.1` alone, a
+/// signed customer-visible change).
 pub const ACCEPT_OFFER: &[u8] = b"\x02h2\x08http/1.1";
 
 /// The 1.5.5 client's ALPN offer in handshake ProtocolNameList encoding.
@@ -525,7 +544,10 @@ fn offer_for(secure: bool, prior_knowledge: bool, http1_only: bool) -> &'static 
     }
 }
 
-/// AN `sse` TARGET AS ITS `http` TWIN, framed exactly as `http`. An `sse`
+/// AN `sse` TARGET AS ITS `http` TWIN, framed exactly as `http`. An `sse` stream is an HTTP
+/// response body read as events (`crate` docs), so its target is the `http` one with the same
+/// authority, path and query: plain, the scheme's own port 80, the same request target, `host`
+/// line and protocol offer, and on HTTP/2 an `http` `:scheme`.
 pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
     if uri.scheme_str() != Some(crate::meta::SSE_KEY) {
         return uri;
@@ -536,6 +558,8 @@ pub(crate) fn as_http(uri: http::Uri) -> http::Uri {
 }
 
 /// What `locate` answers for `target`: whether it is secured, the authority to dial (the host as
+/// the URL writes it, so the connector's destination guard judges the spelling the operator
+/// wrote), and the name offered to and verified against the far end ([`offered_name`]).
 fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     let Some(uri) = std::str::from_utf8(target)
         .ok()
@@ -555,6 +579,13 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
     let Some(host) = uri.host() else {
         return Err("locate: the target names no host");
     };
+    let suffix = uri
+        .authority()
+        .and_then(|authority| authority.as_str().strip_prefix(host));
+    if suffix.is_some_and(|suffix| !suffix.is_empty() && suffix != ":") && uri.port_u16().is_none()
+    {
+        return Err("locate: the target port is not a valid port number");
+    }
     let port = uri.port_u16().unwrap_or(if secure { 443 } else { 80 });
     let host = host.trim_start_matches('[').trim_end_matches(']');
     let authority = if host.contains(':') {
@@ -566,6 +597,7 @@ fn located(target: &[u8]) -> Result<(bool, String, String), &'static str> {
 }
 
 /// Whether `uri`'s authority carries userinfo (`user:pass@`): a credential, which never rides a
+/// URL, so `locate` and `begin` refuse it rather than drop it.
 fn carries_userinfo(uri: &http::Uri) -> bool {
     uri.authority().is_some_and(|a| a.as_str().contains('@'))
 }
@@ -859,7 +891,15 @@ fn begin_peer(
     let services = held.host().and_then(|h| h.services());
     let mut slot = match inst.framings.reach(token) {
         Ok(slot) => slot,
-        Err(why) => return failed(o, format!("begin: {}", why.why())),
+        Err(why) => {
+            if why != framings::Reach::Busy {
+                inst.opening
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&head.ticket);
+            }
+            return failed(o, format!("begin: {}", why.why()));
+        }
     };
     let Held::Accept(a) = slot.held() else {
         return failed(o, "begin: the opening framing is not accepting".into());
@@ -878,6 +918,11 @@ fn begin_peer(
         return Outcome::Pending;
     }
     let ready = a.peer_ready();
+    let reason = (!ready).then(|| {
+        a.failure_reason()
+            .unwrap_or("the opening connection ended")
+            .to_owned()
+    });
     if ready {
         a.drive(sink.now_monotonic_ns);
         fill(a.as_mut(), sink, o, class_of, fault_of);
@@ -893,8 +938,10 @@ fn begin_peer(
         Outcome::Ready
     } else {
         let _ = inst.framings.remove(token);
-        o.error("begin: the opening peer policy was refused");
-        Outcome::Refused
+        o.fail(Refusal::refused(format!(
+            "begin: {}",
+            reason.as_deref().unwrap_or("the opening connection ended")
+        )))
     }
 }
 
@@ -1025,7 +1072,8 @@ impl SafeSlot for Timer {
     }
 }
 
-/// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire bytes
+/// `detach`: hand an accepted connection to the claimed upgrade framer, in `frame` (any wire
+/// bytes still owed first).
 pub(crate) struct Detach;
 impl SafeSlot for Detach {
     type In = FramingIn;
@@ -1061,8 +1109,7 @@ impl SafeSlot for Detach {
             Err(e) => return failed(&mut o, e.0),
         }
         let mut wire_buf = sink.wire();
-        let wire = a.take_wire(wire_buf.cap());
-        wire_buf.extend(&wire);
+        a.wire_into(&mut wire_buf);
         let wire_pending = a.wire_pending();
 
         let Ok(Some(rest)) = a.detach() else {
@@ -1372,6 +1419,7 @@ fn step_prepared(
 }
 
 /// The output lease owns this numeric snapshot through READY or PENDING. Policy-open control
+/// replies keep their own extension and are immediately recalled before any further socket read.
 fn report_receive(a: &Accepted, context: KernelContext<'_>, out: &mut Out<'_, FramerOut>) {
     let bytes = busbar_contract::abi::sdk::transport::receive::encode(a.retained_input() as u64);
     out.lease(
@@ -1438,7 +1486,7 @@ impl Kernel for HostKernel<'_, '_, '_> {
                 self.policy.out,
                 self.policy.leases,
             )
-            .map_err(|_| ServiceError::Unserved)
+            .map_err(|_| ServiceError::Broken)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1514,6 +1562,7 @@ impl Kernel for HostKernel<'_, '_, '_> {
 }
 
 /// An `emit`'s status ([`EmitIn::status`]): stated on the emit that carries an accepted stream's
+/// answer head (`answers_head`), and on no other.
 fn check_emit_status(i: &EmitIn, answers_head: bool) -> Result<(), Fault> {
     if i._status_reserved != 0 {
         return Err(fault(Rule::UnknownCode, "emit._status_reserved"));
@@ -1538,6 +1587,7 @@ fn failed(o: &mut Out<'_, FramerOut>, text: String) -> Outcome {
 }
 
 /// The status class of `code`, from the classes the status rows state ([`HTTP_CLASSES`]);
+/// `STATUS_OTHER` off them.
 fn class_of(code: u16) -> u8 {
     let code = u32::from(code);
     HTTP_CLASSES

@@ -99,6 +99,7 @@ fn a_settings_blob_that_is_not_an_object_is_refused() {
 }
 
 /// The defaults the settings declare are the host's own (`transport::registry`), so the door and
+/// the host read one figure for each.
 #[test]
 fn the_declared_defaults_are_the_hosts() {
     use busbar_contract::transport::registry::{
@@ -172,6 +173,7 @@ fn a_status_code_maps_to_the_breakers_fault_reading() {
 }
 
 /// Every claim that classes its answers reads them for the breaker too, with the same table, and
+/// the tail the door states passes the host's load checks for both tables.
 #[test]
 fn every_classed_claim_has_the_fault_table() {
     use busbar_contract::abi::transport::check::{
@@ -307,6 +309,7 @@ fn the_field_block_keeps_order_and_duplicates_and_drops_hop_by_hop() {
 }
 
 /// A field block is cut only at a line's start or inside a value, never inside a name: the host
+/// refuses any continuation that does not extend a value.
 #[test]
 fn a_field_block_is_cut_only_where_a_continuation_extends_a_value() {
     let block = b"date: Mon\r\nx-a: 1\r\n";
@@ -426,6 +429,7 @@ fn the_entry_claims_http_https_and_sse() {
 }
 
 /// The tail states exactly the ops this door serves: dialling, the accepted side (`begin` on
+/// `SIDE_ACCEPT`), and `detach` on an upgrade line.
 #[test]
 fn the_tail_states_the_ops_the_door_serves() {
     use busbar_contract::abi::transport::{FACT_ACCEPTS, FACT_ADOPTS, FACT_DETACHES, FACT_DIALS};
@@ -504,4 +508,17 @@ fn every_owned_target_buffer_is_wiped_after_normalization_and_percent_expansion(
     probe
         .finish()
         .assert_wiped_on_linux(&["target filtered", "target path", "target encoded"]);
+}
+
+#[test]
+fn locate_rejects_explicit_invalid_ports_without_defaulting() {
+    for target in [
+        b"http://example.com:65536/".as_slice(),
+        b"https://[::1]:99999/",
+        b"http://example.com:abc/",
+    ] {
+        assert!(located(target).is_err());
+    }
+    assert_eq!(located(b"http://example.com/").unwrap().1, "example.com:80");
+    assert_eq!(located(b"https://[::1]:443/").unwrap().1, "[::1]:443");
 }

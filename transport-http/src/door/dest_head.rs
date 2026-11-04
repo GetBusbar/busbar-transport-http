@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The request target as the URL parser serialises it: a space in a model name goes out as `%20`,
+//! never refused.
 
 /// Why a target cannot be written.
 pub const REFUSED: &str = "a request target holds CR, LF or NUL";
@@ -30,7 +31,8 @@ fn is_dot_dot(seg: &[u8]) -> bool {
             .any(|d| seg.eq_ignore_ascii_case(d))
 }
 
-/// `target` as written on the request line.
+/// `target` as written on the request line.  # Errors  [`REFUSED`]: the target holds CR, LF or
+/// NUL.
 pub fn encode_target(target: &[u8]) -> Result<Vec<u8>, &'static str> {
     if target.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
         return Err(REFUSED);

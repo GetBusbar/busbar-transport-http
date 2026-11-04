@@ -147,7 +147,9 @@ fn observe(address: usize, len: usize, allocation_size: usize) -> Observation {
     }
 }
 
-/// Register only an initialized Vec/String/OsString byte payload, at its allocation's start.
+/// Register only an initialized Vec/String/OsString byte payload, at its allocation's start. The
+/// caller retains ordinary ownership and must not retype or make the registered prefix
+/// uninitialized.
 pub(super) fn watch(label: &'static str, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -307,6 +309,7 @@ fn a_live_payload_has_no_deallocation_receipt() {
 }
 
 /// The actual Encode slot must release its normalized target on both success and every later
+/// refusal path.
 #[test]
 fn encode_keeps_target_wiping_custody_on_success_short_sink_and_invalid_fields() {
     use busbar_contract::abi::mechanism::call::{AbiStr, Field, Outcome};

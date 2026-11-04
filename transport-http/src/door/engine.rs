@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE ENGINE: hyper's `client::conn` (HTTP/1.1 and HTTP/2) run as a sans-IO framer.
+//! THE ENGINE: hyper's `client::conn` (HTTP/1.1 and HTTP/2) run as a sans-IO framer.  One
+//! [`Framing`] is one connection.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -59,10 +60,18 @@ enum Sender {
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
-/// One exchange's stage. Every stage after `Writing` carries the attempt's ONE deadline sleep, so
+/// One exchange's stage; assembly, connection, response head and body share one deadline.
 enum Stage {
-    /// The request message, still arriving, and the attempt's deadline (host ns).
-    Writing(Zeroizing<Vec<u8>>, EgressHead, u64, SensitiveFields),
+    /// The request message, still arriving, and the attempt's deadline sleep. The raw buffer
+    /// is zeroed when it is dropped (the message refused, or the framing gone), and when it grows
+    /// (`extend_wiped`); a whole message's head span is zeroed and its body handed on in place
+    /// (`Framing::message`).
+    Writing(
+        Zeroizing<Vec<u8>>,
+        EgressHead,
+        Pin<Box<dyn Sleep>>,
+        SensitiveFields,
+    ),
     /// A whole request, waiting for the connection to take it.
     Queued(http::Request<Full<Bytes>>, Pin<Box<dyn Sleep>>),
     /// Sent; waiting for the response head.
@@ -71,17 +80,24 @@ enum Stage {
         Pin<Box<dyn Sleep>>,
     ),
     /// The response body, and where its last queued byte stands in the framing's queue
+    /// (`Queue::pushed` just after it was queued).
     Body(Incoming, Pin<Box<dyn Sleep>>, u64),
     /// Refused partway through its request message (HTTP/2): the failure piece is out, and every
+    /// later byte of THAT message is dropped until the host's end of it, so the rest is never
+    /// read as a fresh request on the same stream (a head the auth never saw).
     Refused,
     /// Answered in full.
     Done,
 }
 
 /// The most a request's head (its request line and fields) may add to its body in one emitted
+/// message: hyper's own HTTP/1 read-buffer ceiling (`8192 + 4096 * 100`), the largest head hyper
+/// would read back.
 pub(crate) const HEAD_MAX_BYTES: usize = 8192 + 4096 * 100;
 
 /// How far an HTTP/2 stream's body may run ahead of the host: once this many queued bytes stand
+/// ahead of (and including) its last one, its body is not polled again until the host has taken
+/// them.
 pub(crate) const BODY_HOLD: u64 = 32 * 1024;
 
 /// The pieces waiting for the host, and how many piece bytes were ever queued: the difference with
@@ -166,19 +182,24 @@ pub struct Framing {
     conn_done: Arc<AtomicBool>,
     dial: http::Uri,
     /// Whether this connection has carried a request yet: the dial's own path is its FIRST
+    /// request's to inherit (when that request names no target), never a later one's
+    /// (`crate::message::request_target`).
     carried: bool,
     proto: Proto,
     posture: Posture,
     exchanges: Vec<(u64, Stage)>,
     out: Queue,
     /// Whether the last drive left an HTTP/2 body unpolled for `BODY_HOLD`: the framing asks to
+    /// be called again at once (`Owed::next_deadline`), so the body moves on once the host has
+    /// taken what was queued.
     held: bool,
     failed: Option<Failure>,
     now_unix_ns: u64,
 }
 
 impl Framing {
-    /// Open a dialled framing over `dial`, speaking `proto`, at host time `now_ns`.
+    /// Open a dialled framing over `dial`, speaking `proto`, at host time `now_ns`.  # Errors
+    /// `dial` is not a URI.
     pub fn dial(dial: &str, proto: Proto, posture: Posture, now_ns: u64) -> Result<Self, Failure> {
         let dial = canonical_host(
             dial.parse()
@@ -248,7 +269,8 @@ impl Framing {
         self.io.ingest(bytes, end);
     }
 
-    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`; `end` is the
+    /// Bytes for `stream`: part of one HTTP/1.1 request message, rendered by `encode`; `end` is
+    /// the host's end of that message (`EmitIn::end_of_frame`).
     pub fn emit(
         &mut self,
         stream: u64,
@@ -358,14 +380,14 @@ impl Framing {
                     Stage::Writing(
                         Zeroizing::default(),
                         EgressHead::default(),
-                        deadline,
+                        self.io.timer().sleep_until_ns(deadline),
                         sensitive.clone().unwrap_or_default(),
                     ),
                 ));
                 self.exchanges.len() - 1
             }
         };
-        let Stage::Writing(buf, head, deadline, marked) = &mut self.exchanges[idx].1 else {
+        let Stage::Writing(buf, head, _wait, marked) = &mut self.exchanges[idx].1 else {
             return Err(Failure(format!(
                 "stream {stream} already carries a request"
             )));
@@ -378,11 +400,10 @@ impl Framing {
                 "request sensitivity changed during its head".into(),
             ));
         }
-        extend_wiped(buf, bytes);
-
-        if buf.len() > max.saturating_add(HEAD_MAX_BYTES) {
+        if bytes.len() > max.saturating_add(HEAD_MAX_BYTES).saturating_sub(buf.len()) {
             return Err(Failure("request message over the body cap".into()));
         }
+        extend_wiped(buf, bytes);
         let raw = complete_message(buf, head, max, HEAD_MAX_BYTES)
             .map_err(|e| Failure(format!("request message: {e}")))?;
         let Some(whole) = raw else { return Ok(()) };
@@ -424,12 +445,17 @@ impl Framing {
         target_form(&mut req, self.proto)?;
 
         self.carried = true;
-        let wait = self.io.timer().sleep_until_ns(*deadline);
+        let Stage::Writing(_, _, wait, _) =
+            std::mem::replace(&mut self.exchanges[idx].1, Stage::Done)
+        else {
+            unreachable!("the request was being assembled")
+        };
         self.exchanges[idx].1 = Stage::Queued(req, wait);
         Ok(())
     }
 
     /// Drive the connection at host time (`now_ns` monotonic, `now_unix_ns` wall) until nothing
+    /// inside it has more to do.
     pub fn drive(&mut self, now_ns: u64, now_unix_ns: u64) {
         self.io.set_time(now_ns);
         self.now_unix_ns = now_unix_ns;
@@ -466,6 +492,8 @@ impl Framing {
     }
 
     /// With output pending, state the recorded failure on every stream not already finished nor
+    /// already told it failed (a `Refused` one's failure piece is out), then drop the exchanges
+    /// (so a later call pushes nothing).
     fn fail_streams(&mut self) {
         if !(self.io.wire_pending() || !self.out.pieces.is_empty()) {
             return;
@@ -482,6 +510,8 @@ impl Framing {
     }
 
     /// One round: the handshake, then every stream as far as it goes. A stream's own failure on
+    /// HTTP/2 ends THAT stream (dropping its exchange resets it on the wire) with a failure
+    /// piece; on HTTP/1.1, or once the connection itself has failed, it fails the framing.
     fn step(&mut self, cx: &mut Context<'_>, taken: Option<u64>) -> Result<(), Failure> {
         if let Some(h) = self.handshake.as_mut() {
             if let Poll::Ready(r) = h.as_mut().poll(cx) {
@@ -504,7 +534,11 @@ impl Framing {
                 if self.proto == Proto::H1 || conn_dead || f.1 {
                     return Err(f.0);
                 }
-                *stage = Stage::Done;
+                *stage = if matches!(stage, Stage::Writing(..)) {
+                    Stage::Refused
+                } else {
+                    Stage::Done
+                };
                 self.out.push(Piece::failure(*id, &f.0 .0));
             }
         }
@@ -520,6 +554,9 @@ impl Framing {
 }
 
 impl Owed for Framing {
+    fn wire_into(&mut self, into: &mut busbar_contract::abi::sdk::HostBuf<'_, u8>) {
+        self.io.wire_into(into);
+    }
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
         self.io.take_wire(cap)
     }
@@ -530,6 +567,7 @@ impl Owed for Framing {
         &mut self.out.pieces
     }
     /// The earliest sleep still waiting, or NOW where a body was held back for the host: once the
+    /// host has taken what was queued, the next call polls it on.
     fn next_deadline(&self) -> Option<u64> {
         let at = self.io.next_deadline();
         if !self.held {
@@ -544,6 +582,8 @@ impl Owed for Framing {
 }
 
 /// THE ONE WIPE-ON-GROW RULE for a buffer of this door's own that may hold credential bytes (the
+/// request message `emit` collects, the accepted side's hand-over copy, a held body): append
+/// `bytes` to `buf`, never leaving a copy of what it held behind.
 pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
     let need = buf.len().saturating_add(bytes.len());
     if need > buf.capacity() {
@@ -601,6 +641,10 @@ fn canonical_host(dial: http::Uri) -> http::Uri {
 }
 
 /// THE FRAMER'S OWN HEAD LINES for a request to `target`: the client defaults the http transport
+/// owns (THE DESIGN §5: "When the caller sets none, the http door adds `accept: */*`, and on h1
+/// the host header and origin-form target: the http transport owns the client defaults"), in
+/// 1.5.5's order: `accept: */*`, as reqwest added its default after the caller's fields, then
+/// hyper-util's `host` (the port only when it is not the scheme's own).
 pub(crate) fn client_defaults(target: &http::Uri) -> String {
     let mut lines = String::from("accept: */*\r\n");
 
@@ -621,6 +665,9 @@ pub(crate) fn client_defaults(target: &http::Uri) -> String {
 }
 
 /// The request's target form, and nothing added to its head: on HTTP/1.1 the target is rewritten
+/// to origin form (the `host` line the host added carries the authority); on HTTP/2 it stays
+/// absolute, becoming `:scheme`, `:authority` and `:path`, and a `host` line is that
+/// `:authority`, not a field of its own (1.5.5's HTTP/2 requests carried none).
 fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(), Failure> {
     if proto == Proto::H2 {
         req.headers_mut().remove(http::header::HOST);
@@ -641,6 +688,7 @@ fn target_form(req: &mut http::Request<Full<Bytes>>, proto: Proto) -> Result<(),
 struct Knobs {
     now_unix_secs: u64,
     /// HTTP/2 only: the queue bytes the host had taken when the round began, against which a
+    /// body's [`BODY_HOLD`] is judged.
     hold: Option<u64>,
 }
 
@@ -652,7 +700,8 @@ fn timed_out() -> (Failure, bool) {
     )
 }
 
-/// Move one stream as far as it goes this round: `Ok(true)` = its body was held back for the
+/// Move one stream as far as it goes this round: `Ok(true)` = its body was held back for the host
+/// (`BODY_HOLD`).
 fn advance(
     id: u64,
     stage: &mut Stage,
@@ -663,6 +712,16 @@ fn advance(
 ) -> Result<bool, (Failure, bool)> {
     let own = |e: hyper::Error| (Failure(e.to_string()), false);
     loop {
+        let wait = match &mut *stage {
+            Stage::Writing(_, _, wait, _)
+            | Stage::Queued(_, wait)
+            | Stage::Asked(_, wait)
+            | Stage::Body(_, wait, _) => Some(wait),
+            Stage::Refused | Stage::Done => None,
+        };
+        if wait.is_some_and(|wait| wait.as_mut().poll(cx).is_ready()) {
+            return Err(timed_out());
+        }
         match stage {
             Stage::Writing(..) | Stage::Refused | Stage::Done => return Ok(false),
             Stage::Queued(_, wait) => {
@@ -743,6 +802,8 @@ fn advance(
 }
 
 /// The response head as the frame the layer above reads: ONE field block
+/// (`busbar_contract::abi::transport::fields`) carrying the status and any `Retry-After`, framed
+/// even when no field is left in it, so it always comes before the body.
 fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> Piece {
     let bodiless = r.body().is_end_stream();
     Piece {
@@ -755,6 +816,7 @@ fn head_piece(stream: u64, r: &http::Response<Incoming>, now_unix_secs: u64) -> 
 }
 
 /// The body length an answer's head declared: its `Content-Length`, where every value it names
+/// (each line, each comma-list member) is the same `1*DIGIT` (RFC 9110 8.6).
 fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
     if headers.contains_key(http::header::TRANSFER_ENCODING) {
         return None;
@@ -776,6 +838,7 @@ fn declared_len(headers: &http::HeaderMap) -> Option<u64> {
 }
 
 /// An HTTP/1 answer's reason phrase exactly as sent: hyper keeps a phrase that differs from the
+/// canonical one, and one it did not keep was the canonical phrase.
 fn reason_phrase(r: &http::Response<Incoming>) -> Option<Bytes> {
     if r.version() >= http::Version::HTTP_2 {
         return None;

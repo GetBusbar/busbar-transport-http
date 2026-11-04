@@ -36,6 +36,8 @@ fn valued_line(
 }
 
 /// The first line in list order whose route holds and whose methods admit wins; a predicate line
+/// that does not hold is passed over; a path that holds with no method admitted is a miss on the
+/// first such line; nothing holding is no route.
 #[test]
 fn the_guest_list_matches_in_order() {
     let lines = [
@@ -100,6 +102,7 @@ fn a_value_prefix_line_needs_its_prefix() {
 }
 
 /// A query key is stripped case-sensitively, as spelled, with or without a value; a field name
+/// ASCII case-insensitively; a name in one place never strips the other.
 #[test]
 fn the_strip_reads_each_place_by_its_own_rule() {
     let names = vec![
@@ -187,4 +190,35 @@ fn the_kept_lists_are_reused_and_the_oldest_evicted() {
         .shared(by_id(0), || panic!("the reused list survived"))
         .expect("kept");
     assert!(Arc::ptr_eq(&first, &still));
+}
+
+impl Line {
+    /// A `none` line taking every method on every path (a path holds `/`), for the accepted side's
+    /// own cells.
+    #[must_use]
+    pub fn any(line: u32) -> Self {
+        use busbar_contract::abi::transport::route::{METHOD_ANY, PATH_CONTAINS};
+        Self {
+            line,
+            points: 0,
+            auth: AuthRef { id: 1, mac: 1 },
+            body_limit: 0,
+            methods: METHOD_ANY,
+            path_form: PATH_CONTAINS,
+            path: "/".to_owned(),
+            fields: Vec::new(),
+            rung: 0,
+        }
+    }
+
+    /// [`Line::any`] whose auth needs `points`, holding a body to `body_limit` at the body point,
+    /// for the accepted side's own cells.
+    #[must_use]
+    pub fn any_needing(line: u32, points: u32, body_limit: u64) -> Self {
+        Self {
+            points,
+            body_limit,
+            ..Self::any(line)
+        }
+    }
 }

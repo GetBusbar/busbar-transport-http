@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE GUEST LIST an accepted connection is framed under: the listener's lines as `begin` lent them
+//! THE GUEST LIST an accepted connection is framed under: the listener's lines as `begin` lent
+//! them (`BeginIn::lines`, in the kernel's match order), owned for the framing's life; the match
+//! of a decoded head against them in the contract's ONE route vocabulary
+//! (`abi::transport::route::RouteView`: `path_and_fields_match`, then `admits`); and the strip of
+//! what a line's auth named, so the plane never sees a credential.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -45,7 +49,8 @@ impl Line {
         }
     }
 
-    /// The line the host lent, copied out; `None` when its route's path or a predicate name is not
+    /// The line the host lent, copied out; `None` when its route's path or a predicate name is
+    /// not UTF-8 (`Lent::<LineEntry>::route_view`).
     #[must_use]
     pub fn of(l: Lent<'_, LineEntry>) -> Option<Self> {
         let e = *l.get();
@@ -67,36 +72,8 @@ impl Line {
         })
     }
 
-    /// A `none` line taking every method on every path (a path holds `/`), for the accepted side's
-    #[cfg(test)]
-    #[must_use]
-    pub fn any(line: u32) -> Self {
-        use busbar_contract::abi::transport::route::{METHOD_ANY, PATH_CONTAINS};
-        Self {
-            line,
-            points: 0,
-            auth: AuthRef { id: 1, mac: 1 },
-            body_limit: 0,
-            methods: METHOD_ANY,
-            path_form: PATH_CONTAINS,
-            path: "/".to_owned(),
-            fields: Vec::new(),
-            rung: 0,
-        }
-    }
-
-    /// [`Line::any`] whose auth needs `points`, holding a body to `body_limit` at the body point,
-    #[cfg(test)]
-    #[must_use]
-    pub fn any_needing(line: u32, points: u32, body_limit: u64) -> Self {
-        Self {
-            points,
-            body_limit,
-            ..Self::any(line)
-        }
-    }
-
     /// Whether the line the host lent is this one, read in place (nothing copied but the route
+    /// view's predicate list).
     #[must_use]
     pub fn same(&self, l: Lent<'_, LineEntry>) -> bool {
         let e = *l.get();
@@ -119,6 +96,7 @@ impl Line {
     }
 
     /// The line's route in the contract's vocabulary; its predicate list built only where it has
+    /// one (an empty list allocates nothing).
     fn view(&self) -> RouteView<'_> {
         RouteView {
             methods: self.methods,
@@ -156,6 +134,7 @@ pub struct Lists(Mutex<Vec<Arc<[Line]>>>);
 
 impl Lists {
     /// The list `same` recognises, else the one `copy` makes (kept for the next `begin`); `None`
+    /// when `copy` answers none.
     pub fn shared(
         &self,
         same: impl Fn(&[Line]) -> bool,
@@ -202,7 +181,7 @@ pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])
         } else {
             l.view()
         };
-        if !v.path_and_fields_match(path, fields) {
+        if !l.fields.is_empty() && !v.path_and_fields_match(path, fields) {
             continue;
         }
         if v.admits(method) {
@@ -214,6 +193,7 @@ pub fn matched(lines: &[Line], method: &str, path: &str, fields: &[(&str, &[u8])
 }
 
 /// `query` without every key `names` lists as a query key ([`Place::Query`]); the pairs kept, in
+/// order and as the far side spelled them.
 #[must_use]
 pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> {
     let kept: Vec<&str> = query
@@ -257,6 +237,7 @@ fn decoded(s: &str) -> Vec<u8> {
 }
 
 /// Whether field line `name` is one `names` lists as a field line ([`Place::Field`]), compared
+/// ASCII case-insensitively.
 #[must_use]
 pub fn strips_field(name: &str, names: &[(String, Place)]) -> bool {
     names

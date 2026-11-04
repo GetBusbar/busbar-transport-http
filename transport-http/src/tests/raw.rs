@@ -1,4 +1,6 @@
-//! Tests for `raw.rs`. Lifted out of the implementation file so its line count
+//! Tests for `raw.rs`. Lifted out of the implementation file so its line count measures
+//! implementation and nothing else; still a direct child module, so `use super::*` reaches the
+//! private items it always did.
 
 use super::*;
 
@@ -113,7 +115,10 @@ fn the_declared_length_and_coding_are_read_whatever_the_header_casing() {
     );
 }
 
-/// Whitespace between a field name and its colon is refused, not normalised away.
+/// Whitespace between a field name and its colon is refused, not normalised away.  RFC 9112 is
+/// explicit that a server MUST reject such a message: the historical divergence in how
+/// intermediaries handled it is a request-smuggling surface, and trimming the name turns a header
+/// no compliant peer would honour into one this transport does.
 #[test]
 fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert!(Head::parse(b"GET / HTTP/1.1\r\nContent-Length : 5\r\n\r\n").is_err());
@@ -126,7 +131,10 @@ fn whitespace_before_the_colon_is_refused_rather_than_trimmed() {
     assert_eq!(ok.fields().next().unwrap().1, b"5");
 }
 
-/// `chunked` is the LAST coding or the message is not chunked at all.
+/// `chunked` is the LAST coding or the message is not chunked at all.  A sender that applies any
+/// other coding must apply `chunked` as the final one, precisely so the message stays framable; a
+/// `Transfer-Encoding` where it is not final leaves the body length undeterminable, and a reader
+/// that took it for chunked anyway would be decoding a framing the sender never wrote.
 #[test]
 fn chunked_counts_only_as_the_final_transfer_coding() {
     assert_eq!(
@@ -149,6 +157,7 @@ fn chunked_counts_only_as_the_final_transfer_coding() {
 }
 
 /// The list is the whole field across every line carrying it (RFC 9110 5.3): `chunked` on one
+/// line and `gzip` on the next is `chunked, gzip`, and `chunked` twice is a body wrapped twice.
 #[test]
 fn a_coding_list_spans_every_line_of_the_field() {
     for te in [
@@ -184,6 +193,7 @@ fn a_status_line_is_refused() {
 }
 
 /// RFC 9112 7.1.1: `chunk-ext = *( BWS ";" chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, so a
+/// size may be followed by whitespace before its extensions (codeaudit review of D8).
 #[test]
 fn whitespace_before_a_chunk_extension_is_allowed() {
     let mut decoder = ChunkedDecoder::default();
@@ -263,4 +273,14 @@ fn a_blank_line_inside_the_header_block_is_refused() {
             "{head:?}"
         );
     }
+}
+
+#[test]
+fn chunk_extensions_and_trailers_accept_opaque_field_octets() {
+    let mut decoder = ChunkedDecoder::default();
+    decoder
+        .feed(b"1;note=\"\xff\"\r\nx\r\n0\r\nX-Note: \xff\r\n\r\n")
+        .unwrap();
+    assert!(decoder.is_done());
+    assert_eq!(decoder.take().as_slice(), b"x");
 }
