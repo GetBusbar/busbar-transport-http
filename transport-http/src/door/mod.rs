@@ -243,6 +243,7 @@ busbar_contract::statement_extensions!(
             include_bytes!("../../declares.json")
         ),
         (EXT_OFFERED_POINTS, &OFFERED_POINTS),
+        ("listener-bindings", br#"[{"slot":"listen","claim":"http"}]"#),
     ]
 );
 

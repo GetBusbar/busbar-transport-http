@@ -1387,7 +1387,11 @@ impl Accepted {
 impl Owed for Accepted {
     fn wire_into(&mut self, into: &mut busbar_contract::abi::sdk::HostBuf<'_, u8>) {
         self.io.wire_into(into);
-        let n = into.stream(&self.owed);
+        let (first, second) = self.owed.as_slices();
+        let mut n = into.stream(first);
+        if n == first.len() {
+            n += into.stream(second);
+        }
         self.owed.drain(..n);
     }
     fn take_wire(&mut self, cap: usize) -> Vec<u8> {
