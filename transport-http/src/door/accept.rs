@@ -893,7 +893,7 @@ impl Accepted {
         let framed = frame_refusal(
             a,
             RefusalCopy {
-                status,
+                status: u32::from(status),
                 fields: Vec::new(),
                 body: bytes.to_vec(),
             },
@@ -1666,7 +1666,14 @@ fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
     let Some(respond) = a.respond.take() else {
         return false;
     };
-    let mut b = http::Response::builder().status(r.status);
+    let Some(status) = u16::try_from(r.status)
+        .ok()
+        .filter(|status| (100..=599).contains(status))
+        .and_then(|status| http::StatusCode::from_u16(status).ok())
+    else {
+        return false;
+    };
+    let mut b = http::Response::builder().status(status);
     for (name, value) in &r.fields {
         b = b.header(name.as_str(), value.as_slice());
     }
@@ -2271,10 +2278,13 @@ fn head_piece(stream: u64, parts: &http::request::Parts) -> Piece {
         .uri
         .path_and_query()
         .map_or_else(|| parts.uri.to_string(), |p| p.as_str().to_owned());
-    let authority = parts
-        .uri
-        .authority()
-        .map_or_else(String::new, |a| a.as_str().to_owned());
+    let authority = head_view(
+        parts,
+        &[],
+        busbar_contract::abi::host::service::SCHEME_UNDECLARED,
+    )
+    .authority
+    .to_owned();
     let mut block = zeroize::Zeroizing::new(Vec::new());
     for (name, value) in &parts.headers {
         extend_wiped(&mut block, name.as_str().as_bytes());

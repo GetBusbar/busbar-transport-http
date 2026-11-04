@@ -158,7 +158,7 @@ fn a_status_code_maps_to_the_breakers_fault_reading() {
         (413, FAULT_CALLER),
         (422, FAULT_CALLER),
         (428, FAULT_CALLER),
-        (429, FAULT_TRANSIENT),
+        (429, busbar_contract::abi::transport::FAULT_RATE_LIMIT),
         (430, FAULT_CALLER),
         (499, FAULT_CALLER),
         (500, FAULT_TRANSIENT),

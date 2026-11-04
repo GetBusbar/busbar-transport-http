@@ -45,9 +45,7 @@ use busbar_contract::abi::transport::{
     PIECE_HAS_DECLARED_LEN, PIECE_STREAM_FAILED, SIDE_ACCEPT, SIDE_DIAL, YIELD_ENDED,
     YIELD_HAS_DEADLINE, YIELD_MORE, YIELD_STREAM_FULL,
 };
-use busbar_contract::abi::transport::{
-    FAULT_NONE, FAULT_TRANSIENT, STATUS_CALLER_FAULT, STATUS_SUCCESS,
-};
+use busbar_contract::abi::transport::{FAULT_NONE, STATUS_CALLER_FAULT, STATUS_SUCCESS};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, Incoming};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1054,7 +1052,11 @@ fn a_429_head_states_its_class_fault_and_retry_after() {
         assert_eq!(head.code, 429, "{label}");
         assert_eq!(
             (head.status_class, head.fault, head.retry_after_secs),
-            (STATUS_CALLER_FAULT, FAULT_TRANSIENT, 7),
+            (
+                STATUS_CALLER_FAULT,
+                busbar_contract::abi::transport::FAULT_RATE_LIMIT,
+                7
+            ),
             "{label}: the 429 head's class, fault reading and retry-after"
         );
         host.close();
@@ -2129,8 +2131,7 @@ extern "C" fn unit_refuse(ctx: HostCtx, input: *const c_void, out: *mut ServiceO
         );
         i.answer.write_unaligned(RefusalAnswer {
             size: size_of::<RefusalAnswer>() as u32,
-            status,
-            _reserved: 0,
+            status: u32::from(status),
             fields: fields.as_ptr(),
             fields_len: fields.len(),
             body: Blob {

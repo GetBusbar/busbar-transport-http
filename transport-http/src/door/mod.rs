@@ -46,7 +46,7 @@ use busbar_contract::abi::transport::{
     SETTING_FLAG, SIDE_ACCEPT, SIDE_DIAL, STATUS_AT_FIRST_FRAME, STATUS_CALLER_FAULT,
     STATUS_FAR_END_FAULT, STATUS_OTHER, STATUS_SUCCESS, YIELD_ENDED, YIELD_MORE,
 };
-use busbar_contract::transport::registry::{facts as tfacts, status_ns};
+use busbar_contract::transport::registry::facts as tfacts;
 
 use accept::{Accepted, AuthCalled, Kernel};
 use busbar_contract::abi::mechanism::check::{fault, Fault, Rule};
@@ -101,7 +101,7 @@ const HTTP_ROW: Claim = Claim {
     egress_selector_forms: abi_str(""),
     facts: FACTS.as_ptr(),
     facts_len: FACTS.len(),
-    status_namespace: abi_str(status_ns::HTTP),
+    status_namespace: abi_str("http"),
     status_at: STATUS_AT_FIRST_FRAME,
     ..Claim::ZERO
 };
@@ -114,7 +114,7 @@ pub(crate) const CLAIMS: &[Claim] = &[
     Claim {
         selector_forms: bytes_str(&SSE_SELECTOR_CODES),
         egress_selector_forms: abi_str(""),
-        status_namespace: abi_str(status_ns::HTTP),
+        status_namespace: abi_str("http"),
         status_at: STATUS_AT_FIRST_FRAME,
         ..Claim::ZERO
     },
@@ -162,7 +162,7 @@ const HTTP_FAULTS: [(u32, u32, u8); 10] = [
     (404, 407, FAULT_CALLER),
     (408, 408, FAULT_TRANSIENT),
     (409, 428, FAULT_CALLER),
-    (429, 429, FAULT_TRANSIENT),
+    (429, 429, busbar_contract::abi::transport::FAULT_RATE_LIMIT),
     (430, 499, FAULT_CALLER),
     (500, 599, FAULT_TRANSIENT),
 ];

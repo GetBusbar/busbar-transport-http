@@ -277,6 +277,7 @@ struct Yielded {
     /// Frame bytes answered with no piece (what `detach` hands back).
     raw: Vec<u8>,
     flags: u32,
+    next_deadline_ns: u64,
     framing: u64,
 }
 
@@ -286,6 +287,7 @@ impl Yielded {
         self.last = format!("{:?} lease={} err={text:?}", c.outcome, c.lease != 0);
         self.outcome = Some(c.outcome);
         self.flags = o.yielded.flags;
+        self.next_deadline_ns = o.yielded.next_deadline_ns;
         if o.framing != 0 {
             self.framing = o.framing;
         }
@@ -1015,7 +1017,13 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
         );
 
         let accept_opening = opt_text(&refuse["begin"], "refuse.begin");
-        let want = Expected::Exact(yielded_line(&accept_opening, &[], &[], 0, true));
+        let want = Expected::Exact(yielded_line(
+            &accept_opening,
+            &[],
+            &[],
+            YIELD_HAS_DEADLINE,
+            true,
+        ));
         let pinned = sinkfuls(accept_opening.len(), TIGHT_WIRE);
         let token = {
             let label = "begin accept";
@@ -1023,6 +1031,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
             let before = framer_crossings(p);
             let value = {
                 let y = pump(p, 0, Op::Begin(SIDE_ACCEPT, b""), &mut tight);
+                assert_eq!(
+                    y.next_deadline_ns, 30_000_000_001,
+                    "the accepted header deadline is thirty seconds after the host clock"
+                );
                 (y.line(), y.framing)
             };
             assert_eq!(framer_crossings(p) - before, pinned, "{label} crossings");
