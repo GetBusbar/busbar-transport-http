@@ -42,6 +42,8 @@ including before HTTP protocol detection, to bound pre-authentication resource r
 Plugin-owned credential-bearing header, target and wire copies are wiped or streamed directly
 into the host sink. Body and handover-copy limits are checked before allocating an over-limit
 copy. Valid request and response wire behavior is unchanged by these hardening measures.
+Accepted connections now reject request bytes that contradict the protocol negotiated by TLS,
+before request authentication or admission. Cleartext protocol detection remains supported.
 
 ## Build
 
@@ -54,6 +56,12 @@ cargo build --release -p busbar-transport-http-plugin
 ```bash
 cargo test --workspace --locked
 ```
+
+The historical `h2_parity` comparisons and the recorded 1.5.5 wire-golden comparison are ignored
+by default. Run them explicitly with `--ignored` when investigating historical differences;
+their frame and HPACK byte identity is diagnostic, not the 1.6 acceptance contract. Current
+protocol, request/response semantics, authentication, credential sensitivity and resource-bound
+tests remain active. Original recorded golden fixtures are unchanged.
 
 ## License
 

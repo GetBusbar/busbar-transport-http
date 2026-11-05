@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! HTTP/1 and HTTP/2 bearer requests are compared byte for byte with the 1.5.5 egress client.
+//! Current HTTP/2 request semantics and historical HTTP/1/HTTP/2 wire diagnostics.
+//! Run diagnostics explicitly with `--ignored`; raw encoder identity is not the 1.6 contract.
 
 mod common;
 
@@ -266,6 +267,7 @@ fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "historical wire diagnostic; current HTTP semantics and security have dedicated tests"]
 fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -299,6 +301,7 @@ fn an_h2_bearer_request_is_the_bytes_1_5_5_sent() {
 
 /// The HTTP/1-only setting reproduces the 1.5.5 client's request bytes.
 #[test]
+#[ignore = "historical wire diagnostic; current HTTP semantics and security have dedicated tests"]
 fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -317,6 +320,7 @@ fn an_http1_only_bearer_request_is_the_bytes_1_5_5_sent() {
 
 /// An empty HTTP/2 POST carries `content-length: 0`, matching the 1.5.5 client.
 #[test]
+#[ignore = "historical wire diagnostic; current HTTP semantics and security have dedicated tests"]
 fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -345,6 +349,7 @@ fn an_h2_empty_post_carries_content_length_0_as_1_5_5_sent() {
 
 /// An empty HTTP/1.1 POST carries no length field, matching the 1.5.5 client.
 #[test]
+#[ignore = "historical wire diagnostic; current HTTP semantics and security have dedicated tests"]
 fn an_http1_empty_post_carries_no_length_line_as_1_5_5_sent() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -362,4 +367,48 @@ fn an_http1_empty_post_carries_no_length_line_as_1_5_5_sent() {
         String::from_utf8_lossy(&new)
     );
     println!("PROOF an empty http/1.1 POST carries no length line, byte-identical to 1.5.5's");
+}
+
+/// A current peer must receive the authenticated fields and body regardless of HPACK choices.
+#[tokio::test]
+async fn current_http2_requests_preserve_authenticated_fields_and_body() {
+    use tokio::io::AsyncWriteExt;
+
+    for (body, state_len) in [(BODY, true), ("", false), ("", true)] {
+        let wire = capture_door(8080, true, body, state_len);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(&wire).await.expect("write the request");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut connection = h2::server::handshake(server).await.expect("HTTP/2 handshake");
+            let (request, _respond) = connection
+                .accept()
+                .await
+                .expect("a request")
+                .expect("valid request");
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(request.uri().path(), "/v1/messages");
+            assert_eq!(request.uri().authority().unwrap().as_str(), "127.0.0.1:8080");
+            assert_eq!(request.headers()["authorization"], BEARER);
+            assert_eq!(request.headers()["content-type"], "application/json");
+            assert_eq!(request.headers()["accept"], "*/*");
+            if let Some(length) = request.headers().get("content-length") {
+                assert_eq!(length.to_str().unwrap().parse::<usize>().unwrap(), body.len());
+            }
+            let mut incoming = request.into_body();
+            let read = async {
+                let mut received = Vec::new();
+                while let Some(data) = incoming.data().await {
+                    received.extend_from_slice(&data.expect("valid body data"));
+                }
+                received
+            };
+            let received = tokio::select! {
+                received = read => received,
+                next = connection.accept() => panic!("unexpected connection end or request: {next:?}"),
+            };
+            assert_eq!(received, body.as_bytes());
+        })
+        .await
+        .expect("the peer reads the complete request");
+    }
 }

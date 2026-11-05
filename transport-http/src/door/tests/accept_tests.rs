@@ -833,6 +833,75 @@ fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
     f
 }
 
+fn protocol_request(h2: bool) -> Vec<u8> {
+    if !h2 {
+        return b"GET / HTTP/1.1\r\nhost: busbar.test\r\n\r\n".to_vec();
+    }
+    let mut wire = H2_PREFACE.to_vec();
+    wire.extend(frame(4, 0, 0, &[]));
+    let mut block = vec![0x82, 0x86, 0x84, 0x01, 11];
+    block.extend_from_slice(b"busbar.test");
+    wire.extend(frame(1, 0x5, 1, &block));
+    wire
+}
+
+#[test]
+fn negotiated_protocol_mismatches_end_before_auth_or_hand_in() {
+    for (agreed, h2) in [(b"h2".as_slice(), false), (b"http/1.1".as_slice(), true)] {
+        let wire = protocol_request(h2);
+        for split in 0..=wire.len() {
+            let mut a =
+                Accepted::accept(SEC, vec![Line::any_needing(1, POINT_HEAD, 0)]).with_alpn(agreed);
+            let (_, mut kernel) = selecting();
+            for part in [&wire[..split], &wire[split..]] {
+                a.ingest(part, false);
+                run_with(&mut a, SEC, &mut kernel);
+            }
+            assert!(a.ended(), "{agreed:?}, split {split}");
+            assert_eq!(a.agreed(), offer_position(agreed));
+            assert_eq!(
+                a.failure_reason(),
+                Some("the HTTP preface disagrees with the negotiated protocol")
+            );
+            assert!(kernel.auths.is_empty(), "no request authentication");
+            assert!(kernel.handed.is_empty(), "no hand-in");
+            assert!(up(&mut a).heads.is_empty(), "no published request");
+            assert!(a.raw.is_none(), "no retained handover copy");
+        }
+    }
+}
+
+#[test]
+fn matching_alpn_and_cleartext_detection_accept_fragmented_requests() {
+    for (agreed, h2) in [
+        (b"h2".as_slice(), true),
+        (b"http/1.1".as_slice(), false),
+        (b"".as_slice(), true),
+        (b"".as_slice(), false),
+    ] {
+        let wire = protocol_request(h2);
+        for split in 0..=wire.len() {
+            let mut a =
+                Accepted::accept(SEC, vec![Line::any_needing(1, POINT_HEAD, 0)]).with_alpn(agreed);
+            let (_, mut kernel) = selecting();
+            for part in [&wire[..split], &wire[split..]] {
+                a.ingest(part, false);
+                run_with(&mut a, SEC, &mut kernel);
+            }
+            assert!(!a.ended(), "{agreed:?}, split {split}");
+            assert_eq!(kernel.auths.len(), 1);
+            assert_eq!(kernel.handed, [1]);
+            assert_eq!(up(&mut a).heads.len(), 1);
+            let expected = if h2 {
+                b"h2".as_slice()
+            } else {
+                b"http/1.1".as_slice()
+            };
+            assert_eq!(a.agreed(), offer_position(expected));
+        }
+    }
+}
+
 /// An HTTP/2 connection with one whole `GET /` request on stream 1, admitted and gone up: the
 /// accepted side and the request's stream.
 fn h2_request() -> (Accepted, u64) {

@@ -786,6 +786,10 @@ impl SafeSlot for Begin {
             let alpn = i
                 .facts()
                 .map_or(&[][..], |f| f.field(|x| &x.agreed_protocol).bytes());
+            if !matches!(alpn, b"" | b"h2" | b"http/1.1") {
+                o.error("begin: the agreed protocol is not http/1.1 or h2");
+                return Outcome::Refused;
+            }
             let mut accepting = Accepted::accept(i.sink.now_monotonic_ns, lines)
                 .with_policies(loans)
                 .with_body_max(settings.posture.max_body_bytes)

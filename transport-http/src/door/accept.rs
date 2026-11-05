@@ -655,28 +655,45 @@ impl Accepted {
 
     /// Read the connection's first bytes until they show whether they open the HTTP/2 preface, as
     /// hyper's auto server reads them to choose its protocol.
-    fn note_lead(&mut self, bytes: &[u8]) {
+    fn note_lead(&mut self, bytes: &[u8]) -> bool {
+        if self.ended {
+            return false;
+        }
         if self.spoken.is_some() {
-            return;
+            return true;
         }
         let room = H2_PREFACE.len() - self.lead.len();
         self.lead.extend_from_slice(&bytes[..bytes.len().min(room)]);
         let spoken = if self.lead.starts_with(H2_PREFACE) {
-            self.h2 = true;
             b"h2".as_slice()
         } else if H2_PREFACE.starts_with(&self.lead) {
-            return;
+            return true;
         } else {
             b"http/1.1".as_slice()
         };
-        self.spoken = Some(offer_position(spoken));
+        let position = offer_position(spoken);
+        if self.alpn != 0 && self.alpn != position {
+            // The auto server must never see a prefix completing a different protocol:
+            // its upgrade-capable entry point does not honor http1_only/http2_only.
+            self.ended_by = Some("the HTTP preface disagrees with the negotiated protocol".into());
+            self.conn = None;
+            self.ended = true;
+            self.lead.zeroize();
+            self.let_raw_go();
+            return false;
+        }
+        self.h2 = spoken == b"h2";
+        self.spoken = Some(position);
         self.lead.zeroize();
         self.lead = Vec::new();
+        true
     }
 
     /// The far side sent `bytes` (`end` = and then ended).
     pub fn ingest(&mut self, bytes: &[u8], end: bool) {
-        self.note_lead(bytes);
+        if !self.note_lead(bytes) {
+            return;
+        }
         if self.h2
             || self
                 .raw
