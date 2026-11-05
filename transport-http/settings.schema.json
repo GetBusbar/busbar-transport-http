@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "advanced.upstream_h2_prior_knowledge": {
+      "type": "boolean",
+      "default": false
+    },
+    "advanced.upstream_http1_only": {
+      "type": "boolean",
+      "default": false
+    },
+    "limits.upstream_request_timeout_secs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615,
+      "default": 300
+    },
+    "limits.request_body_max_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615,
+      "default": 33554432
+    }
+  },
+  "description": "Instance lifecycle settings only. Empty ABI bytes mean {}. Unknown keys and null are refused. Counts are encoded as unsigned JSON integer tokens; protocol, destination and binding inputs are supplied separately by the host."
+}

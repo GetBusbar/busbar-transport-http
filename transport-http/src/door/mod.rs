@@ -247,8 +247,12 @@ busbar_contract::statement_extensions!(
     ]
 );
 
+/// The published lifecycle settings schema.
+const SETTINGS_SCHEMA: &[u8] = include_bytes!("../../settings.schema.json");
+
 /// The door's Statement: the `http` framer, claiming `http`, `https` and `sse`.
 pub const STATEMENT: Statement = Statement {
+    settings_schema: busbar_contract::abi::mechanism::call::Blob::json(SETTINGS_SCHEMA),
     kind_tail: (&crate::meta::TAIL as *const TransportTail).cast::<KindTailHead>(),
     claims: CLAIM_NAMES.as_ptr(),
     claims_len: CLAIM_NAMES.len(),
@@ -1649,3 +1653,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/detach_tests.rs"]
 mod detach_tests;
+
+#[cfg(test)]
+#[path = "tests/settings_schema_tests.rs"]
+mod settings_schema_tests;

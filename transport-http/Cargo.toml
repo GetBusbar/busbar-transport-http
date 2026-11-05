@@ -50,6 +50,7 @@ serde_json = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 # THE 1.5.5 BYTE COMPARISON (`tests/h2_parity.rs`): 1.5.5's egress client, reqwest 0.12 with its
 # `http2` feature, built exactly as 1.5.5 built it, captured beside this door on the same request.
 reqwest = { workspace = true, features = ["http2"] }
