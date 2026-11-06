@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-pub(crate) use super::hyper_io::field_block;
+pub(crate) use super::hyper_io::{extend_wiped, field_block, held_bytes};
 use super::hyper_io::{HeadWords, HostIo, Owed, Piece};
 use busbar_contract::abi::transport::sensitive_fields::SensitiveFields;
 use bytes::Bytes;
@@ -579,31 +579,6 @@ impl Owed for Framing {
     fn ended(&self) -> bool {
         self.conn_done.load(Ordering::Acquire)
     }
-}
-
-/// THE ONE WIPE-ON-GROW RULE for a buffer of this door's own that may hold credential bytes (the
-/// request message `emit` collects, the accepted side's hand-over copy, a held body): append
-/// `bytes` to `buf`, never leaving a copy of what it held behind.
-pub(crate) fn extend_wiped(buf: &mut Vec<u8>, bytes: &[u8]) {
-    let need = buf.len().saturating_add(bytes.len());
-    if need > buf.capacity() {
-        let mut grown = Vec::with_capacity(need.max(buf.capacity().saturating_mul(2)));
-        grown.extend_from_slice(buf);
-        zeroize::Zeroize::zeroize(buf);
-        *buf = grown;
-    }
-    buf.extend_from_slice(bytes);
-}
-
-/// Share an owned body without releasing its wiping owner before the last byte view is dropped.
-pub(crate) fn held_bytes(bytes: Zeroizing<Vec<u8>>) -> Bytes {
-    struct Held(Zeroizing<Vec<u8>>);
-    impl AsRef<[u8]> for Held {
-        fn as_ref(&self) -> &[u8] {
-            self.0.as_slice()
-        }
-    }
-    Bytes::from_owner(Held(bytes))
 }
 
 /// Normalize the dial authority as the 1.5.5 client's URL parser did.

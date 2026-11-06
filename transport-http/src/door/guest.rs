@@ -211,29 +211,14 @@ pub fn stripped_query(query: &str, names: &[(String, Place)]) -> Option<String> 
 
 /// Decode query components with the same percent and plus handling as 1.5.5's `pct_decode`.
 fn decoded(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match (
-                    char::from(b[i + 1]).to_digit(16),
-                    char::from(b[i + 2]).to_digit(16),
-                ) {
-                    (Some(h), Some(l)) => {
-                        out.extend(u8::try_from(h * 16 + l));
-                        i += 2;
-                    }
-                    _ => out.push(b'%'),
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    out
+    let spaced;
+    let bytes = if s.contains('+') {
+        spaced = s.replace('+', " ");
+        spaced.as_bytes()
+    } else {
+        s.as_bytes()
+    };
+    busbar_contract::abi::sdk::url::percent_decode(bytes)
 }
 
 /// Whether field line `name` is one `names` lists as a field line ([`Place::Field`]), compared

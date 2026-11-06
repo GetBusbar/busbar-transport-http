@@ -222,3 +222,12 @@ impl Line {
         }
     }
 }
+
+#[test]
+fn query_stripping_distinguishes_escaped_plus_and_literal_plus() {
+    let names = vec![("a+b".to_owned(), Place::Query)];
+    assert_eq!(
+        stripped_query("a+b=space&a%2Bb=secret&a%2bb=secret&%zz=kept", &names).as_deref(),
+        Some("a+b=space&%zz=kept")
+    );
+}
