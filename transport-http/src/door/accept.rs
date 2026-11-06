@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
-use busbar_contract::abi::auth::{POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
+use busbar_contract::abi::auth::{AuthPoint, POINT_HEAD, POINT_HEAD_BODY, POINT_PEER};
 use busbar_contract::abi::host::service::{
     AuthRef, UnitRef, FLOW_CONTINUE, LINE_NONE, REFUSE_CHECK_FAILED, REFUSE_METHOD_MISS,
     REFUSE_NO_ROUTE, REFUSE_OVER_GATE, REFUSE_STOPPED, SCHEME_PLAIN,
@@ -292,8 +292,8 @@ enum Gate {
     Peer(usize),
     /// Matched line `.0`, whose auth needs `HeadBody`: the body is being held.
     Hold(usize),
-    /// Matched line `.0`: its auth is called at its head point.
-    Auth(usize),
+    /// Matched line `.0`: its auth is called at the current request point.
+    Auth(usize, AuthPoint),
     /// Matched line `.0`: handed in.
     HandIn(usize),
     /// Admitted: its head went up, its body follows.
@@ -305,10 +305,10 @@ enum Gate {
 }
 
 fn request_gate(points: u32, line: usize) -> Gate {
-    if points & POINT_HEAD_BODY != 0 {
+    if points & POINT_HEAD != 0 {
+        Gate::Auth(line, AuthPoint::Head)
+    } else if points & POINT_HEAD_BODY != 0 {
         Gate::Hold(line)
-    } else if points & POINT_HEAD != 0 {
-        Gate::Auth(line)
     } else {
         Gate::HandIn(line)
     }
@@ -2044,15 +2044,14 @@ impl Accepted {
                     if !a.held_whole {
                         return;
                     }
-                    a.gate = Gate::Auth(n);
+                    a.gate = Gate::Auth(n, AuthPoint::HeadBody);
                 }
-                Gate::Auth(n) => {
+                Gate::Auth(n, point) => {
                     if k.ticket().is_none() {
                         return;
                     }
                     let l = &lines[n];
-                    let (auth, line, body_point) =
-                        (l.auth, l.line, l.points & POINT_HEAD_BODY != 0);
+                    let (auth, line) = (l.auth, l.line);
 
                     let seq = match a.parked {
                         Some((t, seq)) if t == k.ticket() => seq,
@@ -2066,12 +2065,8 @@ impl Accepted {
                     }
                     let fields = field_lines(parts);
                     let view = head_view(parts, &fields, self.scheme);
-                    let (point, body) = if body_point {
-                        (POINT_HEAD_BODY, Some(a.held.as_slice()))
-                    } else {
-                        (POINT_HEAD, None)
-                    };
-                    let answered = k.auth_call(seq, auth, a.unit, point, id, &view, body);
+                    let body = (point == AuthPoint::HeadBody).then_some(a.held.as_slice());
+                    let answered = k.auth_call(seq, auth, a.unit, point.bit(), id, &view, body);
                     drop(fields);
                     match answered {
                         Poll::Pending => {
@@ -2088,7 +2083,14 @@ impl Accepted {
                             if flow != FLOW_CONTINUE {
                                 return self.kernel_refuse(id, a, REFUSE_STOPPED, line, k, did);
                             }
-                            a.gate = Gate::HandIn(n);
+                            // A chain can aggregate distinct HEAD and HEAD_BODY providers.
+                            // The host only runs providers registered for the point called.
+                            a.gate = if point == AuthPoint::Head && l.points & POINT_HEAD_BODY != 0
+                            {
+                                Gate::Hold(n)
+                            } else {
+                                Gate::HandIn(n)
+                            };
                         }
                         Poll::Ready(Err(_)) => return fail(a, did),
                     }

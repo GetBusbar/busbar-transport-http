@@ -95,6 +95,9 @@ struct Selecting {
     loan_wait: bool,
     points: Vec<u32>,
     completions: Vec<(u32, u32)>,
+    units: Vec<UnitRef>,
+    bodies: Vec<Option<Vec<u8>>>,
+    stop_at: Option<u32>,
 }
 
 impl Kernel for Selecting {
@@ -108,19 +111,26 @@ impl Kernel for Selecting {
         &mut self,
         seq: u32,
         auth: AuthRef,
-        _: UnitRef,
+        unit: UnitRef,
         point: u32,
         _: u64,
         _: &HeadViewArgs<'_>,
-        _: Option<&[u8]>,
+        body: Option<&[u8]>,
     ) -> Pend<AuthCalled> {
         self.auths.push(auth.id);
         self.points.push(point);
         self.completions.push((point, seq));
+        self.units.push(unit);
+        self.bodies.push(body.map(<[u8]>::to_vec));
         if self.wait {
             Poll::Pending
         } else {
-            Poll::Ready(Ok((FLOW_CONTINUE, UnitRef { id: 1, mac: 1 }, Vec::new())))
+            let flow = if self.stop_at == Some(point) {
+                busbar_contract::abi::host::service::FLOW_STOP
+            } else {
+                FLOW_CONTINUE
+            };
+            Poll::Ready(Ok((flow, UnitRef { id: 1, mac: 1 }, Vec::new())))
         }
     }
     fn hand_in(
@@ -163,8 +173,162 @@ fn selecting() -> (Accepted, Selecting) {
             loan_wait: false,
             points: Vec::new(),
             completions: Vec::new(),
+            units: Vec::new(),
+            bodies: Vec::new(),
+            stop_at: None,
         },
     )
+}
+
+// The Kernel fixture supplies an already decoded policy, so these tests isolate HTTP's
+// scheduler from the SDK's aggregate-point wire validation. Each point remains a separate
+// auth call; HEAD_BODY does not invoke providers that declare only HEAD.
+fn assert_request_auth_phases(points: u32, expected: &[u32]) {
+    let (mut a, mut kernel) = selecting();
+    let body_point = points & POINT_HEAD_BODY != 0;
+    kernel.policy = selected_policy(2, 22, points, if body_point { 4 } else { 0 });
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\n",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(
+        kernel.points,
+        if points & POINT_HEAD != 0 {
+            vec![POINT_HEAD]
+        } else {
+            Vec::new()
+        }
+    );
+    let early = up(&mut a);
+    assert!(early.body.is_empty());
+    if body_point {
+        assert!(early.heads.is_empty());
+        assert!(
+            kernel.handed.is_empty(),
+            "hand-in waits for every required phase"
+        );
+    } else {
+        assert_eq!(early.heads.len(), 1);
+    }
+    a.ingest(b"abcd", false);
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, expected);
+    assert_eq!(kernel.handed, [22]);
+    assert!(kernel.units[0].is_none());
+    for unit in &kernel.units[1..] {
+        assert_eq!(
+            (unit.id, unit.mac),
+            (1, 1),
+            "the next phase reuses the request unit"
+        );
+    }
+    for (point, body) in kernel.points.iter().zip(&kernel.bodies) {
+        assert_eq!(
+            body.as_deref(),
+            (*point == POINT_HEAD_BODY).then_some(b"abcd".as_slice())
+        );
+    }
+    let final_output = up(&mut a);
+    assert_eq!(early.heads.len() + final_output.heads.len(), 1);
+    assert_eq!(final_output.body, b"abcd");
+    assert!(final_output.whole);
+}
+
+#[test]
+fn head_auth_runs_without_buffering_the_body() {
+    assert_request_auth_phases(POINT_HEAD, &[POINT_HEAD]);
+}
+
+#[test]
+fn head_body_auth_waits_for_the_whole_body() {
+    assert_request_auth_phases(POINT_HEAD_BODY, &[POINT_HEAD_BODY]);
+}
+
+#[test]
+fn mixed_request_auth_runs_head_then_head_body() {
+    assert_request_auth_phases(POINT_HEAD | POINT_HEAD_BODY, &[POINT_HEAD, POINT_HEAD_BODY]);
+}
+
+#[test]
+fn mixed_request_auth_resumes_each_phase_without_repeating_the_previous_one() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_HEAD | POINT_HEAD_BODY, 4);
+    kernel.wait = true;
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\n",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_HEAD]);
+    kernel.wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_HEAD, POINT_HEAD]);
+    assert!(kernel.handed.is_empty());
+    assert_eq!(kernel.completions[0], kernel.completions[1]);
+    kernel.wait = true;
+    a.ingest(b"abcd", false);
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_HEAD, POINT_HEAD, POINT_HEAD_BODY]);
+    assert!(kernel.handed.is_empty());
+    let held = up(&mut a);
+    assert!(held.heads.is_empty() && held.body.is_empty());
+    kernel.wait = false;
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(
+        kernel.points,
+        [POINT_HEAD, POINT_HEAD, POINT_HEAD_BODY, POINT_HEAD_BODY]
+    );
+    assert_eq!(kernel.completions[2], kernel.completions[3]);
+    assert_ne!(kernel.completions[0].1, kernel.completions[2].1);
+    assert!(kernel.units[..2].iter().all(|unit| unit.is_none()));
+    assert!(kernel.units[2..]
+        .iter()
+        .all(|unit| (unit.id, unit.mac) == (1, 1)));
+    assert_eq!(
+        kernel.bodies,
+        [None, None, Some(b"abcd".to_vec()), Some(b"abcd".to_vec())]
+    );
+    assert_eq!(kernel.handed, [22]);
+    assert_eq!(up(&mut a).body, b"abcd");
+}
+
+#[test]
+fn mixed_request_auth_stops_before_the_body_phase_when_head_auth_refuses() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_HEAD | POINT_HEAD_BODY, 4);
+    kernel.stop_at = Some(POINT_HEAD);
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 4\r\n\r\nabcd",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_HEAD]);
+    assert!(kernel.handed.is_empty());
+    let denied = up(&mut a);
+    assert!(denied.heads.is_empty() && denied.body.is_empty());
+}
+
+#[test]
+fn mixed_request_auth_keeps_the_body_limit_before_the_body_phase() {
+    let (mut a, mut kernel) = selecting();
+    kernel.policy = selected_policy(2, 22, POINT_HEAD | POINT_HEAD_BODY, 4);
+    a.ingest(
+        b"POST / HTTP/1.1\r\nhost: test\r\ncontent-length: 5\r\n\r\nabcde",
+        false,
+    );
+    run_with(&mut a, SEC, &mut kernel);
+    assert_eq!(kernel.points, [POINT_HEAD]);
+    assert!(kernel.handed.is_empty());
+    let denied = up(&mut a);
+    assert!(denied.heads.is_empty() && denied.body.is_empty());
+    assert!(a
+        .shared
+        .lock()
+        .unwrap()
+        .streams
+        .values()
+        .all(|stream| stream.held.capacity() == 0));
 }
 
 #[test]
