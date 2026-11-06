@@ -227,4 +227,10 @@ skip = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/GetBusbar/busbar"]
+allow-git = [
+    "https://github.com/GetBusbar/busbar",
+    # SDK 947ff1f347d1c5b6e118419363376b9da90d4087 deny.toml authorizes this
+    # maintained sensitive-field fix (upstream hyperium/h2#996). Cargo.toml and
+    # Cargo.lock retain the exact h2 revision d6146a5c425e55653cdfebc5660e52d87430c588.
+    "https://github.com/MattJackson/h2",
+]

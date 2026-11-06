@@ -458,9 +458,10 @@ fn a_request_goes_up_as_its_head_slots_one_field_block_and_its_body() {
     assert_eq!(*stream, 1);
     assert_eq!(&words.method[..], b"POST");
     assert_eq!(&words.target[..], b"/v1/messages");
-    assert!(
-        words.authority.is_empty(),
-        "an origin-form request names no authority"
+    assert_eq!(
+        &words.authority[..],
+        b"busbar.test",
+        "the head carries the Host authority used by request admission"
     );
     assert!(words.reason.is_empty());
 
@@ -1457,6 +1458,10 @@ fn switched_read_ahead_and_each_owned_detach_copy_are_wiped() {
     a.ingest(b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: x-test\r\n\r\n", false);
     run(&mut a, SEC);
     let stream = up(&mut a).heads[0].0;
+    // Read-ahead arrives while HTTP still owns the connection. After the 101 drive ends
+    // this framing, the host routes new input to its successor instead.
+    let payload = b"switched-credential-canary".repeat(2000);
+    a.ingest(&payload, false);
     a.emit(
         stream,
         b"connection: upgrade\r\nupgrade: x-test\r\n",
@@ -1466,8 +1471,6 @@ fn switched_read_ahead_and_each_owned_detach_copy_are_wiped() {
     .unwrap();
     run(&mut a, SEC);
 
-    let payload = b"switched-credential-canary".repeat(2000);
-    a.ingest(&payload, false);
     let probe = Probe::start();
     let mut handed = Vec::new();
     loop {

@@ -986,17 +986,41 @@ fn a_framing_failing_with_output_owed_fails_each_live_stream_after_it() {
     assert_eq!(body(&mut f).0, b"hello", "the body went up before it");
 }
 
-/// The request timeout firing in the drive that queued body data does the same.
+/// The request timeout preserves body data queued before the deadline and fails after it.
 #[test]
 fn a_request_timeout_with_body_queued_fails_the_stream_after_it() {
     let mut f = asked(Proto::H1, 1);
     f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhello", false);
-    f.drive(2 * SEC, 0);
+    f.drive(SEC - 1, 0);
+    assert!(
+        f.failure().is_none(),
+        "not expired while the body is queued"
+    );
+    assert!(
+        f.pieces().iter().any(|p| p.bytes == b"hello"[..]),
+        "body output is owed before the deadline"
+    );
+    f.drive(SEC, 0);
     assert!(f.failure().is_some(), "the framing failed");
     let ps: Vec<_> = f.pieces().iter().filter(|p| p.stream == 1).collect();
     let last = ps.last().expect("pieces on stream 1");
     assert!(last.failed, "the last piece is the failure");
     assert!(ps.iter().all(|p| !p.end));
+    assert_eq!(ps.iter().filter(|p| p.failed).count(), 1, "stated once");
+    assert_eq!(body(&mut f), (b"hello".to_vec(), false));
+}
+
+/// A ready response first polled at the deadline cannot outrun the attempt's clock.
+#[test]
+fn a_request_timeout_precedes_ready_response_data() {
+    let mut f = asked(Proto::H1, 1);
+    f.ingest(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello", false);
+    f.drive(SEC, 0);
+    assert_eq!(
+        f.failure().expect("the framing failed").0,
+        "the request timeout passed before the response was whole"
+    );
+    assert!(f.pieces().is_empty(), "no expired response is handed up");
 }
 
 /// With nothing owed, no piece is pushed: the door answers FAILED at once.
