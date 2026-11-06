@@ -11,7 +11,7 @@
 #
 # THIRD-PARTY VERSIONS ARE THE FLEET'S, NOT THIS REPO'S. The table below is busbar's own root
 # `[workspace.dependencies]` (third-party rows) at busbar 1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e, followed by the plugin-only rows
-# of busbar's `.github/fleet/deps.toml` at 1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e. A member takes a crate with
+# of busbar's `fleet/deps.toml` at 1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e. A member takes a crate with
 # `{ workspace = true }` (adding features if it needs them); a crate in neither table is a new
 # `deps.toml` row in busbar first. Heal seeds resolution from busbar's lock at the pin; this
 # plugin retains its own Cargo.lock and CI checks its pinned core revision and dependency policy.
@@ -115,7 +115,7 @@ url = "2"
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 webpki-roots = "1"
 zeroize = "1"
-# busbar .github/fleet/deps.toml [plugin-deps], at 1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e
+# busbar fleet/deps.toml [plugin-deps], at 1a8a677b84a1667fbb6d7603b3586ad6ffe4f23e
 fallible-iterator = "0.2"
 httparse = { version = "1", default-features = false }
 ldap3 = { version = "0.12", default-features = false, features = ["sync"] }

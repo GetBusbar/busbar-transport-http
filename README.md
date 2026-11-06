@@ -7,7 +7,6 @@ First-party signed kind:transport plugin cdylib: the http transport, packaged as
 |---|---|---|---|---|
 | `transport` | `http` | `busbar-transport-http-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
-[![ci](https://github.com/GetBusbar/busbar-transport-http/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-transport-http/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
 ## What it is for
