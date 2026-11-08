@@ -57,7 +57,7 @@ fn settings(json: &str) -> Blob {
 fn ops() -> &'static Ops {
     // SAFETY: `door()` answers the `'static` door of this crate.
     #[allow(unused_unsafe)]
-    let d: *const Door = unsafe { door::door() };
+    let d: *const Door = unsafe { door() };
     // SAFETY: the door answers a `'static` door whose table is this kind's `Ops`.
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
@@ -595,7 +595,8 @@ fn a_target_carrying_userinfo_is_failed_at_locate_and_begin() {
 /// The Statement carries the complete declares document.
 #[test]
 fn the_statement_carries_the_declares_document() {
-    let ext = door::STATEMENT.extensions;
+    // SAFETY: the door retains its static validated Statement.
+    let ext = unsafe { (*door().statement()).extensions };
     assert!(!ext.ptr.is_null(), "the Statement carries extensions");
     // SAFETY: the Statement's extensions are a `'static` blob of `len` bytes.
     let bytes = unsafe { std::slice::from_raw_parts(ext.ptr, ext.len) };

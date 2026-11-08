@@ -796,7 +796,7 @@ fn scenario(label: &str, ops: &'static Ops, rt: &tokio::runtime::Runtime, case: 
 }
 
 fn linked() -> &'static Ops {
-    let d = busbar_transport_http_plugin::door::door();
+    let d = busbar_transport_http_plugin::door();
     // SAFETY: the door's `'static` table.
     unsafe { &*(*d).ops().cast::<Ops>() }
 }
@@ -4622,7 +4622,7 @@ fn the_door_offers_the_peer_point_linked_and_dropped_in() {
     // SAFETY: the one exported symbol, a `DoorFn`.
     let dropped: libloading::Symbol<'_, extern "C" fn() -> *const Door> =
         unsafe { lib.get(DOOR_SYMBOL) }.expect("the door symbol");
-    offers_the_peer_point("linked", busbar_transport_http_plugin::door::door());
+    offers_the_peer_point("linked", busbar_transport_http_plugin::door());
     offers_the_peer_point("dropped", dropped());
 }
 

@@ -25,11 +25,12 @@ fn call<S: SafeSlot>(p: *mut c_void, index: u32, i: &S::In, o: &mut S::Out) -> O
 
 struct Seed;
 impl SafeSlot for Seed {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -55,10 +56,15 @@ impl SafeSlot for Seed {
 
 struct Probe;
 impl SafeSlot for Probe {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = FramerOut;
     type State = State;
-    fn call(p: sdk::Instance<'_, State>, i: Lent<'_, FramingIn>, _: Out<'_, FramerOut>) -> Outcome {
+    fn call(
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
+        i: Lent<'_, FramingIn>,
+        _: Out<'_, FramerOut>,
+    ) -> Outcome {
         if p.get().unwrap().life().framings.reach(i.framing).is_ok() {
             Outcome::Ready
         } else {

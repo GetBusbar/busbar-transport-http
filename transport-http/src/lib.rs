@@ -10,7 +10,10 @@
 
 mod claims;
 
-pub mod door;
+mod door;
+
+/// The validated ABI entry and generated registration constant.
+pub use door::{door, MACRO_DOOR};
 mod message;
 mod meta;
 mod raw;

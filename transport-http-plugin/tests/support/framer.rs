@@ -7,7 +7,6 @@ use busbar_contract::abi::mechanism::lifecycle::{
 };
 use busbar_plugin_loader::dispatch::{in_head, load_dropped, load_linked, out_head};
 use serde_json::Value;
-use std::sync::atomic::Ordering;
 
 fn input<T: InFrame>() -> T {
     // SAFETY: ABI frames contain only zero-valid plain C data and begin with InHead.
@@ -38,7 +37,7 @@ std::thread_local! {
     static CROSSINGS: std::cell::RefCell<std::collections::HashMap<u64, (u64, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 fn actual_count(p: &Plugin<Transport>) -> u64 {
-    p.inner.crossings.load(Ordering::SeqCst) - p.inner.resumes.load(Ordering::SeqCst)
+    p.test_invocations().0 - p.test_invocations().1
 }
 fn framer_crossings(p: &Plugin<Transport>) -> u64 {
     CROSSINGS.with(|counts| {
@@ -1210,7 +1209,10 @@ fn exercise(p: &Plugin<Transport>, d: &busbar_plugin_loader::dispatch::Dispatche
 
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_plugin() {
-    let d = busbar_plugin_loader::dispatch::Dispatcher::new(Default::default());
+    let d = busbar_plugin_loader::dispatch::Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let path = super::cdylib();
     let (dropped_address, dropped_ops) =
         busbar_plugin_loader::dispatch::load::door_addresses_of_library(&path)
@@ -1434,7 +1436,10 @@ fn begin_dial_want(dial: &Value, flags: u32) -> Expected {
 
 #[test]
 fn an_actual_receive_receipt_without_its_framing_context_is_refused_and_released() {
-    let d = busbar_plugin_loader::dispatch::Dispatcher::new(Default::default());
+    let d = busbar_plugin_loader::dispatch::Dispatcher::new(
+        Default::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let linked: Plugin<Transport> = load_linked(&super::row(), super::bind(&d)).unwrap();
     let dropped: Plugin<Transport> =
         load_dropped(&super::cdylib(), &super::row().statement, super::bind(&d)).unwrap();

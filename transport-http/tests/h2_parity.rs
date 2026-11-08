@@ -128,7 +128,7 @@ fn capture_155(rt: &tokio::runtime::Runtime, h2: bool, body: &'static str) -> (V
 /// line before the auth; the host states one for a non-empty body and none for an empty one
 /// (busbar-kernel `plane_driver/far_end.rs`, the length the head defaults ask for).
 fn capture_door(port: u16, h2: bool, body: &str, state_len: bool) -> Vec<u8> {
-    let d = busbar_transport_http::door::door();
+    let d = busbar_transport_http::door();
     // SAFETY: the door's `'static` table.
     let ops: &Ops = unsafe { &*(*d).ops().cast::<Ops>() };
     let settings = if h2 {

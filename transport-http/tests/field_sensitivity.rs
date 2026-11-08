@@ -38,7 +38,7 @@ fn blob(value: &[u8]) -> Blob {
 fn ops() -> &'static Ops {
     #[allow(unused_unsafe)]
     // SAFETY: this crate's linked door takes no argument and returns its static table.
-    let door = unsafe { busbar_transport_http::door::door() };
+    let door = unsafe { busbar_transport_http::door() };
     // SAFETY: the linked door owns its static transport table.
     unsafe { &*(*door).ops().cast::<Ops>() }
 }

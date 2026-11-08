@@ -28,9 +28,10 @@ use busbar_contract::abi::mechanism::ticket::{CompletionHandle, Ticket};
 use busbar_contract::abi::sdk::door::{abi_str, statement};
 use busbar_contract::abi::sdk::life::{self, Held as Opened, Life, Refreshed, Refusal};
 use busbar_contract::abi::sdk::services::{
-    HeadViewArgs, Pend, RefusalCopy, ServiceError, Services,
+    HeadViewArgs, Pend, RefusalCopy, ServiceError, Services as KindServices,
 };
 use busbar_contract::abi::sdk::transport::policy::Loans;
+type Services = KindServices<busbar_contract::plugin::markers::TransportKind>;
 use busbar_contract::abi::sdk::transport::{
     form_codes, settings_reading, SettingRow, DEFAULT_BODY_MAX,
 };
@@ -372,6 +373,7 @@ fn settings_of(bytes: &[u8]) -> Result<Settings, Refusal> {
 }
 
 impl Life for Instance {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     /// Unread: `cancel` is this door's own slot ([`Cancel`]).
     const CANCEL: u32 = CANCEL_NOTHING_MOVED;
 
@@ -405,11 +407,12 @@ macro_rules! slot {
         $(#[$doc])*
         pub struct $name;
         impl SafeSlot for $name {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
             type In = $in;
             type Out = $out;
             type State = State;
             fn call(
-                $inst: sdk::Instance<'_, State>,
+                $inst: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
                 $input: Lent<'_, $in>,
                 #[allow(unused_mut)] mut $o: Out<'_, $out>,
             ) -> Outcome $body
@@ -493,11 +496,12 @@ busbar_contract::not_served! {
 /// stream the host was handed or the whole connection ([`Accepted::refuse`]).
 pub(crate) struct Refuse;
 impl SafeSlot for Refuse {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = RefuseIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, RefuseIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -654,11 +658,12 @@ fn offered_name(host: &str) -> String {
 /// `locate`.
 pub struct Locate;
 impl SafeSlot for Locate {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = LocateIn;
     type Out = LocateOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, LocateIn>,
         mut o: Out<'_, LocateOut>,
     ) -> Outcome {
@@ -728,11 +733,12 @@ impl SafeSlot for Locate {
 /// `begin`.
 pub struct Begin;
 impl SafeSlot for Begin {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = BeginIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, BeginIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -887,7 +893,7 @@ impl SafeSlot for Begin {
 }
 
 fn begin_peer(
-    p: &sdk::Instance<'_, State>,
+    p: &sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
     head: Lent<'_, InHead>,
     token: u64,
     sink: Lent<'_, FramerSink>,
@@ -957,11 +963,12 @@ fn begin_peer(
 /// `ingest`.
 pub struct Ingest;
 impl SafeSlot for Ingest {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = IngestIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, IngestIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -988,11 +995,12 @@ impl SafeSlot for Ingest {
 /// `emit`.
 pub struct Emit;
 impl SafeSlot for Emit {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = EmitIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, EmitIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -1056,11 +1064,12 @@ impl SafeSlot for Emit {
 /// `timer`.
 pub struct Timer;
 impl SafeSlot for Timer {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -1085,11 +1094,12 @@ impl SafeSlot for Timer {
 /// bytes still owed first).
 pub(crate) struct Detach;
 impl SafeSlot for Detach {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FramingIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, FramingIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -1167,11 +1177,12 @@ fn take_detached(
 /// `finish`.
 pub struct Finish;
 impl SafeSlot for Finish {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = FinishIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        p: sdk::Instance<'_, State>,
+        p: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, FinishIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -1192,11 +1203,12 @@ impl SafeSlot for Finish {
 /// `encode`: one HTTP/1.1 request message into the wire buffer.
 pub struct Encode;
 impl SafeSlot for Encode {
+    type Kind = busbar_contract::plugin::markers::TransportKind;
     type In = EncodeIn;
     type Out = FramerOut;
     type State = State;
     fn call(
-        _: sdk::Instance<'_, State>,
+        _: sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
         i: Lent<'_, EncodeIn>,
         mut o: Out<'_, FramerOut>,
     ) -> Outcome {
@@ -1297,7 +1309,7 @@ framer_op!(
 /// first time and takes none again, but what it answers is read afresh.
 fn with(
     op: FramerOp,
-    p: &sdk::Instance<'_, State>,
+    p: &sdk::Instance<'_, State, busbar_contract::plugin::markers::TransportKind>,
     head: Lent<'_, InHead>,
     token: u64,
     sink: Lent<'_, FramerSink>,

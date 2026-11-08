@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! **ONE `http` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_http::door::door`) and
+//! **ONE `http` DOOR, BOTH WAYS IN**: the linked door (`busbar_transport_http::door`) and
 //! this crate's built cdylib (the same door behind the one `export_door!`), each admitted through
 //! the loader's ONE door validation and driven through the ONE dispatcher's crossing, give the
 //! same Statement and the same wire bytes for one request.
@@ -61,7 +61,7 @@ fn cdylib() -> std::path::PathBuf {
 
 /// The row a compiled-in build holds for this door.
 fn row() -> LinkedRow {
-    LinkedRow::of(busbar_transport_http::door::door).expect("the door states itself")
+    LinkedRow::of(busbar_transport_http::door).expect("the door states itself")
 }
 
 fn bind(d: &Dispatcher) -> Bind {
@@ -166,7 +166,10 @@ fn script(p: &Plugin<Transport>) -> Vec<u8> {
 
 #[test]
 fn the_linked_and_the_dropped_in_door_are_one_framer() {
-    let d = Dispatcher::new(DispatchConfig::default());
+    let d = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let linked: Plugin<Transport> = load_linked(&row(), bind(&d)).expect("the linked door loads");
     let dropped: Plugin<Transport> =
         load_dropped(&cdylib(), &row().statement, bind(&d)).expect("the dropped-in door loads");
@@ -188,7 +191,10 @@ fn the_linked_and_the_dropped_in_door_are_one_framer() {
 
 #[test]
 fn the_door_asked_for_as_another_kind_is_refused_both_ways() {
-    let d = Dispatcher::new(DispatchConfig::default());
+    let d = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
     let want = (KindCode::Transport, KindCode::Hook);
     match load_linked::<Hook>(&row(), bind(&d)) {
         Err(LoadError::ManifestKind {
