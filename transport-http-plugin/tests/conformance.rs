@@ -217,3 +217,34 @@ mod framer;
 
 #[path = "support/negative.rs"]
 mod negative;
+
+// HTTP's target interpretation belongs here; core framing-loan tests use an SDK witness.
+#[test]
+fn http_begin_assigns_a_framing_token_both_ways() {
+    let d = Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    );
+    for p in [
+        load_linked::<Transport>(&row(), bind(&d)).expect("linked HTTP"),
+        load_dropped::<Transport>(&cdylib(), &row().statement, bind(&d)).expect("dropped HTTP"),
+    ] {
+        open(&p);
+        let scope = d.framing_context(p.instance().0, 0, 0).unwrap();
+        let mut i: BeginIn = z();
+        i.head = in_head();
+        i.side = SIDE_DIAL;
+        i.scheme = SCHEME_PLAIN;
+        i.target = s("http://127.0.0.1/");
+        let mut o: FramerOut = z();
+        o.head = out_head();
+        let mut f = Frame::new(i, o);
+        let result = busbar_plugin_loader::dispatch::framing_context::with_context(
+            Some(scope.clone()),
+            || p.call(slot::BEGIN, &mut f),
+        );
+        assert_eq!(result.outcome, Outcome::Ready);
+        assert_ne!(f.out.framing, 0);
+        scope.confirm(f.out.framing).unwrap();
+    }
+}
