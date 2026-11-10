@@ -75,3 +75,10 @@ futures = { workspace = true }
 
 [lints]
 workspace = true
+
+[package.metadata.busbar.test-contexts]
+listener_framed = [{ path = "tests/root/listener_framed.rs" }]
+root_http = [{ path = "tests/root/scoped_framing.rs", module = "scoped_framing_tests" }]
+listener_bindings = [{ path = "tests/root/listener_bindings_cases.rs", module = "binding_tests" }]
+transport_inventory = [{ path = "tests/root/transport_inventory.rs", module = "transport_inventory_tests" }]
+boot_http_locate = [{ path = "tests/root/boot_locate.rs" }]
