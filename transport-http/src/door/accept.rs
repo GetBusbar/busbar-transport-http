@@ -1111,28 +1111,24 @@ impl Accepted {
             return Err(Failure("emit: trailers precede the answer head".into()));
         }
 
-        if answer.h1
-            && trailers.keys().any(|name| {
-                matches!(
-                    name.as_str(),
-                    "authorization"
-                        | "cache-control"
-                        | "content-encoding"
-                        | "content-length"
-                        | "content-range"
-                        | "content-type"
-                        | "host"
-                        | "max-forwards"
-                        | "set-cookie"
-                        | "trailer"
-                        | "transfer-encoding"
-                        | "te"
-                )
-            })
-        {
-            return Err(Failure(
-                "emit: field cannot be carried in HTTP/1 trailers".into(),
-            ));
+        if trailers.keys().any(|name| {
+            matches!(
+                name.as_str(),
+                "authorization"
+                    | "cache-control"
+                    | "content-encoding"
+                    | "content-length"
+                    | "content-range"
+                    | "content-type"
+                    | "host"
+                    | "max-forwards"
+                    | "set-cookie"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "te"
+            )
+        }) {
+            return Err(Failure("emit: field cannot be carried in trailers".into()));
         }
         let Some(queue) = answer.reply.as_ref() else {
             return Err(Failure("emit: stream has no answer".into()));
@@ -1685,7 +1681,7 @@ fn frame_refusal(a: &mut Answer, r: RefusalCopy) -> bool {
     };
     let Some(status) = u16::try_from(r.status)
         .ok()
-        .filter(|status| (100..=599).contains(status))
+        .filter(|status| (200..=599).contains(status))
         .and_then(|status| http::StatusCode::from_u16(status).ok())
     else {
         return false;

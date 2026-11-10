@@ -652,7 +652,7 @@ fn offered_name(host: &str) -> String {
         return v4.to_string();
     }
     sdk::net::expand_alternate_ipv4(bare)
-        .map_or_else(|| host.to_ascii_lowercase(), |v4| v4.to_string())
+        .map_or_else(|| bare.to_ascii_lowercase(), |v4| v4.to_string())
 }
 
 /// `locate`.

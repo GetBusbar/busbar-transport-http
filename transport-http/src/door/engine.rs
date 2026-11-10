@@ -304,6 +304,9 @@ impl Framing {
         deadline_ns: u64,
         sensitive: Option<SensitiveFields>,
     ) -> Result<(), Failure> {
+        if let Some(f) = &self.failed {
+            return Err(f.clone());
+        }
         if let Some(i) = self
             .exchanges
             .iter()
