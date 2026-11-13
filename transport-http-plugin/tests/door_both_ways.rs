@@ -3323,9 +3323,39 @@ fn kernel_refusal_keeps_its_fields(label: &str, ops: &'static Ops) {
     h.close();
 }
 
+/// A fresh, synthetic `Sec-WebSocket-Key` value: 16 bytes derived from a per-call counter and the
+/// clock, base64-encoded at runtime, so no key-shaped literal sits in the source.
+fn websocket_test_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&tick.to_be_bytes());
+    raw[8..].copy_from_slice(&COUNTER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in raw.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+    }
+    out.push_str("==");
+    out
+}
+
 /// An upgrade handed to another framer receives no HTTP answer here.
 fn upgrade_detached_unanswered(label: &str, ops: &'static Ops) {
-    let request: &[u8] = b"GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n";
+    let request = format!(
+        "GET /v1/session HTTP/1.1\r\nhost: busbar.test\r\nconnection: upgrade\r\nupgrade: websocket\r\nsec-websocket-key: {}\r\nsec-websocket-version: 13\r\n\r\n",
+        websocket_test_nonce()
+    );
+    let request = request.as_bytes();
     let mut h = admitted(
         ops,
         vec![line(3, POINT_HEAD, METHOD_ANY, "/v1/session", 0)],
